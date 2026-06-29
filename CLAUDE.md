@@ -311,12 +311,16 @@ When starting work on a new project that has no CLAUDE.md:
 I can grow new abilities: when a task turns out reusable, distill it into a skill
 (`skills/<name>/SKILL.md`) so next time it's one invocation, not improvisation.
 
-**Behavior (approach B — ask first):**
-1. **Notice** when work just done is *skill-worthy*: repeatable, non-trivial (multi-step /
-   easy to get wrong from memory), generalizable (clear inputs). NOT for one-off answers,
-   trivial single commands, or anything an existing skill already covers.
-2. **Ask the user** one short line, e.g. "Сделать из этого скилл? (`<name>` — <1-line purpose>)".
-   Frequent asking is fine; if ignored / "no" → skip silently, create nothing.
+**Behavior (approach B — ask first, HIGH threshold):**
+The "is this worth a skill?" judgment is **mine to make** (model/Opus judgment), NOT bot.py
+code — code can't tell a reusable method from a one-off. So apply real judgment, and keep the
+bar HIGH: **silence is the default; only ask when it clearly clears the bar.**
+1. **Notice** only genuinely *skill-worthy* work — ALL of: repeatable (a method I'd realistically
+   invoke again), non-trivial (multi-step / easy to get wrong from memory), generalizable (clear
+   inputs). NOT one-off answers, trivial single commands, or anything an existing skill covers.
+   When in doubt → do NOT ask. Better to miss a few than to nag.
+2. **Only then, ask** one short line, e.g. "Сделать из этого скилл? (`<name>` — <1-line purpose>)".
+   If ignored / "no" → skip silently, create nothing. Expect this to be rare, not every task.
 3. **On explicit yes:**
    - dedup: `memory_search` + `tools/new_skill.py list`; if a near-duplicate exists, update it
      instead of creating new.
