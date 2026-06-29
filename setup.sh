@@ -99,7 +99,15 @@ if [ ! -f "bot/transcribe_config.json" ]; then
   echo "[ok] transcribe_config.json (авто-детект)"
 fi
 
-# ── 7. Права ──────────────────────────────────────────────────────────────────
+# ── 7. Скіли: discovery через .claude/skills ─────────────────────────────────
+# claude-CLI шукає скіли в .claude/skills/, а не в skills/ — лінкуємо.
+if [ -d "skills" ] && [ ! -e ".claude/skills" ]; then
+  mkdir -p .claude
+  ln -sfn ../skills .claude/skills
+  echo "[ok] .claude/skills -> ../skills (скіли підхоплюються)"
+fi
+
+# ── 8. Права ──────────────────────────────────────────────────────────────────
 
 chmod +x bot/run.sh
 echo "[ok] run.sh — права виставлено"
