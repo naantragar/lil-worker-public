@@ -1,0 +1,4 @@
+aiogram>=3.0
+mistune==2.0.5
+openai
+lingua-language-detector

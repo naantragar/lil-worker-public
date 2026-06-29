@@ -1,0 +1,22 @@
+# Secrets
+bot/.env
+bot/.sessions.json
+bot/.providers.json
+bot/.sessions_codex.json
+bot/instances/
+# Python
+bot/.venv/
+__pycache__/
+*.pyc
+# Logs & runtime
+bot/*.log
+*.pid
+bot/.runtime.sock
+bot/bot_runtime_state.json
+bot/bot.py.bak
+bot/backups/
+# Index / state
+.sessions.json
+.memory_index.db
+# OS
+.DS_Store
