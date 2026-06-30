@@ -80,6 +80,14 @@ PRIVILEGED_INSTANCE = "lil_worker"
 ALLOW_SELF_MODIFICATION = INSTANCE_NAME == PRIVILEGED_INSTANCE
 SELFMOD_GUARD_PATH = CODE_DIR / "selfmod_guard.py"
 
+# Optional per-instance reasoning effort (set in instance.env as LIL_WORKER_EFFORT).
+# Empty → inherit the global ~/.claude/settings.json effortLevel. Lets e.g. a light helper
+# run at "low" while the main bot stays higher. Valid: low|medium|high|xhigh|max.
+_VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+INSTANCE_EFFORT = os.environ.get("LIL_WORKER_EFFORT", "").strip().lower()
+if INSTANCE_EFFORT and INSTANCE_EFFORT not in _VALID_EFFORTS:
+    INSTANCE_EFFORT = ""
+
 CLAUDE_MODEL_CONFIG_FILE = DATA_DIR / "model_config.json"
 CODEX_MODEL_CONFIG_FILE = DATA_DIR / "codex_model_config.json"
 
@@ -1415,6 +1423,10 @@ async def run_claude_streaming(
             }
         })
         cmd.extend(["--settings", guard_settings])
+
+    if INSTANCE_EFFORT:
+        # Per-instance reasoning depth (overrides the global effortLevel for this instance).
+        cmd.extend(["--effort", INSTANCE_EFFORT])
 
     if session_id:
         cmd.extend(["--resume", session_id])

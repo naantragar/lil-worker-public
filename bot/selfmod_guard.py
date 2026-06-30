@@ -21,6 +21,12 @@ import sys
 
 PROTECTED_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# The instance's OWN data dir (its model/transcribe config, sessions, runtime state) is NOT
+# protected — a secondary instance may manage its OWN settings (e.g. switch its own model),
+# just not the shared bot code. instance.sh sets this to bot/instances/<name>/.
+OWN_DATA_DIR = os.environ.get("LIL_WORKER_DATA_DIR", "").strip()
+_OWN = os.path.abspath(OWN_DATA_DIR) if OWN_DATA_DIR else None
+
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 
 # write/mutation indicators for Bash commands
@@ -41,10 +47,16 @@ def _deny(reason):
     sys.exit(2)
 
 
+def _is_own(ap):
+    return bool(_OWN) and (ap == _OWN or ap.startswith(_OWN + os.sep))
+
+
 def _under_protected(path):
     if not path:
         return False
     ap = os.path.abspath(os.path.expanduser(path))
+    if _is_own(ap):
+        return False  # the instance's own settings/data — allowed
     return ap == PROTECTED_ROOT or ap.startswith(PROTECTED_ROOT + os.sep)
 
 
@@ -66,8 +78,12 @@ def main():
 
     if tool == "Bash":
         cmd = ti.get("command", "") or ""
-        if PROTECTED_ROOT in cmd and WRITE_RE.search(cmd):
-            _deny("refused Bash command that writes into the protected repo.")
+        if WRITE_RE.search(cmd):
+            # ignore references to the instance's OWN data dir, then see if any protected
+            # (shared-code) path remains.
+            residual = cmd.replace(OWN_DATA_DIR, " ") if OWN_DATA_DIR else cmd
+            if PROTECTED_ROOT in residual:
+                _deny("refused Bash command that writes into the protected repo (shared code).")
         sys.exit(0)
 
     sys.exit(0)

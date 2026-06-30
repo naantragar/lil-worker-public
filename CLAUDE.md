@@ -46,6 +46,33 @@ timeout 60 <command>   # for installs/compiles
 
 Never retry the same failing action more than once. If something fails twice - stop, explain, ask the user.
 
+## Killing / restarting bot processes — IDENTIFY FIRST (CRITICAL)
+
+Multiple UNRELATED bots can run on the same box, and several of them have an entry file literally
+named `bot.py`, launched as `.venv/bin/python bot.py`. In `ps` their command lines are
+**indistinguishable** — you cannot tell which project a `python bot.py` belongs to from the
+cmdline alone. Mis-killing one takes down someone's production bot.
+
+**Hard rules:**
+1. **NEVER `kill`/`pkill` by a fuzzy/partial match** on `bot.py` / `python bot.py`. No
+   hand-rolled `pkill -f bot.py`.
+2. **Identify a PID by disambiguating signals, not the cmdline string:**
+   - **cwd** is decisive: `readlink /proc/<pid>/cwd` → tells you which project it is.
+   - **pid-file ownership**: a PID is "bot X" only if X's own pid-file contains it
+     (my crab: `bot/lil_worker.pid`; instances: `bot/instances/<name>/lil_worker.pid`; other
+     projects keep their own pid-files in their own dirs).
+3. **Never assume an old / untagged / relative-path `python bot.py` is a stale ghost of mine.**
+   If a PID's cwd is not my code dir, or it's not in one of my pid-files, **it is NOT mine —
+   leave it alone.**
+4. **To restart only me, use the existing anchored tools** (`bot/run.sh restart`,
+   `bot/restart_crab.sh`) — they match the ABSOLUTE krevetka python+bot.py path and never touch
+   other projects. Don't improvise a kill.
+5. **Before any manual `kill <pid>`**: verify cwd + pid-file ownership. If unsure → do NOT kill,
+   ask the user.
+
+(Real incident this taught: a manual ghost-kill by guessed PID took down an unrelated project
+bot that happened to run `python bot.py` from its own dir.)
+
 ## Self-modification
 
 To add features or fix bugs in bot.py:
