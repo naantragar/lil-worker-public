@@ -73,6 +73,13 @@ DATA_DIR = Path(os.environ.get("LIL_WORKER_DATA_DIR") or CODE_DIR)
 BOT_CWD = os.environ.get("LIL_WORKER_BOT_CWD") or str(Path.home() / "lil_worker")
 INSTANCE_NAME = os.environ.get("LIL_WORKER_INSTANCE", "lil_worker")
 
+# Self-modification is allowed ONLY from the privileged (default) instance.
+# Secondary instances get a PreToolUse guard (selfmod_guard.py) that blocks edits to
+# krevetka's own code/persona, while staying full-power for their own project work.
+PRIVILEGED_INSTANCE = "lil_worker"
+ALLOW_SELF_MODIFICATION = INSTANCE_NAME == PRIVILEGED_INSTANCE
+SELFMOD_GUARD_PATH = CODE_DIR / "selfmod_guard.py"
+
 CLAUDE_MODEL_CONFIG_FILE = DATA_DIR / "model_config.json"
 CODEX_MODEL_CONFIG_FILE = DATA_DIR / "codex_model_config.json"
 
@@ -1396,6 +1403,18 @@ async def run_claude_streaming(
             "--allowedTools", "Read,Write,Edit,Bash,Glob,Grep,WebFetch,WebSearch,Task,Agent,Workflow,Skill",
             "--append-system-prompt", build_provider_system_prompt(lang),
         ]
+
+    if not ALLOW_SELF_MODIFICATION:
+        # Secondary instance: block modification of krevetka's own code via a PreToolUse guard.
+        guard_settings = json.dumps({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+                    "hooks": [{"type": "command", "command": f"python3 {SELFMOD_GUARD_PATH}"}],
+                }]
+            }
+        })
+        cmd.extend(["--settings", guard_settings])
 
     if session_id:
         cmd.extend(["--resume", session_id])

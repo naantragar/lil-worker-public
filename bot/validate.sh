@@ -79,16 +79,22 @@ print('OK')
   cp "$BOT" "$BOT.bak"
   echo "OK ($BOT.bak)"
 
-  # --- Check 5: Dry-run (start and kill after 3s) ---
-  echo -n "[5] Dry-run (3s)... "
-  # Run bot briefly, capture output, kill after 3s
-  timeout 5 $VENV "$BOT" --validate-startup > /tmp/validate_dryrun.txt 2>&1 &
+  # --- Check 5: Dry-run (poll for the success line up to 15s, then kill) ---
+  echo -n "[5] Dry-run... "
+  # Run bot; poll output for the success line instead of a fixed sleep — startup can take
+  # ~5-6s under load, so a fixed 3s window gave false negatives.
+  SUCCESS_LINE="Validation startup path completed without live Telegram polling."
+  timeout 20 $VENV "$BOT" --validate-startup > /tmp/validate_dryrun.txt 2>&1 &
   DRY_PID=$!
-  sleep 3
+  for _ in $(seq 1 30); do
+    grep -q "$SUCCESS_LINE" /tmp/validate_dryrun.txt && break
+    kill -0 $DRY_PID 2>/dev/null || break
+    sleep 0.5
+  done
   kill $DRY_PID 2>/dev/null
   wait $DRY_PID 2>/dev/null
 
-  if grep -q "Validation startup path completed without live Telegram polling." /tmp/validate_dryrun.txt; then
+  if grep -q "$SUCCESS_LINE" /tmp/validate_dryrun.txt; then
     echo "OK (startup validates without live Telegram polling)"
   else
     echo "FAIL (bot did not start)"
