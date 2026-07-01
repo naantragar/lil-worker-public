@@ -9,14 +9,22 @@ a freshly-written skill is well-formed and immediately discoverable.
 Discovery: skills live in skills/<name>/SKILL.md and are exposed to claude-CLI via the
 symlink  .claude/skills -> ../skills  (created once; see SELF_SKILL_CREATION_TZ.md).
 
+Skill self-improvement (evolution): before editing an existing skill, `snapshot` it
+(saves a timestamped copy under skills/<name>/.history/), apply the Edit, then re-`validate`.
+`.history/` is private-only and never synced to the public repo. See SKILL_SELF_IMPROVEMENT_TZ.md.
+
 Usage:
   python3 tools/new_skill.py scaffold <name> ["<one-line description>"]
   python3 tools/new_skill.py validate <name|path/to/SKILL.md>
+  python3 tools/new_skill.py snapshot <name>
+  python3 tools/new_skill.py history  <name>
   python3 tools/new_skill.py list
 """
 import os
 import re
+import shutil
 import sys
+from datetime import datetime, timezone
 
 BASE = os.environ.get("KREVETKA_BASE",
                       os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -83,6 +91,10 @@ def validate(arg):
             errs.append("frontmatter: 'user-invocable' should be true/false")
         if not body or len(body) < 20:
             errs.append("body is empty/too short (needs real instructions)")
+        # A freshly scaffolded skill still carries TODO placeholders — those must be
+        # filled in before it counts as valid, otherwise validate is a rubber stamp.
+        if fm.get("description", "").startswith("TODO") or (body and body.lstrip().startswith("TODO")):
+            errs.append("still contains scaffold TODO placeholder — fill it in")
     if errs:
         print("INVALID: " + path)
         for e in errs:
@@ -113,6 +125,59 @@ def scaffold(name, desc=None):
     return 0
 
 
+def _history_dir(name):
+    return os.path.join(SKILLS_DIR, name, ".history")
+
+
+def snapshot(name):
+    """Copy skills/<name>/SKILL.md to skills/<name>/.history/SKILL.<UTC-ts>.md.
+
+    Additive, never destructive. Meant to be run BEFORE editing a skill so every
+    improvement has an undo point. Private-only: .history/ is excluded from the
+    public repo (see ops/make_public.sh)."""
+    path = _skill_path(name)
+    if not os.path.isfile(path):
+        print(f"FAIL: no SKILL.md at {path}")
+        return 1
+    hist = _history_dir(name)
+    os.makedirs(hist, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    # Name every snapshot SKILL.<ts>.NNN.md with a zero-padded counter so that
+    # lexicographic order == chronological order even for many snapshots in the same
+    # second (mtime is useless here: copy2 copies the SOURCE's mtime, identical for all).
+    # Reserve the destination ATOMICALLY (O_CREAT|O_EXCL) so racing snapshots can't clobber.
+    n = 0
+    while True:
+        dest = os.path.join(hist, f"SKILL.{ts}.{n:03d}.md")
+        try:
+            fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            n += 1
+            continue
+        os.close(fd)
+        break
+    shutil.copy2(path, dest)
+    print(f"snapshot: {dest}")
+    return 0
+
+
+def history(name):
+    """List snapshots in skills/<name>/.history/, newest first."""
+    hist = _history_dir(name)
+    if not os.path.isdir(hist):
+        print("(no snapshots)")
+        return 0
+    snaps = [f for f in os.listdir(hist)
+             if f.startswith("SKILL.") and f.endswith(".md")]
+    if not snaps:
+        print("(no snapshots)")
+        return 0
+    # Filenames are SKILL.<ts>.NNN.md (zero-padded), so lexicographic == chronological.
+    for f in sorted(snaps, reverse=True):
+        print(f"  {os.path.join(hist, f)}")
+    return 0
+
+
 def list_skills():
     if not os.path.isdir(SKILLS_DIR):
         print("no skills/ dir")
@@ -135,6 +200,10 @@ def main(argv):
         return validate(argv[2])
     if cmd == "scaffold" and len(argv) >= 3:
         return scaffold(argv[2], argv[3] if len(argv) >= 4 else None)
+    if cmd == "snapshot" and len(argv) >= 3:
+        return snapshot(argv[2])
+    if cmd == "history" and len(argv) >= 3:
+        return history(argv[2])
     if cmd == "list":
         return list_skills()
     print(__doc__)

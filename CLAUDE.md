@@ -362,6 +362,40 @@ Spec: `SELF_SKILL_CREATION_TZ.md`. Never overwrite an existing skill without exp
 
 ---
 
+## Skill self-improvement (evolving existing skills, proactive, ask-first)
+
+Skills aren't write-once. When I *use* a `skills/<name>/SKILL.md` and hit a real gap (missing
+step, wrong assumption, drifted path/command, or a strictly better method that generalizes), I can
+refine it so the next invocation is better. Depth to complement the breadth of skill-*creation* —
+same discipline: proactive, ask-first, HIGH threshold, silence is the default.
+
+1. **Recognize** only genuinely improvement-worthy work: the just-used skill failed / was
+   incomplete, drifted, or I found a clearly better *generalizable* method. NOT cosmetic wording,
+   one-off tweaks for today's task, or anything better kept as memory. When in doubt → don't ask.
+2. **Ask** one short line, e.g. "Улучшить скилл `<name>`? (<1-line what changes>)". Silence /
+   "no" → skip, edit nothing. Expect this to be rare.
+3. **On explicit yes — never overwrite blind:**
+   - **snapshot** (undo point): `python3 tools/new_skill.py snapshot <name>` → saves
+     `skills/<name>/.history/SKILL.<ts>.md` (private-only, excluded from the public repo).
+   - **edit**: apply the minimal focused diff with a normal Edit. Keep frontmatter valid (`name`
+     still matches dir); keep it **generic & secret-free** (skills sync to the PUBLIC repo).
+   - **validate**: `python3 tools/new_skill.py validate <name>`.
+   - **gate before shipping**: by default **manually smoke-test** the skill on the exact scenario
+     that triggered the improvement. IF an eval case tagged for this skill exists, additionally
+     commit the edit on a branch and run
+     `python3 tools/eval/run.py --compare <old-ref> <new-ref> --skill <name>` (it checks out two
+     git refs, so the tree must be CLEAN — commit first, don't run it on a dirty working tree) and
+     accept only if `delta >= 0`. (Per-skill eval cases barely exist yet in v0, so smoke-test is
+     usually the real gate.)
+   - If validate fails, the smoke-test regresses, or `--compare` shows delta < 0 → revert from the
+     `.history/` snapshot, don't ship. List snapshots with `tools/new_skill.py history <name>`.
+4. **Tell the user in ONE line** what changed (mirrors self-curated memory).
+
+Spec: `SKILL_SELF_IMPROVEMENT_TZ.md`. `.history/` is private-only — never overwrite a live
+SKILL.md without snapshotting first.
+
+---
+
 ## Skill: markdown-new
 
 Convert any public URL to clean Markdown — much less tokens than raw HTML.
