@@ -1,0 +1,11 @@
+# LLM-judge case: open-ended, so an exact match is wrong. A separate `claude -p`
+# call scores the answer 0-1 against the fixed rubric (run N=3, mean + variance).
+# Kept in the suite as a template for open-ended skills; higher cost than the
+# deterministic cases above.
+id: summary-judge
+skill: null
+input: "In one sentence, explain what an offline eval harness is and why it matters for safe self-modification."
+check:
+  type: judge
+  value: "A single-sentence answer that correctly describes an offline eval harness as a repeatable, objective way to score before-vs-after so a change can be judged better/worse rather than by vibes."
+  threshold: 0.7

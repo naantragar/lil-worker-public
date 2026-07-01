@@ -1,0 +1,10 @@
+# Deterministic 'contains' case for the markdown-new skill.
+# The model, given a public URL, should invoke the skill and return markdown
+# whose heading matches the well-known example.org page title.
+id: markdown-new-basic
+skill: markdown-new
+input: "Use the markdown-new skill to convert https://example.com to markdown and show the result."
+check:
+  type: contains
+  value: "Example Domain"
+  ignore_case: true

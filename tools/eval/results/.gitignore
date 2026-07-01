@@ -1,0 +1,3 @@
+# Result artifacts are local-only; keep the directory, ignore its contents.
+*
+!.gitignore

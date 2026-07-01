@@ -1,0 +1,9 @@
+# Deterministic 'regex' case: model must emit a JSON object with the requested
+# keys. Regex is lenient about whitespace/order so a valid-but-formatted answer
+# still passes.
+id: json-output-regex
+skill: null
+input: "Reply with ONLY a JSON object with keys \"status\" and \"count\", where status is \"ok\" and count is 3. No prose."
+check:
+  type: regex
+  value: "\"status\"\\s*:\\s*\"ok\""

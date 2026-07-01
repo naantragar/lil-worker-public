@@ -1,0 +1,11 @@
+# Script-check case: the model's answer is piped (pass_output) into a small
+# python one-liner that asserts it parses as JSON. Exit 0 == valid JSON.
+# This shows the 'script' check verifying an artifact programmatically.
+id: valid-json-script
+skill: null
+input: "Output ONLY a JSON array of the first three prime numbers. No prose, no code fences."
+check:
+  type: script
+  command: "python3 -c 'import sys,json; json.loads(sys.stdin.read())'"
+  pass_output: true
+  expect_exit: 0
