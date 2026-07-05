@@ -226,6 +226,9 @@ Never go silent after the last tool call.
 
 ---
 
+
+---
+
 ## Knowledge & Memory system
 
 Keep CLAUDE.md short - only summaries + links. Details go in separate files. Never duplicate text.
