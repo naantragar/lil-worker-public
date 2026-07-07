@@ -21,6 +21,7 @@ import shlex
 import re
 import tempfile
 import logging
+import shutil
 import subprocess
 import time
 import tomllib
@@ -107,6 +108,15 @@ RUNTIME_DAEMON_PATH = CODE_DIR / "runtime_daemon.py"
 RUNTIME_LOG_PATH = DATA_DIR / "runtime.log"
 RUNTIME_TMUX_SESSION = f"{INSTANCE_NAME}_runtime"
 LAST_RESTART_REPORT_HASH_FILE = DATA_DIR / ".last_restart_report_hash"
+
+# ── Durable background jobs (wake-up feature v0) ───────────────────────────────
+# A detached job (launched via job_ctl.py) survives the one-shot `claude -p` turn and writes
+# its state under JOBS_DIR/<id>/. This poller notices a terminal status and messages the owner
+# — krevetka "waking up" to report. Only the privileged (main) instance notifies.
+JOBS_DIR = DATA_DIR / "jobs"
+JOBS_POLL_INTERVAL = int(os.environ.get("LIL_WORKER_JOBS_POLL_SEC", "20"))
+JOBS_RESULT_PREVIEW = 1500          # chars of result tail included in the message
+JOBS_PRUNE_DAYS = 3                 # delete notified job dirs older than this
 
 
 def load_claude_model() -> str:
@@ -2238,6 +2248,84 @@ async def handle_message(message: Message, bot: Bot):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _job_read(p: Path) -> str:
+    try:
+        return p.read_text().strip()
+    except OSError:
+        return ""
+
+
+async def _notify_finished_jobs(bot: Bot) -> None:
+    """Scan JOBS_DIR once: message the owner about any terminal, not-yet-notified job, then mark
+    it notified. Prune old notified jobs. Owner must be an allowed user. Idempotent per tick —
+    a send failure is retried next tick (the notified marker is written only after a good send)."""
+    if not JOBS_DIR.is_dir():
+        return
+    now = time.time()
+    for job_dir in sorted(JOBS_DIR.iterdir()):
+        if not job_dir.is_dir() or not (job_dir / "spec.json").exists():
+            continue
+        status = _job_read(job_dir / "status")
+        notified = job_dir / "notified"
+
+        if notified.exists():
+            # already handled — prune if it has aged out
+            try:
+                if (now - notified.stat().st_mtime) > JOBS_PRUNE_DAYS * 86400:
+                    shutil.rmtree(job_dir, ignore_errors=True)
+            except OSError:
+                pass
+            continue
+
+        if status not in ("done", "failed"):
+            continue
+
+        try:
+            spec = json.loads((job_dir / "spec.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            spec = {}
+        owner = spec.get("owner_uid")
+        if owner not in ALLOWED_USERS:
+            # never message a non-allowed chat; mark handled so we don't rescan forever
+            logger.warning(f"job {job_dir.name}: owner {owner} not in ALLOWED_USERS — skip notify")
+            notified.write_text("skipped-owner")
+            continue
+
+        label = spec.get("label", "job")
+        rc = _job_read(job_dir / "exit_code")
+        dur = _job_read(job_dir / "duration_sec")
+        result = _job_read(job_dir / "result.txt")
+        if len(result) > JOBS_RESULT_PREVIEW:
+            result = "…" + result[-JOBS_RESULT_PREVIEW:]
+        head = "✅ завершена" if status == "done" else "❌ упала"
+        msg = (
+            f"🦐 Фоновая задача «{label}» {head}\n"
+            f"job {spec.get('id', job_dir.name)} · {dur}s · rc={rc}\n\n"
+            f"{result or '(пустой вывод)'}\n\n"
+            f"(полный результат: {job_dir / 'result.txt'})"
+        )
+        try:
+            # parse_mode=None: raw job output is untrusted — never let it be parsed as HTML.
+            await bot.send_message(owner, msg, parse_mode=None)
+        except Exception as e:
+            logger.warning(f"job {job_dir.name}: notify send failed, will retry: {e}")
+            continue
+        notified.write_text(time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+        logger.info(f"job {job_dir.name}: notified owner {owner} (status={status})")
+
+
+async def poll_jobs_loop(bot: Bot) -> None:
+    """Periodic tick: only the privileged (main) instance notifies about finished jobs."""
+    if INSTANCE_NAME != PRIVILEGED_INSTANCE:
+        return
+    while True:
+        try:
+            await _notify_finished_jobs(bot)
+        except Exception as e:
+            logger.warning(f"jobs poll error: {e}")
+        await asyncio.sleep(JOBS_POLL_INTERVAL)
+
+
 async def main():
     if not BOT_TOKEN:
         print("ERROR: Set TELEGRAM_BOT_TOKEN in .env")
@@ -2302,6 +2390,7 @@ async def main():
             await asyncio.sleep(5)
 
     hb_task = asyncio.create_task(heartbeat_loop())
+    jobs_task = asyncio.create_task(poll_jobs_loop(bot))
     try:
         update_runtime_state(runtime_state, phase="polling")
         await dp.start_polling(bot)
@@ -2310,6 +2399,7 @@ async def main():
         raise
     finally:
         hb_task.cancel()
+        jobs_task.cancel()
         update_runtime_state(runtime_state, phase="stopped")
         pid_file.unlink(missing_ok=True)
 
