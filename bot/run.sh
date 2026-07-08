@@ -24,6 +24,10 @@ HEARTBEAT_STALE_SECONDS=90
 # DEADLOCK window: the async loop_at must tick within this generous window. Long legitimate turns
 # keep the loop turning between bursts, so only a truly wedged loop (~10 min silent) restarts.
 LOOP_STALE_SECONDS=600
+# START-GRACE window: a just-launched bot needs a few seconds to write its state + heartbeat files.
+# While the process has been up less than this, health reports OK so the supervisor can't
+# restart-loop a bot that is merely still booting (the fail-closed "state absent" check).
+START_GRACE_SECONDS=30
 
 ensure_last_good_dir() {
   mkdir -p "$LAST_GOOD_DIR"
@@ -111,50 +115,73 @@ bot_is_healthy() {
   if [ ! -f "$PID_FILE" ] || ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
     return 1
   fi
-  # BUSY = HEALTHY: if a claude turn (a child process of THIS bot pid) is actively running, never
-  # report unhealthy. This is the definitive guard against restarting the bot mid-work, independent
-  # of any heartbeat tuning, and resolves the starvation-vs-deadlock ambiguity for long turns.
-  # Read-only + precise (children of the exact bot pid only — no fuzzy match, no signals sent).
-  local BOT_PID
-  BOT_PID="$(cat "$PID_FILE" 2>/dev/null)"
-  if [ -n "$BOT_PID" ] && pgrep -P "$BOT_PID" -f 'claude' >/dev/null 2>&1; then
+  # START-GRACE: while the process has been up less than the grace window, treat it as healthy so a
+  # fail-closed "state/heartbeat file absent" check below can't restart-loop a bot that is still
+  # booting (state + heartbeat are written a moment after the process appears). Only reached when the
+  # PID is alive, so a bot that crashes at boot still fails (kill -0 above) and gets recovered.
+  local BOT_PID_G UPTIME_G
+  BOT_PID_G="$(cat "$PID_FILE" 2>/dev/null)"
+  UPTIME_G="$(ps -o etimes= -p "$BOT_PID_G" 2>/dev/null | tr -d ' ')"
+  if [ -n "$UPTIME_G" ] && [ "$UPTIME_G" -lt "$START_GRACE_SECONDS" ] 2>/dev/null; then
     return 0
   fi
-  if [ ! -f "$STATE_FILE" ]; then
-    return 1
+  # BUSY = HEALTHY (for the SOFT signals only): a claude turn that is a child of THIS bot pid means
+  # active work — it must never be restarted on a heartbeat blip. Precise + read-only (children of the
+  # exact bot pid; no fuzzy match, no signals). Captured as a flag so the DEADLOCK check below can
+  # still override it — see the reorder note.
+  local BOT_PID BUSY
+  BOT_PID="$(cat "$PID_FILE" 2>/dev/null)"
+  BUSY=0
+  if [ -n "$BOT_PID" ] && pgrep -P "$BOT_PID" -f 'claude' >/dev/null 2>&1; then
+    BUSY=1
   fi
-  "$VENV_PYTHON" - "$STATE_FILE" "$HEARTBEAT_FILE" "$HEARTBEAT_STALE_SECONDS" "$LOOP_STALE_SECONDS" <<'PY' >/dev/null
+  # DEADLOCK OVERRIDES BUSY (the load-bearing ordering): a wedged event loop (loop_at ancient) is
+  # UNHEALTHY even while a claude child is alive. Otherwise a hung-but-busy bot reports healthy
+  # forever and the SOLE cron supervisor could never recover it. Safe because a legitimate long turn
+  # keeps loop_at fresh — the async loop_heartbeat ticks every 5s while the loop merely AWAITS the
+  # claude subprocess — so this only trips a genuinely stuck loop (>LOOP_STALE_SECONDS), never a
+  # healthy turn. Needs the state file to read loop_at; if it's absent we can't assess deadlock, so
+  # fall back to the old busy-first behavior. BUSY still suppresses the softer heartbeat-staleness
+  # restart inside the checker.
+  if [ ! -f "$STATE_FILE" ]; then
+    [ "$BUSY" = 1 ] && return 0 || return 1
+  fi
+  "$VENV_PYTHON" - "$STATE_FILE" "$HEARTBEAT_FILE" "$HEARTBEAT_STALE_SECONDS" "$LOOP_STALE_SECONDS" "$BUSY" <<'PY' >/dev/null
 import json, sys, time
 from pathlib import Path
 
 state_path, hb_path = sys.argv[1], sys.argv[2]
-thread_stale, loop_stale = int(sys.argv[3]), int(sys.argv[4])
+thread_stale, loop_stale, busy = int(sys.argv[3]), int(sys.argv[4]), sys.argv[5] == "1"
 now = time.time()
 
-# Fail-safe: an unreadable/absent state file => treat as unhealthy (err toward recovery).
+# Fail-safe: an unreadable state file => can't assess the deadlock signal. Preserve the old
+# busy-first behavior (a busy bot stays healthy; an idle one errs toward recovery).
 try:
     state = json.loads(Path(state_path).read_text(encoding="utf-8"))
 except Exception:
+    raise SystemExit(0 if busy else 1)
+
+# DEADLOCK (loop_at) — checked FIRST and OVERRIDES busy. loop_at is written ONLY by the event loop;
+# if it is ancient the loop is wedged even though the process/child lives -> restart.
+loop_at = float(state.get("loop_at") or 0)
+if loop_at and now - loop_at > loop_stale:
     raise SystemExit(1)
+
+# From here BUSY suppresses the softer signals: an active claude turn is healthy regardless of them.
+if busy:
+    raise SystemExit(0)
 
 if str(state.get("phase") or "") == "failed":
     raise SystemExit(1)
 
-# PRIMARY: the load-immune OS-thread heartbeat file. Fall back to the (loop-written) heartbeat_at
-# only for back-compat with an older bot that predates the thread file.
+# PRIMARY liveness: the load-immune OS-thread heartbeat file. Fall back to the (loop-written)
+# heartbeat_at only for back-compat with an older bot that predates the thread file.
 try:
     thread_hb = float(Path(hb_path).read_text().strip())
 except Exception:
     thread_hb = float(state.get("heartbeat_at") or 0)
 if not thread_hb or now - thread_hb > thread_stale:
     raise SystemExit(1)   # process/thread genuinely stuck or dead
-
-# SECONDARY (deadlock): loop_at is written ONLY by the event loop. If it is ancient while the thread
-# heartbeat is fresh, the async loop is wedged even though the process lives -> restart. Generous
-# window so heavy but healthy turns (loop still ticks between CPU bursts) never trip it.
-loop_at = float(state.get("loop_at") or 0)
-if loop_at and now - loop_at > loop_stale:
-    raise SystemExit(1)
 PY
 }
 
@@ -186,9 +213,11 @@ kill_main_bots() {
 
 case "$1" in
   start)
+    # Runtime is an AUXILIARY component: the bot answers messages by invoking `claude -p` directly and
+    # does NOT route through the runtime socket (bot.py treats a down runtime as a startup warning, not
+    # fatal). So a broken runtime must never block the bot from starting — attempt it, warn, continue.
     if ! start_runtime; then
-      echo "Start aborted: runtime did not become healthy."
-      exit 1
+      echo "WARN: auxiliary runtime did not become healthy — starting bot anyway (non-fatal)."
     fi
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
       echo "Already running (PID $(cat "$PID_FILE"))"
@@ -209,11 +238,10 @@ case "$1" in
     echo $! > "$PID_FILE"
     echo "Started (PID $!)"
     snapshot_last_good
-    # Auto-start watchdog if available and not running
-    WATCHDOG="$SCRIPT_DIR/watchdog.sh"
-    if [ -x "$WATCHDOG" ]; then
-      "$WATCHDOG" start 2>/dev/null
-    fi
+    # SINGLE-SUPERVISOR model: the crontab health-check (`health || (sleep 5; health) || restart`) is
+    # the ONE supervisor. run.sh deliberately no longer resurrects watchdog.sh here — two supervisors
+    # firing `start`/`restart` in the same window caused a TOCTOU double-launch/self-kill race
+    # (two bots on one token → getUpdates 409). watchdog.sh is retired; do NOT re-add an auto-start.
     ;;
 
   stop)
@@ -268,7 +296,10 @@ case "$1" in
     ;;
 
   health)
-    if runtime_is_healthy && bot_is_healthy; then
+    # Health reflects the BOT only. The auxiliary runtime is intentionally EXCLUDED: a broken runtime
+    # must not mark a perfectly-fine bot UNHEALTHY (the supervisor would then restart the bot for an
+    # aux-component failure — a self-outage vector). Runtime state stays visible via `status`/`doctor`.
+    if bot_is_healthy; then
       echo "OK"
     else
       echo "UNHEALTHY"
