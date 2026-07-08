@@ -158,6 +158,24 @@ if loop_at and now - loop_at > loop_stale:
 PY
 }
 
+# Kill the MAIN bot process(es) precisely, by cwd + instance identity read from /proc — NOT by a
+# cmdline string. This catches duplicates regardless of absolute-vs-relative cmdline (the old
+# anchored `pkill` missed relative ones → two bots on one token → getUpdates conflict), while never
+# touching a SECONDARY instance (game/helper — they carry a LIL_WORKER_INSTANCE tag) or another
+# project's bot.py that lives in a different working directory. Follows "identify by cwd before kill".
+# $1 = signal (default TERM). Echoes each pid it signalled.
+kill_main_bots() {
+  local sig="${1:-TERM}" pid comm cwd inst
+  for pid in $(pgrep -f 'bot\.py' 2>/dev/null); do
+    comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
+    case "$comm" in python*) ;; *) continue ;; esac          # only python interpreters, not our bash/claude
+    cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null)"
+    [ "$cwd" = "$SCRIPT_DIR" ] || continue                    # only THIS bot dir (spares other projects)
+    inst="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^LIL_WORKER_INSTANCE=//p')"
+    case "$inst" in ""|lil_worker) kill "-$sig" "$pid" 2>/dev/null && echo "$pid" ;; esac  # main only
+  done
+}
+
 case "$1" in
   start)
     if ! start_runtime; then
@@ -168,10 +186,11 @@ case "$1" in
       echo "Already running (PID $(cat "$PID_FILE"))"
       exit 1
     fi
-    # Clean up any ghost processes before starting
-    pkill -f "$VENV_PYTHON $BOT_SCRIPT$" 2>/dev/null
+    # Clean up any ghost MAIN-bot processes before starting (cwd+instance precise; catches the
+    # relative-cmdline duplicates the old anchored pkill missed; leaves game/helper/other projects).
+    kill_main_bots TERM >/dev/null
     sleep 0.3
-    pkill -9 -f "$VENV_PYTHON $BOT_SCRIPT$" 2>/dev/null
+    kill_main_bots KILL >/dev/null
     # Start the MAIN bot with a CLEAN env: unset any inherited instance/token vars so bot/.env is
     # authoritative. Prevents a start invoked from a secondary/other-project context from bringing
     # the main bot up on the wrong token (the cross-context env-leak class of bug).
@@ -192,17 +211,14 @@ case "$1" in
   stop)
     stop_runtime
     STOPPED=false
-    # Kill by PID file
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-      kill "$(cat "$PID_FILE")"
-      STOPPED=true
-    fi
+    # Kill the main bot precisely by cwd + instance (catches relative-path duplicates the old
+    # anchored pkill missed; never touches secondary instances or other projects' bot.py).
+    KILLED="$(kill_main_bots TERM)"
+    [ -n "$KILLED" ] && STOPPED=true
     rm -f "$PID_FILE"
-    # Kill any remaining instances (prevents ghost processes)
-    pkill -f "$VENV_PYTHON $BOT_SCRIPT$" 2>/dev/null && STOPPED=true
     sleep 0.5
-    # Force kill if still alive
-    pkill -9 -f "$VENV_PYTHON $BOT_SCRIPT$" 2>/dev/null
+    # Force-kill any survivors.
+    kill_main_bots KILL >/dev/null
     if $STOPPED; then
       echo "Stopped."
     else

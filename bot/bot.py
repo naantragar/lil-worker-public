@@ -2535,7 +2535,14 @@ async def main():
         hb_task.cancel()
         jobs_task.cancel()
         update_runtime_state(runtime_state, phase="stopped")
-        pid_file.unlink(missing_ok=True)
+        # Only remove the pid file if it STILL points to us. During a restart a newer bot may have
+        # already claimed it; deleting it then would blank the live bot's pid and false-UNHEALTHY it
+        # (the observed race). Guard the unlink so the old bot never clobbers the new bot's pid file.
+        try:
+            if pid_file.read_text().strip() == str(os.getpid()):
+                pid_file.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
