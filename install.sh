@@ -158,7 +158,7 @@ echo "      dependencies installed"
 chmod +x bot/run.sh
 [ -f bot/validate.sh ] && chmod +x bot/validate.sh
 
-# ── 6. Auto-restart on reboot + watchdog ──────────────────────────────────────
+# ── 6. Auto-restart on reboot + health supervisor (cron) ─────────────────────
 
 echo "[6/6] Setting up auto-restart..."
 
@@ -168,14 +168,17 @@ chmod +x bot/watchdog.sh 2>/dev/null
 CRON_OK=false
 if crontab -l >/dev/null 2>&1 || [ -w /var/spool/cron/crontabs/ ] 2>/dev/null; then
   CRON_REBOOT="@reboot sleep 15 && cd $TARGET && bot/run.sh start >> bot/lil_worker.log 2>&1"
+  # Single supervisor: a */5 health-check that restarts a dead/hung bot, with a built-in circuit
+  # breaker (see bot/run.sh `supervise`). This is the ONE supervisor — do NOT also run watchdog.sh.
+  CRON_SUPERVISE="*/5 * * * * cd $TARGET || exit; timeout 120 bot/run.sh supervise >> bot/lil_worker.log 2>&1"
   CRON_MARKER="# lil_worker auto-restart"
 
   if crontab -l 2>/dev/null | grep -qF "lil_worker auto-restart"; then
     echo "      cron already installed"
     CRON_OK=true
   else
-    if (crontab -l 2>/dev/null; echo ""; echo "$CRON_MARKER"; echo "$CRON_REBOOT") | crontab - 2>/dev/null; then
-      echo "      cron @reboot installed"
+    if (crontab -l 2>/dev/null; echo ""; echo "$CRON_MARKER"; echo "$CRON_REBOOT"; echo "$CRON_SUPERVISE") | crontab - 2>/dev/null; then
+      echo "      cron installed: @reboot start + */5 supervise (health-check + circuit breaker)"
       CRON_OK=true
     fi
   fi
@@ -183,11 +186,9 @@ fi
 
 if [ "$CRON_OK" = false ]; then
   echo "      cron not available (no permissions)"
-  echo "      watchdog will handle crash recovery (starts with run.sh start)"
+  echo "      NOTE: no cron supervisor installed — restart manually if the bot dies (bot/run.sh start)"
   echo "      NOTE: after server reboot, run manually: cd ~/lil_worker && bot/run.sh start"
 fi
-
-echo "      watchdog: bot/watchdog.sh (auto-starts with run.sh, checks every 5 min)"
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 
@@ -210,7 +211,7 @@ echo ""
 echo "  4. Check in Telegram - send any message to your bot"
 echo ""
 echo "Auto-restart:"
-echo "  - Watchdog checks every 5 min, restarts if crashed"
+echo "  - Supervisor: */5 cron 'bot/run.sh supervise' — health-check + restart + circuit breaker"
 if [ "$CRON_OK" = true ]; then
   echo "  - Cron @reboot: bot starts automatically after server reboot"
 else

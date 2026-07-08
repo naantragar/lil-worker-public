@@ -28,6 +28,17 @@ LOOP_STALE_SECONDS=600
 # While the process has been up less than this, health reports OK so the supervisor can't
 # restart-loop a bot that is merely still booting (the fail-closed "state absent" check).
 START_GRACE_SECONDS=30
+# --- Circuit breaker (supervise) config ---
+# supervise = the SOLE cron entrypoint. If the bot stays unhealthy across repeated restarts the
+# breaker TRIPS: auto-restart halts (stops the restart-loop + Telegram startup-message spam) and one
+# alert is sent. After a cooldown it makes a single half-open trial restart, and self-heals when the
+# bot comes back. State files live in bot/ and are git-ignored (runtime artifacts, never public).
+RESTART_LEDGER="$SCRIPT_DIR/restart_ledger"   # newline epochs, one per restart, pruned to window
+BREAKER_FILE="$SCRIPT_DIR/breaker_tripped"    # presence = breaker OPEN (body: ts=/reason=)
+ENV_FILE="$SCRIPT_DIR/.env"
+BREAKER_THRESHOLD=3      # unhealthy restarts within the window before tripping
+BREAKER_WINDOW=1800      # 30 min counting window
+BREAKER_COOLDOWN=3600    # 1 h open before a single half-open trial restart
 
 ensure_last_good_dir() {
   mkdir -p "$LAST_GOOD_DIR"
@@ -109,6 +120,53 @@ runtime_is_healthy() {
     return 1
   fi
   "$VENV_PYTHON" "$RUNTIME_CTL" health >/dev/null 2>&1
+}
+
+_sup_log() { echo "[$(date '+%F %T')] supervise: $*"; }
+
+# Read one KEY from .env WITHOUT sourcing it (never execute .env content). Strips a trailing CR and
+# surrounding double-quotes. Absent/empty -> empty string.
+_sup_env_get() {
+  [ -f "$ENV_FILE" ] || return 0
+  local v
+  v="$(grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2-)"
+  v="${v%$'\r'}"; v="${v%\"}"; v="${v#\"}"
+  printf '%s' "$v"
+}
+
+# Best-effort ONE Telegram message to the admin (first ALLOWED_USERS id). Never fails supervise,
+# never logs the token (curl output -> /dev/null). Only the still-alive external cron can announce a
+# down bot, since a tripped bot never boots to announce itself.
+_sup_notify() {
+  local msg="$1" token chat
+  token="$(_sup_env_get TELEGRAM_BOT_TOKEN)"
+  chat="$(_sup_env_get ALLOWED_USERS | cut -d, -f1 | tr -d ' ')"
+  [ -n "$token" ] && [ -n "$chat" ] || return 0
+  # Token goes in via a -K config on STDIN (a pipe), never on the command line — so it can't be read
+  # from /proc/<pid>/cmdline or `ps` by other local accounts. chat_id/text stay in argv (not secret).
+  printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$token" \
+    | timeout 15 curl -s -o /dev/null -K - \
+        --data-urlencode "chat_id=$chat" \
+        --data-urlencode "text=$msg" >/dev/null 2>&1 || true
+}
+
+# Prune RESTART_LEDGER to restart timestamps within BREAKER_WINDOW of $1(now); echo the surviving
+# count; delete the file when empty; sweep any orphaned mktemp litter. Called on BOTH healthy and
+# unhealthy cycles so the count is a true rolling window — a flapping bot (down/up/down) still
+# accumulates toward the threshold instead of being zeroed by every healthy sample.
+_sup_prune_ledger() {
+  local now="$1" n=0 t tmp
+  rm -f "$RESTART_LEDGER".* 2>/dev/null
+  [ -f "$RESTART_LEDGER" ] || { echo 0; return 0; }
+  tmp="$(mktemp "${RESTART_LEDGER}.XXXXXX")" || { echo 0; return 0; }
+  while IFS= read -r t; do
+    case "$t" in ''|*[!0-9]*) continue ;; esac
+    if [ $(( now - t )) -ge 0 ] && [ $(( now - t )) -lt "$BREAKER_WINDOW" ]; then
+      echo "$t" >> "$tmp"; n=$(( n + 1 ))
+    fi
+  done < "$RESTART_LEDGER"
+  if [ "$n" -gt 0 ]; then mv -f "$tmp" "$RESTART_LEDGER"; else rm -f "$tmp" "$RESTART_LEDGER"; fi
+  echo "$n"
 }
 
 bot_is_healthy() {
@@ -307,6 +365,74 @@ case "$1" in
     fi
     ;;
 
+  supervise)
+    # SOLE cron supervisor entrypoint (cron: */5 ... timeout 120 bot/run.sh supervise >> log 2>&1).
+    # Replaces the old inline `health || (sleep 5; health) || restart` brace-group and adds a circuit
+    # breaker so a persistently-broken bot can't restart-loop / startup-message-spam forever. cron runs
+    # as an INDEPENDENT root process (not a child of the bot), so calling restart here is correct — it
+    # only fires when the bot is already unhealthy, i.e. no live turn to protect.
+    now="$(date +%s)"
+
+    _sup_reset_if_healthy() {
+      if [ -f "$BREAKER_FILE" ]; then
+        _sup_log "bot healthy again -> clearing tripped breaker"
+        _sup_notify "lil_worker: recovered — bot healthy again, circuit breaker reset."
+        rm -f "$BREAKER_FILE"
+      fi
+      # Age out old restarts but do NOT wipe: a flapping bot must keep accumulating toward the window
+      # threshold across interspersed healthy samples (else it never trips and spams forever).
+      _sup_prune_ledger "$now" >/dev/null
+    }
+
+    # (a) healthy now -> reset breaker + prune, done
+    if bot_is_healthy; then _sup_reset_if_healthy; exit 0; fi
+    # (b) debounce a single transient blip
+    sleep 5
+    if bot_is_healthy; then _sup_reset_if_healthy; exit 0; fi
+
+    # ---- still unhealthy ----
+    # (c) breaker already OPEN?
+    if [ -f "$BREAKER_FILE" ]; then
+      tripped_ts="$(sed -n 's/^ts=//p' "$BREAKER_FILE" 2>/dev/null | head -n1)"
+      case "$tripped_ts" in ''|*[!0-9]*) tripped_ts=0 ;; esac
+      age=$(( now - tripped_ts ))
+      # A missing/corrupt ts (interrupted or disk-full write) or a future ts (clock skew) would else
+      # read as "cooldown long expired" and half-open-restart EVERY cycle. Treat any bad ts as a fresh
+      # trip: re-arm to now and skip this cycle.
+      if [ "$tripped_ts" -eq 0 ] || [ "$age" -lt 0 ]; then
+        printf 'ts=%s\nreason=re-armed (bad/absent ts)\n' "$now" > "$BREAKER_FILE"
+        _sup_log "breaker marker had bad ts -> re-armed to now, skip restart"
+        exit 0
+      fi
+      if [ "$age" -lt "$BREAKER_COOLDOWN" ]; then
+        _sup_log "breaker OPEN (${age}s/${BREAKER_COOLDOWN}s cooldown) -> skip restart"
+        exit 0
+      fi
+      # half-open: exactly ONE trial restart per cooldown; re-arm ts so the next open window starts now
+      _sup_log "breaker HALF-OPEN -> single trial restart"
+      printf 'ts=%s\nreason=half-open trial\n' "$now" > "$BREAKER_FILE"
+      "$SCRIPT_DIR/run.sh" restart
+      exit 0
+    fi
+
+    # (d) count restarts within the rolling window (prune-and-count in one place)
+    count="$(_sup_prune_ledger "$now")"
+
+    if [ "$count" -ge "$BREAKER_THRESHOLD" ]; then
+      _sup_log "breaker TRIP: ${count} restarts within ${BREAKER_WINDOW}s -> halting auto-restart"
+      printf 'ts=%s\nreason=%s restarts in %ss\n' "$now" "$count" "$BREAKER_WINDOW" > "$BREAKER_FILE"
+      _sup_notify "lil_worker: circuit breaker TRIPPED — bot still unhealthy after ${count} restarts in $(( BREAKER_WINDOW/60 ))min. Auto-restart halted, needs a look. Trial retry in $(( BREAKER_COOLDOWN/60 ))min."
+      rm -f "$RESTART_LEDGER"
+      exit 0
+    fi
+
+    # under threshold -> record this restart + do it
+    echo "$now" >> "$RESTART_LEDGER"
+    _sup_log "unhealthy -> restart #$(( count + 1 )) within window"
+    "$SCRIPT_DIR/run.sh" restart
+    exit 0
+    ;;
+
   doctor)
     "$0" status
     echo "---"
@@ -342,7 +468,7 @@ case "$1" in
     ;;
 
   *)
-    echo "Usage: $0 {start|stop|restart|status|health|doctor|snapshot|restore-last-good|logs|runtime-health|runtime-sessions}"
+    echo "Usage: $0 {start|stop|restart|status|health|supervise|doctor|snapshot|restore-last-good|logs|runtime-health|runtime-sessions}"
     exit 1
     ;;
 esac
