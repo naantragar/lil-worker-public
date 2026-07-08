@@ -165,12 +165,20 @@ PY
 # project's bot.py that lives in a different working directory. Follows "identify by cwd before kill".
 # $1 = signal (default TERM). Echoes each pid it signalled.
 kill_main_bots() {
-  local sig="${1:-TERM}" pid comm cwd inst
+  local sig="${1:-TERM}" pid comm cwd inst script a
   for pid in $(pgrep -f 'bot\.py' 2>/dev/null); do
-    comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
-    case "$comm" in python*) ;; *) continue ;; esac          # only python interpreters, not our bash/claude
-    cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null)"
-    [ "$cwd" = "$SCRIPT_DIR" ] || continue                    # only THIS bot dir (spares other projects)
+    case "$(cat "/proc/$pid/comm" 2>/dev/null)" in python*) ;; *) continue ;; esac  # python only, not our bash/claude
+    # Identify OUR bot by the RESOLVED script path (== $BOT_SCRIPT), NOT by process cwd: the bot's
+    # cwd just reflects whoever launched it (watchdog from the parent dir vs a manual run from bot/),
+    # so cwd is unreliable. Reconstruct the .../bot.py arg from argv and resolve relative→cwd.
+    script=""
+    while IFS= read -r -d '' a; do case "$a" in *bot.py) script="$a" ;; esac; done < "/proc/$pid/cmdline" 2>/dev/null
+    [ -n "$script" ] || continue
+    case "$script" in
+      /*) : ;;
+      *) cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null)"; script="$cwd/$script" ;;
+    esac
+    [ "$script" = "$BOT_SCRIPT" ] || continue                 # only OUR bot.py (spares other projects)
     inst="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^LIL_WORKER_INSTANCE=//p')"
     case "$inst" in ""|lil_worker) kill "-$sig" "$pid" 2>/dev/null && echo "$pid" ;; esac  # main only
   done
