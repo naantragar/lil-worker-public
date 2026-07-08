@@ -37,6 +37,19 @@ WRITE_RE = re.compile(
     r"|open\([^)]*['\"][wa])"
 )
 
+# LIFECYCLE indicators: a secondary instance must NEVER kill/restart the MAIN bot, even though
+# these commands don't "write a file" (so WRITE_RE misses them). This is the privilege boundary —
+# the main bot's process lifecycle is main-only. A secondary manages ITSELF via instance.sh, which
+# is not matched here. Blocks: the main restart script, main run.sh lifecycle verbs, and any
+# kill/pkill/systemctl aimed at the bot process or its pid file.
+LIFECYCLE_RE = re.compile(
+    r"\brestart_crab\.sh\b"
+    r"|\brun\.sh\b[^\n]*\b(restart|stop|start)\b"
+    r"|\b(pkill|kill|killall)\b[^\n]*\bbot\.py\b"
+    r"|\b(pkill|kill|killall)\b[^\n]*lil_worker(\.pid|\b)"
+    r"|\bsystemctl\b[^\n]*\b(restart|stop|kill|start)\b"
+)
+
 
 def _deny(reason):
     sys.stderr.write(
@@ -78,6 +91,15 @@ def main():
 
     if tool == "Bash":
         cmd = ti.get("command", "") or ""
+        # Normalize line-continuations + newlines to spaces so a multi-line command can't split a
+        # verb from its target to evade LIFECYCLE_RE. (Numeric-PID/obfuscated kills still evade —
+        # this guard is a speed-bump against naive/accidental interference, NOT a hard sandbox; real
+        # isolation = running secondaries under a separate OS user. See the deferred follow-up.)
+        norm = re.sub(r"\\\s*\n", " ", cmd).replace("\n", " ")
+        # Lifecycle first: block any attempt to kill/restart the MAIN bot regardless of writes.
+        if LIFECYCLE_RE.search(norm):
+            _deny("refused a command that could kill/restart the MAIN bot — process lifecycle is "
+                  "main-only; a secondary instance manages only itself.")
         if WRITE_RE.search(cmd):
             # ignore references to the instance's OWN data dir, then see if any protected
             # (shared-code) path remains.

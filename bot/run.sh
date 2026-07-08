@@ -172,7 +172,13 @@ case "$1" in
     pkill -f "$VENV_PYTHON $BOT_SCRIPT$" 2>/dev/null
     sleep 0.3
     pkill -9 -f "$VENV_PYTHON $BOT_SCRIPT$" 2>/dev/null
-    nohup env PYTHONUNBUFFERED=1 "$VENV_PYTHON" "$BOT_SCRIPT" >> "$LOG_FILE" 2>&1 &
+    # Start the MAIN bot with a CLEAN env: unset any inherited instance/token vars so bot/.env is
+    # authoritative. Prevents a start invoked from a secondary/other-project context from bringing
+    # the main bot up on the wrong token (the cross-context env-leak class of bug).
+    nohup env -u TELEGRAM_BOT_TOKEN -u ALLOWED_USERS -u CLAUDE_MODEL -u CODEX_MODEL \
+      -u CODEX_SANDBOX_MODE -u CODEX_APPROVAL_POLICY -u OPENAI_API_KEY -u OPENAI_VOICE_MODEL \
+      -u LIL_WORKER_INSTANCE -u LIL_WORKER_DATA_DIR -u LIL_WORKER_BOT_CWD -u LIL_WORKER_EFFORT \
+      PYTHONUNBUFFERED=1 "$VENV_PYTHON" "$BOT_SCRIPT" >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
     echo "Started (PID $!)"
     snapshot_last_good

@@ -332,10 +332,10 @@ TTS_MODEL = "gpt-4o-mini-tts"
 TTS_VOICE = "marin"
 TEMP_DIR = Path(tempfile.gettempdir())
 
-# Pattern: [VOICE lang="en"]text to speak[/VOICE]
-# Must start at beginning of line — prevents matching inline examples in text
+# Pattern: [VOICE lang="en" speed="1.5"]text to speak[/VOICE]
+# speed is optional (default 1.0); must start at beginning of line
 _VOICE_RE = re.compile(
-    r'(?m)^\s*\[VOICE\s+lang=["\'](\w+)["\']\](.*?)\[/VOICE\]',
+    r'(?m)^\s*\[VOICE\s+lang=["\'](\w+)["\'](?:\s+speed=["\']([0-9.]+)["\'])?\s*\](.*?)\[/VOICE\]',
     re.DOTALL,
 )
 
@@ -375,22 +375,25 @@ async def send_files(reply_msg: Message, paths: list[str]):
                 pass
 
 
-def extract_voice_blocks(text: str) -> tuple[str, list[tuple[str, str]]]:
+def extract_voice_blocks(text: str) -> tuple[str, list[tuple[str, str, float]]]:
     """Extract [VOICE] blocks from response text.
 
-    Returns (cleaned_text, [(lang, speech_text), ...])
+    Returns (cleaned_text, [(lang, speech_text, speed), ...])
     """
     blocks = []
     for match in _VOICE_RE.finditer(text):
         lang = match.group(1)
-        speech_text = match.group(2).strip()
+        speed_str = match.group(2)
+        speech_text = match.group(3).strip()
+        speed = float(speed_str) if speed_str else 1.0
+        speed = max(0.25, min(4.0, speed))
         if speech_text:
-            blocks.append((lang, speech_text))
+            blocks.append((lang, speech_text, speed))
     cleaned = _VOICE_RE.sub("", text).strip()
     return cleaned, blocks
 
 
-async def synthesize_speech(text: str, user_id: int) -> Path | None:
+async def synthesize_speech(text: str, user_id: int, speed: float = 1.0) -> Path | None:
     """Generate OGG Opus audio via OpenAI TTS."""
     if not OPENAI_API_KEY:
         logger.error("TTS: OPENAI_API_KEY not set")
@@ -403,6 +406,7 @@ async def synthesize_speech(text: str, user_id: int) -> Path | None:
             voice=TTS_VOICE,
             input=text,
             response_format="opus",
+            speed=speed,
         ) as response:
             await response.stream_to_file(audio_path)
         return audio_path
@@ -412,7 +416,7 @@ async def synthesize_speech(text: str, user_id: int) -> Path | None:
 
 
 async def send_voice_with_indicator(
-    message: Message, bot: Bot, vb_text: str, vb_lang: str, user_id: int
+    message: Message, bot: Bot, vb_text: str, vb_lang: str, user_id: int, speed: float = 1.0
 ):
     """Show record_voice animation, synthesize TTS, send voice message."""
     chat_id = message.chat.id
@@ -438,8 +442,8 @@ async def send_voice_with_indicator(
 
     loop_task = asyncio.create_task(_record_voice_loop())
     try:
-        logger.info(f"TTS: generating voice ({vb_lang}), {len(vb_text)} chars")
-        audio_path = await synthesize_speech(vb_text, user_id)
+        logger.info(f"TTS: generating voice ({vb_lang}, speed={speed}), {len(vb_text)} chars")
+        audio_path = await synthesize_speech(vb_text, user_id, speed=speed)
         if audio_path:
             try:
                 await message.answer_voice(voice=FSInputFile(audio_path))
@@ -519,8 +523,8 @@ async def _flush_buffer(user_id: int, bot: Bot):
         await send_long_message(reply_msg, response_html)
 
     # Send voice messages with record_voice animation
-    for vb_lang, vb_text in voice_blocks:
-        await send_voice_with_indicator(reply_msg, bot, vb_text, vb_lang, user_id)
+    for vb_lang, vb_text, vb_speed in voice_blocks:
+        await send_voice_with_indicator(reply_msg, bot, vb_text, vb_lang, user_id, speed=vb_speed)
 
     # Send files — markers from the final answer AND from streamed text
     await send_files(reply_msg, streamed_files + file_paths)
@@ -2112,8 +2116,8 @@ async def _flush_photo_buffer(user_id: int, bot: Bot):
         response_html = markdown_to_telegram_html(cleaned_response)
         await send_long_message(reply_msg, response_html)
 
-    for vb_lang, vb_text in voice_blocks:
-        await send_voice_with_indicator(reply_msg, bot, vb_text, vb_lang, user_id)
+    for vb_lang, vb_text, vb_speed in voice_blocks:
+        await send_voice_with_indicator(reply_msg, bot, vb_text, vb_lang, user_id, speed=vb_speed)
 
     await send_files(reply_msg, streamed_files + file_paths)
 
@@ -2244,8 +2248,8 @@ async def handle_voice(message: Message, bot: Bot):
         response_html = markdown_to_telegram_html(cleaned_response)
         await send_long_message(message, response_html)
 
-    for vb_lang, vb_text in voice_blocks:
-        await send_voice_with_indicator(message, bot, vb_text, vb_lang, user_id)
+    for vb_lang, vb_text, vb_speed in voice_blocks:
+        await send_voice_with_indicator(message, bot, vb_text, vb_lang, user_id, speed=vb_speed)
 
     await send_files(message, streamed_files + file_paths)
 
