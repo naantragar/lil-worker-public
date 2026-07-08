@@ -8,6 +8,7 @@ VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
 PID_FILE="$SCRIPT_DIR/lil_worker.pid"
 LOG_FILE="$SCRIPT_DIR/lil_worker.log"
 STATE_FILE="$SCRIPT_DIR/bot_runtime_state.json"
+HEARTBEAT_FILE="$SCRIPT_DIR/bot_heartbeat"
 # CODEX: local persistent runtime layer for shell/session reuse.
 RUNTIME_SCRIPT="$SCRIPT_DIR/runtime_daemon.py"
 RUNTIME_CTL="$SCRIPT_DIR/runtime_ctl.py"
@@ -16,7 +17,13 @@ RUNTIME_LOG="$SCRIPT_DIR/runtime.log"
 RUNTIME_SOCKET="$SCRIPT_DIR/.runtime.sock"
 RUNTIME_TMUX_SESSION="lil_worker_runtime"
 LAST_GOOD_DIR="$SCRIPT_DIR/backups/last_good"
-HEARTBEAT_STALE_SECONDS=20
+# PRIMARY liveness window: the OS-thread heartbeat (bot_heartbeat) is load-immune, so a generous
+# 90s only trips when the process/thread is genuinely stuck or dead — a busy event loop no longer
+# false-restarts the bot mid-work (the old 20s footgun).
+HEARTBEAT_STALE_SECONDS=90
+# DEADLOCK window: the async loop_at must tick within this generous window. Long legitimate turns
+# keep the loop turning between bursts, so only a truly wedged loop (~10 min silent) restarts.
+LOOP_STALE_SECONDS=600
 
 ensure_last_good_dir() {
   mkdir -p "$LAST_GOOD_DIR"
@@ -104,22 +111,49 @@ bot_is_healthy() {
   if [ ! -f "$PID_FILE" ] || ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
     return 1
   fi
+  # BUSY = HEALTHY: if a claude turn (a child process of THIS bot pid) is actively running, never
+  # report unhealthy. This is the definitive guard against restarting the bot mid-work, independent
+  # of any heartbeat tuning, and resolves the starvation-vs-deadlock ambiguity for long turns.
+  # Read-only + precise (children of the exact bot pid only — no fuzzy match, no signals sent).
+  local BOT_PID
+  BOT_PID="$(cat "$PID_FILE" 2>/dev/null)"
+  if [ -n "$BOT_PID" ] && pgrep -P "$BOT_PID" -f 'claude' >/dev/null 2>&1; then
+    return 0
+  fi
   if [ ! -f "$STATE_FILE" ]; then
     return 1
   fi
-  "$VENV_PYTHON" - "$STATE_FILE" "$HEARTBEAT_STALE_SECONDS" <<'PY' >/dev/null
+  "$VENV_PYTHON" - "$STATE_FILE" "$HEARTBEAT_FILE" "$HEARTBEAT_STALE_SECONDS" "$LOOP_STALE_SECONDS" <<'PY' >/dev/null
 import json, sys, time
 from pathlib import Path
-state = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-stale = int(sys.argv[2])
+
+state_path, hb_path = sys.argv[1], sys.argv[2]
+thread_stale, loop_stale = int(sys.argv[3]), int(sys.argv[4])
 now = time.time()
-heartbeat_at = float(state.get("heartbeat_at") or 0)
-phase = str(state.get("phase") or "")
-if not heartbeat_at:
+
+# Fail-safe: an unreadable/absent state file => treat as unhealthy (err toward recovery).
+try:
+    state = json.loads(Path(state_path).read_text(encoding="utf-8"))
+except Exception:
     raise SystemExit(1)
-if now - heartbeat_at > stale:
+
+if str(state.get("phase") or "") == "failed":
     raise SystemExit(1)
-if phase in {"failed"}:
+
+# PRIMARY: the load-immune OS-thread heartbeat file. Fall back to the (loop-written) heartbeat_at
+# only for back-compat with an older bot that predates the thread file.
+try:
+    thread_hb = float(Path(hb_path).read_text().strip())
+except Exception:
+    thread_hb = float(state.get("heartbeat_at") or 0)
+if not thread_hb or now - thread_hb > thread_stale:
+    raise SystemExit(1)   # process/thread genuinely stuck or dead
+
+# SECONDARY (deadlock): loop_at is written ONLY by the event loop. If it is ancient while the thread
+# heartbeat is fresh, the async loop is wedged even though the process lives -> restart. Generous
+# window so heavy but healthy turns (loop still ticks between CPU bursts) never trip it.
+loop_at = float(state.get("loop_at") or 0)
+if loop_at and now - loop_at > loop_stale:
     raise SystemExit(1)
 PY
 }

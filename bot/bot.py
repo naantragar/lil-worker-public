@@ -22,6 +22,7 @@ import re
 import tempfile
 import logging
 import shutil
+import threading
 import subprocess
 import time
 import tomllib
@@ -113,10 +114,22 @@ LAST_RESTART_REPORT_HASH_FILE = DATA_DIR / ".last_restart_report_hash"
 # A detached job (launched via job_ctl.py) survives the one-shot `claude -p` turn and writes
 # its state under JOBS_DIR/<id>/. This poller notices a terminal status and messages the owner
 # — krevetka "waking up" to report. Only the privileged (main) instance notifies.
+# Load-immune liveness: a dedicated OS thread stamps this file every 5s so run.sh can tell the bot
+# is alive even when the asyncio event loop is momentarily starved by heavy CPU/IO. This is the fix
+# for the old failure mode where a long/heavy turn tripped the 20s heartbeat and the watchdog
+# restarted the bot mid-work. The async `loop_at` state field is the SEPARATE deadlock signal.
+HEARTBEAT_FILE = DATA_DIR / "bot_heartbeat"
+
 JOBS_DIR = DATA_DIR / "jobs"
 JOBS_POLL_INTERVAL = int(os.environ.get("LIL_WORKER_JOBS_POLL_SEC", "20"))
-JOBS_RESULT_PREVIEW = 1500          # chars of result tail included in the message
+JOBS_RESULT_PREVIEW = 1500          # chars of result tail included in the raw (v0) message
 JOBS_PRUNE_DAYS = 3                 # delete notified job dirs older than this
+# v1 "wake & reason": a `wake` job, on completion, wakes a fresh ISOLATED claude turn that reports
+# the result in my own voice. Isolated = a synthetic user_id (-owner) → its own .sessions.json entry
+# + its own _active_procs slot, so it NEVER races the interactive chat (which keys on the real uid).
+# Same chat destination (the lead-in Message), separate compute identity.
+WAKE_RESULT_FEED = 8000             # chars of result fed into the wake reasoning prompt
+_wake_lock = asyncio.Lock()         # serialize wake reports (one at a time)
 
 
 def load_claude_model() -> str:
@@ -553,6 +566,9 @@ def _default_runtime_state() -> dict:
         "pid": os.getpid(),
         "started_at": now,
         "heartbeat_at": now,
+        # Seeded so the run.sh deadlock check (guarded by `if loop_at`) is armed from birth — a loop
+        # that wedges before its first tick still ages this out past LOOP_STALE_SECONDS.
+        "loop_at": now,
         "phase": "starting",
         "last_error_at": None,
         "last_error": None,
@@ -573,6 +589,25 @@ def update_runtime_state(state: dict, **changes) -> None:
     if changes.get("last_error"):
         state["last_error_at"] = now
     write_runtime_state(state)
+
+
+def _write_heartbeat_file() -> None:
+    """Atomically stamp HEARTBEAT_FILE with the current time (tmp + replace = no torn reads)."""
+    try:
+        tmp = HEARTBEAT_FILE.with_suffix(".tmp")
+        tmp.write_text(str(time.time()))
+        tmp.replace(HEARTBEAT_FILE)
+    except Exception:
+        pass
+
+
+def _heartbeat_thread_loop(stop_event: threading.Event) -> None:
+    """PRIMARY 'process alive' signal, run in a dedicated OS thread so it keeps ticking even when the
+    asyncio event loop is starved by heavy CPU/IO. The kernel schedules the thread independently and
+    the GIL is released across the sleep + tiny file write, so a busy loop can't false-trip it — the
+    root fix for watchdog restarts during long turns. run.sh reads HEARTBEAT_FILE for liveness."""
+    while not stop_event.wait(5):
+        _write_heartbeat_file()
 
 
 def load_provider_map() -> dict:
@@ -2255,6 +2290,86 @@ def _job_read(p: Path) -> str:
         return ""
 
 
+def _job_dump_text(job_dir: Path, spec: dict, status: str) -> str:
+    """The plain (v0) notification: header + a tail of the raw result. Used for non-wake jobs and
+    as the fallback when a wake report fails. Sent with parse_mode=None (output is untrusted)."""
+    label = spec.get("label", "job")
+    rc = _job_read(job_dir / "exit_code")
+    dur = _job_read(job_dir / "duration_sec")
+    result = _job_read(job_dir / "result.txt")
+    if len(result) > JOBS_RESULT_PREVIEW:
+        result = "…" + result[-JOBS_RESULT_PREVIEW:]
+    head = "✅ завершена" if status == "done" else "❌ упала"
+    return (
+        f"🦐 Фоновая задача «{label}» {head}\n"
+        f"job {spec.get('id', job_dir.name)} · {dur}s · rc={rc}\n\n"
+        f"{result or '(пустой вывод)'}\n\n"
+        f"(полный результат: {job_dir / 'result.txt'})"
+    )
+
+
+async def _wake_and_report(bot: Bot, job_dir: Path, spec: dict, status: str) -> bool:
+    """Wake a fresh ISOLATED claude turn to report a finished job into the owner's chat, in my own
+    voice. Isolated identity = synthetic user_id (-owner): its own session + _active_procs slot, so
+    it can never race the interactive chat. Returns True if the report streamed, False to fall back
+    to the raw v0 dump. One wake at a time (_wake_lock)."""
+    owner = spec.get("owner_uid")
+    label = spec.get("label", "job")
+    rc = _job_read(job_dir / "exit_code")
+    dur = _job_read(job_dir / "duration_sec")
+    result = _job_read(job_dir / "result.txt")
+    if len(result) > WAKE_RESULT_FEED:
+        result = "…(обрезано)…\n" + result[-WAKE_RESULT_FEED:]
+    try:
+        cmd = base64.b64decode(spec.get("cmd_b64", "")).decode(errors="replace")
+    except Exception:
+        cmd = ""
+
+    async with _wake_lock:
+        try:
+            lead = await bot.send_message(
+                owner,
+                f"🦐 Проснулась — фоновая задача «{label}» завершилась, смотрю результат…",
+                parse_mode=None,
+            )
+        except Exception as e:
+            logger.warning(f"wake {job_dir.name}: lead-in send failed: {e}")
+            return False
+
+        wake_uid = -int(owner)   # isolated identity (real Telegram ids are positive)
+        prompt = (
+            "[АВТОНОМНОЕ ПРОБУЖДЕНИЕ — доклад о фоновой задаче]\n"
+            f"Метка: {label}\n"
+            f"job: {spec.get('id', job_dir.name)} · длительность {dur}s · код выхода {rc} "
+            f"({'успешно' if status == 'done' else 'ОШИБКА'})\n"
+            f"Команда: {cmd}\n"
+            "--- Результат (stdout+stderr) ---\n"
+            f"{result or '(пустой вывод)'}\n"
+            "--- Конец результата ---\n\n"
+            "Ты — креветка. Это не интерактивный чат, а автономное пробуждение, чтобы кратко "
+            "доложить пользователю о завершённой фоновой задаче: что сделано, главное из "
+            "результата, всё ли в порядке и что стоит сделать дальше. Отвечай по-русски, сжато, "
+            "без лишних преамбул. Не выдумывай того, чего нет в результате."
+        )
+        session_id = get_session_id(wake_uid, PROVIDER_CLAUDE)
+        try:
+            response, new_sid, streamed_files = await run_provider_streaming(
+                PROVIDER_CLAUDE, prompt, session_id, lead, bot, lang="ru", user_id=wake_uid
+            )
+        except Exception as e:
+            logger.warning(f"wake {job_dir.name}: reasoning failed: {e}")
+            return False
+        update_session_id(wake_uid, PROVIDER_CLAUDE, new_sid, session_id)
+
+        # mirror _flush_buffer post-processing (text + files; reports don't emit voice)
+        response_no_files, file_paths = extract_file_blocks(response)
+        cleaned, _voice = extract_voice_blocks(response_no_files)
+        if cleaned:
+            await send_long_message(lead, markdown_to_telegram_html(cleaned))
+        await send_files(lead, streamed_files + file_paths)
+        return True
+
+
 async def _notify_finished_jobs(bot: Bot) -> None:
     """Scan JOBS_DIR once: message the owner about any terminal, not-yet-notified job, then mark
     it notified. Prune old notified jobs. Owner must be an allowed user. Idempotent per tick —
@@ -2291,22 +2406,23 @@ async def _notify_finished_jobs(bot: Bot) -> None:
             notified.write_text("skipped-owner")
             continue
 
-        label = spec.get("label", "job")
-        rc = _job_read(job_dir / "exit_code")
-        dur = _job_read(job_dir / "duration_sec")
-        result = _job_read(job_dir / "result.txt")
-        if len(result) > JOBS_RESULT_PREVIEW:
-            result = "…" + result[-JOBS_RESULT_PREVIEW:]
-        head = "✅ завершена" if status == "done" else "❌ упала"
-        msg = (
-            f"🦐 Фоновая задача «{label}» {head}\n"
-            f"job {spec.get('id', job_dir.name)} · {dur}s · rc={rc}\n\n"
-            f"{result or '(пустой вывод)'}\n\n"
-            f"(полный результат: {job_dir / 'result.txt'})"
-        )
+        if spec.get("wake"):
+            # v1: mark handled up-front so a mid-wake bot restart can't double-report, then wake an
+            # isolated reasoning turn. On wake failure, fall back to the raw v0 dump.
+            notified.write_text(time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+            ok = await _wake_and_report(bot, job_dir, spec, status)
+            if not ok:
+                try:
+                    await bot.send_message(owner, _job_dump_text(job_dir, spec, status), parse_mode=None)
+                except Exception as e:
+                    logger.warning(f"job {job_dir.name}: fallback dump failed: {e}")
+            logger.info(f"job {job_dir.name}: wake-report done (ok={ok}) owner={owner}")
+            continue
+
+        # v0: plain raw-dump notification, retry-safe (notified written only after a good send)
         try:
             # parse_mode=None: raw job output is untrusted — never let it be parsed as HTML.
-            await bot.send_message(owner, msg, parse_mode=None)
+            await bot.send_message(owner, _job_dump_text(job_dir, spec, status), parse_mode=None)
         except Exception as e:
             logger.warning(f"job {job_dir.name}: notify send failed, will retry: {e}")
             continue
@@ -2336,6 +2452,9 @@ async def main():
     # Write own PID file — reliable even when run.sh gets killed mid-restart
     pid_file = DATA_DIR / "lil_worker.pid"
     pid_file.write_text(str(os.getpid()))
+    # Stamp the liveness file immediately (before any slow startup work) so a stale file from a
+    # previous run can't make the health check false-report the fresh process as unhealthy.
+    _write_heartbeat_file()
     runtime_state = _default_runtime_state()
     runtime_state["validate_startup"] = validate_startup
     write_runtime_state(runtime_state)
@@ -2384,20 +2503,31 @@ async def main():
         except Exception:
             pass
 
-    async def heartbeat_loop():
+    # PRIMARY liveness: load-immune OS-thread heartbeat (stamps HEARTBEAT_FILE). Started before the
+    # first heavy work and kept alive for the whole run; run.sh trusts this for "process alive".
+    _write_heartbeat_file()
+    hb_stop = threading.Event()
+    hb_thread = threading.Thread(target=_heartbeat_thread_loop, args=(hb_stop,), daemon=True)
+    hb_thread.start()
+
+    # SECONDARY: async loop_at — proves the event loop itself is turning. run.sh uses this only as a
+    # deadlock signal with a generous window, so a busy loop never triggers a restart, but a truly
+    # wedged loop eventually does.
+    async def loop_heartbeat():
         while True:
-            update_runtime_state(runtime_state, phase="polling")
+            update_runtime_state(runtime_state, phase="polling", loop_at=time.time())
             await asyncio.sleep(5)
 
-    hb_task = asyncio.create_task(heartbeat_loop())
+    hb_task = asyncio.create_task(loop_heartbeat())
     jobs_task = asyncio.create_task(poll_jobs_loop(bot))
     try:
-        update_runtime_state(runtime_state, phase="polling")
+        update_runtime_state(runtime_state, phase="polling", loop_at=time.time())
         await dp.start_polling(bot)
     except Exception as e:
         update_runtime_state(runtime_state, phase="failed", last_error=str(e))
         raise
     finally:
+        hb_stop.set()
         hb_task.cancel()
         jobs_task.cancel()
         update_runtime_state(runtime_state, phase="stopped")
