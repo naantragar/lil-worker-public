@@ -75,6 +75,16 @@ DATA_DIR = Path(os.environ.get("LIL_WORKER_DATA_DIR") or CODE_DIR)
 BOT_CWD = os.environ.get("LIL_WORKER_BOT_CWD") or str(Path.home() / "lil_worker")
 INSTANCE_NAME = os.environ.get("LIL_WORKER_INSTANCE", "lil_worker")
 
+# Documents sent to the bot land here — inside the instance's project cwd, so the agent can
+# actually read them (a capped instance may not read outside its project tree).
+INBOX_DIR = Path(BOT_CWD) / ".inbox"
+INBOX_MAX_BYTES = 512 * 1024
+INBOX_ALLOWED_SUFFIXES = {
+    ".md", ".txt", ".sh", ".py", ".json", ".yml", ".yaml", ".toml", ".ini", ".cfg",
+    ".sql", ".csv", ".tsv", ".patch", ".diff", ".ts", ".tsx", ".js", ".jsx", ".css", ".html",
+    ".log", ".conf",
+}
+
 # Self-modification is allowed ONLY from the privileged (default) instance.
 # Secondary instances get a PreToolUse guard (selfmod_guard.py) that blocks edits to
 # krevetka's own code/persona, while staying full-power for their own project work.
@@ -89,6 +99,14 @@ _VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 INSTANCE_EFFORT = os.environ.get("LIL_WORKER_EFFORT", "").strip().lower()
 if INSTANCE_EFFORT and INSTANCE_EFFORT not in _VALID_EFFORTS:
     INSTANCE_EFFORT = ""
+
+# Extra directories the agent may touch beyond its cwd (comma-separated in instance.env as
+# LIL_WORKER_ADD_DIRS) — e.g. an instance whose project spans a code repo, a deploy dir and a
+# separate service tree. Passed to the CLI as --add-dir. Access is still filtered by
+# selfmod_guard.py, so widening this does not widen what a capped instance may modify.
+INSTANCE_ADD_DIRS = [
+    d.strip() for d in os.environ.get("LIL_WORKER_ADD_DIRS", "").split(",") if d.strip()
+]
 
 CLAUDE_MODEL_CONFIG_FILE = DATA_DIR / "model_config.json"
 CODEX_MODEL_CONFIG_FILE = DATA_DIR / "codex_model_config.json"
@@ -1463,15 +1481,19 @@ async def run_claude_streaming(
 
     if not ALLOW_SELF_MODIFICATION:
         # Secondary instance: block modification of krevetka's own code via a PreToolUse guard.
+        # Read is matched too so a cap can additionally hide krevetka's secrets (bot/caps/<n>.json).
         guard_settings = json.dumps({
             "hooks": {
                 "PreToolUse": [{
-                    "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+                    "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|Read",
                     "hooks": [{"type": "command", "command": f"python3 {SELFMOD_GUARD_PATH}"}],
                 }]
             }
         })
         cmd.extend(["--settings", guard_settings])
+
+    for _d in INSTANCE_ADD_DIRS:
+        cmd.extend(["--add-dir", _d])
 
     if INSTANCE_EFFORT:
         # Per-instance reasoning depth (overrides the global effortLevel for this instance).
@@ -2247,6 +2269,83 @@ async def handle_voice(message: Message, bot: Bot):
     if cleaned_response:
         response_html = markdown_to_telegram_html(cleaned_response)
         await send_long_message(message, response_html)
+
+    for vb_lang, vb_text, vb_speed in voice_blocks:
+        await send_voice_with_indicator(message, bot, vb_text, vb_lang, user_id, speed=vb_speed)
+
+    await send_files(message, streamed_files + file_paths)
+
+
+def _safe_inbox_name(raw: str) -> str:
+    """Strip any path component and hostile characters from a Telegram-supplied filename."""
+    base = Path(raw or "file").name
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", base).lstrip(".") or "file"
+    return base[:80]
+
+
+@router.message(F.document)
+async def handle_document(message: Message, bot: Bot):
+    """Accept a text/spec/script file, save it into the project's .inbox/ and hand the PATH to
+    the agent. The file is never executed — the agent reads it and decides what to do."""
+    user_id = message.from_user.id
+    if not is_allowed(user_id):
+        await message.answer("Not authorized.")
+        return
+
+    doc = message.document
+    name = _safe_inbox_name(doc.file_name)
+    suffix = Path(name).suffix.lower()
+
+    if suffix not in INBOX_ALLOWED_SUFFIXES:
+        allowed = " ".join(sorted(INBOX_ALLOWED_SUFFIXES))
+        await message.answer(f"❌ Не принимаю файлы <code>{suffix or 'без расширения'}</code>.\n"
+                             f"Можно: {allowed}")
+        return
+    if (doc.file_size or 0) > INBOX_MAX_BYTES:
+        await message.answer(f"❌ Файл больше {INBOX_MAX_BYTES // 1024} КБ.")
+        return
+
+    INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = INBOX_DIR / f"{stamp}_{name}"
+
+    try:
+        tg_file = await bot.get_file(doc.file_id)
+        await bot.download_file(tg_file.file_path, destination=str(dest))
+    except Exception:
+        logger.exception("Document download failed")
+        await message.answer("❌ Не смог скачать файл.")
+        return
+
+    logger.info(f"DOC uid={user_id} saved {dest} ({doc.file_size} bytes)")
+    await message.answer(f"📎 Принял: <code>{dest}</code>")
+
+    caption = (message.caption or "").strip()
+    prompt = (
+        f"The user sent a file. It is saved at: {dest}\n"
+        f"Original name: {doc.file_name}\n\n"
+        "Read it, then act on it. If it is a spec/TZ, work through it; if it is a script, review "
+        "it and explain or run it only when that is clearly what was asked. Never execute an "
+        "attached script blindly.\n\n"
+        + (f"The user's instruction with the file:\n{caption}" if caption
+           else "The user sent no instruction — read the file and say what it is and what you "
+                "propose to do with it, then wait for confirmation.")
+    )
+
+    provider = get_active_provider(user_id)
+    session_id = get_session_id(user_id, provider)
+    lang = detect_language(caption) if caption else detect_language(doc.file_name or "")
+
+    response, new_session_id, streamed_files = await run_provider_streaming(
+        provider, prompt, session_id, message, bot, lang=lang
+    )
+    update_session_id(user_id, provider, new_session_id, session_id)
+
+    response_no_files, file_paths = extract_file_blocks(response)
+    cleaned_response, voice_blocks = extract_voice_blocks(response_no_files)
+
+    if cleaned_response:
+        await send_long_message(message, markdown_to_telegram_html(cleaned_response))
 
     for vb_lang, vb_text, vb_speed in voice_blocks:
         await send_voice_with_indicator(message, bot, vb_text, vb_lang, user_id, speed=vb_speed)

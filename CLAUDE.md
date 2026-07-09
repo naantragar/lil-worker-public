@@ -124,6 +124,17 @@ attributable. Three layers (full spec: `ACTION_ATTRIBUTION_TZ.md`):
    <repo>` to arm it.
 
 
+## Instance caps (профили ограничений для вторичных инстансов)
+
+Вторичный инстанс можно сузить до одного проекта «колпаком»: `bot/caps/<instance>.json` →
+`{"profile": "<name>"}`. Файл лежит в защищённом корне, поэтому **снять колпак может только
+главный инстанс** (`bot/instance.sh cap set|off|show <name>` + `restart <name>`).
+
+- `LIL_WORKER_ADD_DIRS` в `instance.env` (через запятую) → `claude --add-dir`, чтобы инстанс
+  дотянулся до деревьев проекта вне своего cwd.
+
+Детали, точный allow/deny-list и честная граница защиты: `knowledge/instance-caps.md`.
+
 ## Model switching
 
 Edit `bot/model_config.json` - takes effect on next message, no restart needed:
@@ -247,6 +258,14 @@ Do NOT send files automatically after creating or editing them — just confirm 
 **CRITICAL:** the marker is processed ONLY in the clean final answer. If `[FILE ...]` text shares a response with tool calls (Bash/Write/Edit), it leaks as literal text instead of sending the file.
 - Do all tool work first → then a SEPARATE final response containing ONLY the marker + minimal text, no tools after it.
 - Details: `knowledge/sending-files-via-bot.md`
+
+## Receiving files from the user — `.inbox/`
+
+A document sent to the bot is saved to `<BOT_CWD>/.inbox/<timestamp>_<name>` and its PATH is
+handed to me with the caption as the instruction. Text/spec/script suffixes only (`.md`, `.sh`,
+`.py`, `.sql`, …), max 512 KB. **An attached script is never executed automatically** — I read it,
+explain it, and run it only when that is plainly what was asked. No caption → summarize the file
+and propose next steps, then wait.
 
 ## Always confirm task completion
 

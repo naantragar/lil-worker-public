@@ -28,6 +28,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BOT="$SCRIPT_DIR/bot.py"
 VENV="$SCRIPT_DIR/.venv/bin/python"
 INSTANCES_DIR="$SCRIPT_DIR/instances"
+# Caps live OUTSIDE instances/ on purpose: instances/<n>/ is writable by that instance,
+# so a cap stored there could be removed by the very instance it constrains.
+CAPS_DIR="$SCRIPT_DIR/caps"
+VALID_CAPS="upstream-specialist"
 
 err() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -173,6 +177,54 @@ cmd_list() {
   $found || echo "Нет ни одного инстанса."
 }
 
+cmd_cap() {
+  # cap set <name> <profile> | cap off <name> | cap show [name]
+  local verb="$1" name="$2" profile="$3"
+  local capf="$CAPS_DIR/$name.json"
+
+  case "$verb" in
+    set)
+      [ -n "$name" ] && [ -n "$profile" ] || err "usage: cap set <name> <profile>  (profiles: $VALID_CAPS)"
+      [ -f "$(inst_env "$name")" ] || err "инстанс '$name' не найден"
+      echo "$VALID_CAPS" | tr ' ' '\n' | grep -qx "$profile" || err "неизвестный профиль '$profile' (есть: $VALID_CAPS)"
+      mkdir -p "$CAPS_DIR"
+      cat > "$capf" <<EOF
+{
+  "profile": "$profile",
+  "set_by": "krevetka main instance",
+  "set_at": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+EOF
+      echo "✅ Колпак '$profile' надет на '$name'. Применится после: ./instance.sh restart $name"
+      ;;
+    off)
+      [ -n "$name" ] || err "usage: cap off <name>"
+      if [ -f "$capf" ]; then
+        rm -f "$capf"
+        echo "✅ Колпак снят с '$name' (остаётся базовая защита кода креветки)."
+        echo "   Применится после: ./instance.sh restart $name"
+      else
+        echo "На '$name' колпака нет."
+      fi
+      ;;
+    show|"")
+      if [ -n "$name" ]; then
+        [ -f "$capf" ] && { echo "$name: $(grep '"profile"' "$capf" | cut -d'"' -f4)"; } || echo "$name: без колпака"
+      else
+        [ -d "$CAPS_DIR" ] || { echo "Колпаков нет."; return 0; }
+        local any=false
+        for f in "$CAPS_DIR"/*.json; do
+          [ -f "$f" ] || continue
+          any=true
+          printf "  %-12s %s\n" "$(basename "$f" .json)" "$(grep '"profile"' "$f" | cut -d'"' -f4)"
+        done
+        $any || echo "Колпаков нет."
+      fi
+      ;;
+    *) err "usage: cap {set <name> <profile>|off <name>|show [name]}" ;;
+  esac
+}
+
 cmd_ensure_all() {
   # Для cron: поднять все инстансы, которые должны работать, но упали
   [ -d "$INSTANCES_DIR" ] || return 0
@@ -193,11 +245,13 @@ case "$1" in
   restart)    cmd_restart "$2" ;;
   status)     cmd_status "$2" ;;
   list)       cmd_list ;;
+  cap)        cmd_cap "$2" "$3" "$4" ;;
   ensure-all) cmd_ensure_all ;;
   *)
-    echo "Usage: $0 {create|start|stop|restart|status|list|ensure-all}"
+    echo "Usage: $0 {create|start|stop|restart|status|list|cap|ensure-all}"
     echo "  create <name> <token> <cwd> [model]"
     echo "  start|stop|restart|status <name>"
+    echo "  cap set <name> <profile> | cap off <name> | cap show [name]"
     echo "  list | ensure-all"
     exit 1
     ;;
