@@ -1,0 +1,13 @@
+#!/bin/sh
+# Attribution post-commit hook: durably log EVERY commit (mine, a subagent's, or a human's)
+# to the agent action ledger. Even a worktree/subagent commit is captured and labeled via the
+# runtime env. Defensive: never fail the commit.
+#
+# The path to action_log.py is INJECTED by tools/install_hooks.sh at install time (placeholder
+# below), or overridden via the ACTION_LOG env var. Kept out of the source so this file carries
+# no machine-specific path.
+REPO="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+LOG="${ACTION_LOG:-__ACTION_LOG_PATH__}"
+[ -f "$LOG" ] || exit 0
+python3 "$LOG" record-commit "$REPO" HEAD >/dev/null 2>&1 || true
+exit 0

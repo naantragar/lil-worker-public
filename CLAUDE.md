@@ -92,6 +92,38 @@ Restart MUST come last - `run.sh restart` kills the current process. If bot does
 - Details: `knowledge/dual-repo-sync.md`.
 <!-- PRIVATE-ONLY END -->
 
+## Action provenance & attribution ledger (CRITICAL — so I never see my own action as foreign)
+
+After a session reset or server restart my chat context is gone. To stop perceiving my own (or a
+subagent's) past side effect as a mysterious third party's, every side-effecting action is durably
+attributable. Three layers (full spec: `ACTION_ATTRIBUTION_TZ.md`):
+
+1. **Subagents don't publish/deploy — I integrate.** Workflow/`Agent` subagents keep their full
+   power: they read, analyze, **write code, edit files (incl. in isolated worktrees), and propose
+   diffs/plans** — that IS the point of the swarm, don't clip it. What they MUST NOT do is the
+   durable, shared, hard-to-reverse step: **push to a remote, deploy, restart live services, or
+   commit into the main shared working tree.** I (the main agent) review their output and perform
+   those. So every reset-surviving side effect is definitionally mine. (Ephemeral worktree edits
+   create no attribution ambiguity — nothing persists on the shared branch until I integrate it;
+   and layers 2–3 catch any exception, labeling it as the subagent's via env.)
+
+2. **Durable action ledger** — `tools/action_log.py`, JSONL at `/root/.claude/agent-actions.jsonl`
+   (never synced, survives resets). Records action/repo/ref/summary + machine-derived provenance
+   (session id, subagent flag, model). **Whenever I commit / push / deploy / restart, log it:**
+   ```
+   python3 tools/action_log.py record --action deploy --repo <path> --ref <img> --summary "<what>"
+   ```
+   (commit is auto-logged by the hook below — no manual call needed for commits.) **When a commit
+   or side effect looks foreign, READ THE LEDGER before assuming a third party did it:**
+   `python3 tools/action_log.py tail 20` · `... search <term>` · `... show --repo <path>`.
+
+3. **Git provenance** — a `post-commit` hook (`tools/hooks/post-commit`, install via
+   `tools/install_hooks.sh`, already in `lil_worker` + `upstream-system`) auto-logs EVERY commit
+   (mine, a subagent's, or a human's); agent commits are detected by the Anthropic noreply trailer,
+   human commits (no trailer) are labeled `external`. After cloning a repo, run `install_hooks.sh
+   <repo>` to arm it.
+
+
 ## Model switching
 
 Edit `bot/model_config.json` - takes effect on next message, no restart needed:
