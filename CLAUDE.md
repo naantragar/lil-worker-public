@@ -73,6 +73,22 @@ cmdline alone. Mis-killing one takes down someone's production bot.
 (Real incident this taught: a manual ghost-kill by guessed PID took down an unrelated project
 bot that happened to run `python bot.py` from its own dir.)
 
+## Durable workflow jobs — long swarms that survive between messages
+
+A background `Workflow` runs INSIDE the one-shot `claude -p` turn; when I emit my final reply the turn
+ends and a still-running swarm is **killed** (lost report). For any workflow I want to outlive the
+turn, or that's too long to poll to the end without blocking the chat, launch it as a **durable job**
+instead of the inline tool:
+```
+python3 tools/workflow_job.py launch --script <path.js> [--args-file <json>] [--label L] [--resume <runId>] [--force]
+```
+It runs the swarm in a detached nested `claude -p` (survives the turn via `bot/job_ctl.py`), and on
+completion the existing wake-poller reports the result in my voice. Args are injected into the script
+(`globalThis.args`) — never rely on the nested model to pass the `args` param (it stringifies it).
+Details + the known limitation (no auto-resume across a server restart yet):
+`knowledge/durable-workflow-jobs.md`. Quick swarms whose result I need THIS turn → inline `Workflow`
+is still fine.
+
 ## Self-modification
 
 To add features or fix bugs in bot.py:
