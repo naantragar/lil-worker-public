@@ -73,6 +73,14 @@ cmdline alone. Mis-killing one takes down someone's production bot.
 (Real incident this taught: a manual ghost-kill by guessed PID took down an unrelated project
 bot that happened to run `python bot.py` from its own dir.)
 
+## Plans / backlog — `PLANS.md`
+
+`PLANS.md` (repo root) is the single living backlog: things we studied/planned but haven't built yet,
+across all projects, ordered top=most important/interesting to the user, bottom=least. When the user
+says "покажи планы" / "our plans" / "что в бэклоге" → show this file top-to-bottom. Keep it current:
+add an item the moment we scope something we won't build immediately; move/strike items as they ship;
+the USER sets the priority order (I record it, don't reorder on my own).
+
 ## Durable workflow jobs — long swarms that survive between messages
 
 A background `Workflow` runs INSIDE the one-shot `claude -p` turn; when I emit my final reply the turn
@@ -408,17 +416,28 @@ When starting work on a new project that has no CLAUDE.md:
 I can grow new abilities: when a task turns out reusable, distill it into a skill
 (`skills/<name>/SKILL.md`) so next time it's one invocation, not improvisation.
 
-**Behavior (approach B — ask first, HIGH threshold):**
+**Behavior (approach B — ask first, HIGH QUALITY bar — but the bar is on QUALITY, not on silence):**
 The "is this worth a skill?" judgment is **mine to make** (model/Opus judgment), NOT bot.py
-code — code can't tell a reusable method from a one-off. So apply real judgment, and keep the
-bar HIGH: **silence is the default; only ask when it clearly clears the bar.**
-1. **Notice** only genuinely *skill-worthy* work — ALL of: repeatable (a method I'd realistically
-   invoke again), non-trivial (multi-step / easy to get wrong from memory), generalizable (clear
-   inputs). NOT one-off answers, trivial single commands, or anything an existing skill covers.
-   When in doubt → do NOT ask. Better to miss a few than to nag.
-2. **Only then, ask** one short line, e.g. "Сделать из этого скилл? (`<name>` — <1-line purpose>)".
-   If ignored / "no" → skip silently, create nothing. Expect this to be rare, not every task.
-3. **On explicit yes:**
+code — code can't tell a reusable method from a one-off. Keep the bar HIGH on *what qualifies*;
+do NOT bias toward silence once it qualifies. The cost of missing is real, not free: a genuinely
+reusable method I don't capture I re-improvise every time; asking costs the user one "no". So the
+error to avoid is **staying silent through a method I've repeated** — not the rare extra ask.
+1. **Quality bar (unchanged, high):** propose only work that is ALL of — repeatable (a method I'd
+   realistically invoke again), non-trivial (multi-step / easy to get wrong from memory),
+   generalizable (clear inputs). NOT one-off answers, trivial single commands, or anything an
+   existing skill covers. If it fails any of these → don't ask.
+2. **Checkpoint — when to actually run the check (this is the part that was missing):**
+   - **HARD TRIGGER:** the moment I notice I've applied the same non-trivial method **2+ times**
+     (this session or across sessions), that repetition *is* the signal — run the check and, if it
+     clears the quality bar, ASK. Don't wait for a third repeat.
+   - Also sweep the check after finishing any non-trivial task (esp. one that involved a reusable
+     multi-step maneuver), the same way I self-curate memory.
+   Once the quality bar is met, ASK — "в сомнении молчи" applies only to whether it *qualifies*,
+   never as a reason to sit on something that clearly does.
+3. **Ask** one short line, e.g. "Сделать из этого скилл? (`<name>` — <1-line purpose>)".
+   If ignored / "no" → skip silently, create nothing. Still not every task — the quality bar keeps
+   it occasional — but a repeated method must not slip by unasked.
+4. **On explicit yes:**
    - dedup: `memory_search` + `tools/new_skill.py list`; if a near-duplicate exists, update it
      instead of creating new.
    - distill: write `skills/<name>/SKILL.md` (frontmatter `name`/`description`/`user-invocable`
@@ -426,7 +445,7 @@ bar HIGH: **silence is the default; only ask when it clearly clears the bar.**
    - validate: `python3 tools/new_skill.py validate <name>` (scaffold first with
      `tools/new_skill.py scaffold <name> "<desc>"` if handy).
    - it's immediately invocable (discovery via `.claude/skills -> ../skills` symlink).
-4. **Tell the user in ONE line** what skill was created (mirrors self-curated memory).
+5. **Tell the user in ONE line** what skill was created (mirrors self-curated memory).
 
 Spec: `SELF_SKILL_CREATION_TZ.md`. Never overwrite an existing skill without explicit ok.
 
