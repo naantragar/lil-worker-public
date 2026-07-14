@@ -81,6 +81,7 @@ says "покажи планы" / "our plans" / "что в бэклоге" → sh
 add an item the moment we scope something we won't build immediately; move/strike items as they ship;
 the USER sets the priority order (I record it, don't reorder on my own).
 
+
 ## Durable workflow jobs — long swarms that survive between messages
 
 A background `Workflow` runs INSIDE the one-shot `claude -p` turn; when I emit my final reply the turn
