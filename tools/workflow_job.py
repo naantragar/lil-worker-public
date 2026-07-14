@@ -139,7 +139,11 @@ def cmd_launch(a: argparse.Namespace) -> None:
     if a.effort:
         inner += ["--effort", a.effort]
     # Quote-safe assembly: job_ctl stores the cmd base64, but we still hand it a single shell string.
-    inner_cmd = " ".join(shlex.quote(x) for x in inner)
+    # The env prefix is the whole point of the durability fix: a `claude -p` turn kills still-running
+    # background tasks after a 600s ceiling ("Background tasks still running after 600s; terminating"),
+    # which decapitated long swarms even inside the detached job. 0 = wait indefinitely; the runner
+    # turn does nothing but drive this one workflow, so there is nothing else to time out.
+    inner_cmd = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 " + " ".join(shlex.quote(x) for x in inner)
 
     label = a.label or f"workflow:{Path(script).stem}"
     ctl = [sys.executable, str(JOB_CTL), "launch", "--cmd", inner_cmd, "--label", label, "--wake"]
