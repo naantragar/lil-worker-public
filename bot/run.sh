@@ -3,7 +3,13 @@
 # Usage: ./run.sh {start|stop|restart|status|logs}
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BOT_SCRIPT="$SCRIPT_DIR/bot.py"
+# Entry file is deliberately NOT named bot.py: several unrelated projects on this box run their own
+# `python bot.py`, and a fuzzy `pkill -f bot.py` used to hit the wrong one. `krevetka.py` shares no
+# substring with `bot.py`, so a careless fuzzy match can no longer reach us.
+BOT_SCRIPT="$SCRIPT_DIR/krevetka.py"
+# Transitional//safety net: a process still running under the OLD name FROM THIS DIR is also ours and
+# must be stoppable (renaming while running would otherwise strand it and cause two bots on one token).
+LEGACY_BOT_SCRIPT="$SCRIPT_DIR/bot.py"
 VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
 PID_FILE="$SCRIPT_DIR/lil_worker.pid"
 LOG_FILE="$SCRIPT_DIR/lil_worker.log"
@@ -46,7 +52,7 @@ ensure_last_good_dir() {
 
 snapshot_last_good() {
   ensure_last_good_dir
-  cp "$BOT_SCRIPT" "$LAST_GOOD_DIR/bot.py"
+  cp "$BOT_SCRIPT" "$LAST_GOOD_DIR/krevetka.py"
   cp "$0" "$LAST_GOOD_DIR/run.sh"
   cp "$SCRIPT_DIR/watchdog.sh" "$LAST_GOOD_DIR/watchdog.sh" 2>/dev/null || true
   cp "$SCRIPT_DIR/validate.sh" "$LAST_GOOD_DIR/validate.sh" 2>/dev/null || true
@@ -55,11 +61,11 @@ snapshot_last_good() {
 }
 
 restore_last_good() {
-  if [ ! -f "$LAST_GOOD_DIR/bot.py" ] || [ ! -f "$LAST_GOOD_DIR/run.sh" ]; then
+  if [ ! -f "$LAST_GOOD_DIR/krevetka.py" ] || [ ! -f "$LAST_GOOD_DIR/run.sh" ]; then
     echo "Rollback unavailable: no last-known-good snapshot"
     return 1
   fi
-  cp "$LAST_GOOD_DIR/bot.py" "$BOT_SCRIPT"
+  cp "$LAST_GOOD_DIR/krevetka.py" "$BOT_SCRIPT"
   cp "$LAST_GOOD_DIR/run.sh" "$0"
   [ -f "$LAST_GOOD_DIR/watchdog.sh" ] && cp "$LAST_GOOD_DIR/watchdog.sh" "$SCRIPT_DIR/watchdog.sh"
   [ -f "$LAST_GOOD_DIR/validate.sh" ] && cp "$LAST_GOOD_DIR/validate.sh" "$SCRIPT_DIR/validate.sh"
@@ -251,19 +257,21 @@ PY
 # $1 = signal (default TERM). Echoes each pid it signalled.
 kill_main_bots() {
   local sig="${1:-TERM}" pid comm cwd inst script a
-  for pid in $(pgrep -f 'bot\.py' 2>/dev/null); do
+  for pid in $(pgrep -f 'krevetka\.py|bot\.py' 2>/dev/null); do
     case "$(cat "/proc/$pid/comm" 2>/dev/null)" in python*) ;; *) continue ;; esac  # python only, not our bash/claude
     # Identify OUR bot by the RESOLVED script path (== $BOT_SCRIPT), NOT by process cwd: the bot's
     # cwd just reflects whoever launched it (watchdog from the parent dir vs a manual run from bot/),
     # so cwd is unreliable. Reconstruct the .../bot.py arg from argv and resolve relative→cwd.
     script=""
-    while IFS= read -r -d '' a; do case "$a" in *bot.py) script="$a" ;; esac; done < "/proc/$pid/cmdline" 2>/dev/null
+    while IFS= read -r -d '' a; do case "$a" in *krevetka.py|*bot.py) script="$a" ;; esac; done < "/proc/$pid/cmdline" 2>/dev/null
     [ -n "$script" ] || continue
     case "$script" in
       /*) : ;;
       *) cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null)"; script="$cwd/$script" ;;
     esac
-    [ "$script" = "$BOT_SCRIPT" ] || continue                 # only OUR bot.py (spares other projects)
+    # Only OUR entry file, by ABSOLUTE path — this is what spares other projects' bot.py. The legacy
+    # name is accepted too, but still only from THIS directory, so the guarantee is unchanged.
+    { [ "$script" = "$BOT_SCRIPT" ] || [ "$script" = "$LEGACY_BOT_SCRIPT" ]; } || continue
     inst="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^LIL_WORKER_INSTANCE=//p')"
     case "$inst" in ""|lil_worker) kill "-$sig" "$pid" 2>/dev/null && echo "$pid" ;; esac  # main only
   done

@@ -187,35 +187,23 @@ def resolve_codex_model() -> str:
     """Resolve the effective Codex model after bot config and CLI defaults."""
     return load_codex_model() or load_codex_cli_default_model() or "default"
 
-PINCHTAB_SYSTEM_PROMPT = """
-Pinchtab is available locally and should be preferred for public web-page access instead of third-party search/browsing when it can do the job.
+WEB_ACCESS_SYSTEM_PROMPT = """
+Web access. For reading a public page, prefer the local markdown-new skill: it returns clean Markdown
+at a fraction of the tokens of raw HTML, and its browser method renders JS/SPA pages.
 
-Use local repo docs first:
-- ~/lil_worker/docs/pinchtab.md
-- ~/lil_worker/policies/pinchtab.md
+    python3 ~/lil_worker/skills/markdown-new/scripts/markdown_new_fetch.py '<URL>'
+    # --method auto|ai|browser    --output <file>
 
-Pinchtab commands:
-- ~/.pinchtab/run.sh status|start|stop|restart|foreground
-- ~/.pinchtab/browser.sh navigate <url>
-- ~/.pinchtab/browser.sh text
-- ~/.pinchtab/browser.sh snapshot_interactive
-- ~/.pinchtab/browser.sh snapshot_full
-- ~/.pinchtab/browser.sh click <ref>
-- ~/.pinchtab/browser.sh type <ref> <text>
-- ~/.pinchtab/browser.sh scroll <up|down>
-- ~/.pinchtab/browser.sh tabs
-- ~/.pinchtab/browser.sh health
+WebFetch and WebSearch cover one-off lookups and search; the deep-research skill covers multi-source
+research reports.
 
-Default workflow:
-1. Read docs/policies if needed.
-2. Check ~/.pinchtab/run.sh status.
-3. For public HTTPS pages use the read-first ladder: navigate -> text -> snapshot_interactive -> snapshot_full.
-4. Prefer text/snapshot output over external sources when the user wants page contents.
+There is NO local headless-browser bridge installed on this machine, so browser AUTOMATION is not
+available: clicking, typing, scrolling, running JS inside a page, and staying logged in across steps
+cannot be done. Do not go looking for one and do not try to start one. If a task genuinely requires
+driving an authenticated web UI (e.g. clicking through a dashboard with no API to trigger an export),
+say so plainly and let the user decide whether to install a browser bridge — never improvise one.
 
-Safety:
-- Do not expose bridge tokens or secrets.
-- Follow policies/pinchtab.md restrictions for sensitive sites and irreversible actions.
-- Before stopping Pinchtab after heavy pages, navigate tabs to about:blank, check tabs, then stop.
+Only public HTTPS URLs. Never place tokens, keys, or secrets in a URL you fetch.
 """.strip()
 
 RUNTIME_IDENTITY_PROMPT = """
@@ -264,7 +252,7 @@ def build_provider_system_prompt(lang: str) -> str:
     return (
         f"IMPORTANT: The user's message is in {lang}. You MUST reply in {lang}.\n\n"
         f"{RUNTIME_IDENTITY_PROMPT}\n\n"
-        f"{PINCHTAB_SYSTEM_PROMPT}"
+        f"{WEB_ACCESS_SYSTEM_PROMPT}"
     )
 
 

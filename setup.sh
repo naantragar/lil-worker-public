@@ -13,8 +13,8 @@ echo ""
 
 # ── 1. Перевірка що ми в репо ─────────────────────────────────────────────────
 
-if [ ! -f "bot/bot.py" ]; then
-  echo "[!] bot/bot.py не знайдено."
+if [ ! -f "bot/krevetka.py" ]; then
+  echo "[!] bot/krevetka.py не знайдено."
   echo "    Запускай цей скрипт з кореня репо lil_worker:"
   echo "    cd lil_worker && bash setup.sh"
   exit 1

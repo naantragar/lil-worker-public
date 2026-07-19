@@ -4,7 +4,7 @@
 #        ./validate.sh --deep  (level 2 — full with dry-run)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BOT="$SCRIPT_DIR/bot.py"
+BOT="$SCRIPT_DIR/krevetka.py"
 VENV="$SCRIPT_DIR/.venv/bin/python"
 DEEP=false
 FAIL=false

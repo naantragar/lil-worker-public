@@ -13,7 +13,9 @@ bot/*.log
 *.pid
 bot/.runtime.sock
 bot/bot_runtime_state.json
+bot/krevetka.py.bak
 bot/bot.py.bak
+bot/bot.py.prerename
 bot/backups/
 # Index / state
 .sessions.json

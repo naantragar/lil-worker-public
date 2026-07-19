@@ -2,7 +2,7 @@
 
 ## How it works
 
-User sends a Telegram message -> bot.py calls `claude -p` CLI -> Claude responds -> answer goes back to Telegram.
+User sends a Telegram message -> krevetka.py calls `claude -p` CLI -> Claude responds -> answer goes back to Telegram.
 
 Running as OS user on a VPS (Ubuntu). Model configured via `model_config.json`.
 
@@ -12,7 +12,7 @@ All bot files are at: `bot/`
 
 | File | Purpose |
 |------|---------|
-| bot.py | Telegram bot + Claude bridge |
+| krevetka.py | Telegram bot + Claude bridge (deliberately NOT `bot.py` — see the kill section) |
 | .env | Config: bot token, allowed users, model |
 | run.sh | Process manager: start / stop / restart / status |
 | watchdog.sh | Crash recovery: checks bot every 5 min, restarts if dead |
@@ -48,14 +48,21 @@ Never retry the same failing action more than once. If something fails twice - s
 
 ## Killing / restarting bot processes — IDENTIFY FIRST (CRITICAL)
 
-Multiple UNRELATED bots can run on the same box, and several of them have an entry file literally
-named `bot.py`, launched as `.venv/bin/python bot.py`. In `ps` their command lines are
-**indistinguishable** — you cannot tell which project a `python bot.py` belongs to from the
-cmdline alone. Mis-killing one takes down someone's production bot.
+Multiple UNRELATED bots run on this box and several use an entry file literally named `bot.py`,
+launched as `.venv/bin/python bot.py`. In `ps` their command lines are **indistinguishable** —
+you cannot tell which project a `python bot.py` belongs to from the cmdline alone. Mis-killing one
+takes down someone's production bot.
+
+**My entry file is therefore NOT named `bot.py`.** It is `bot/krevetka.py` (renamed 2026-07-19),
+and the name shares no substring with `bot.py`, so a fuzzy `pkill -f bot.py` can never reach me.
+The corollary is the useful part: **any `bot.py` in `ps` is by definition NOT mine — hands off.**
+(`selfmod_guard.py`'s LIFECYCLE_RE matches BOTH names; if the entry file is ever renamed again,
+that regex must be updated in the same commit or the "cannot kill the main bot" guarantee silently
+disappears.)
 
 **Hard rules:**
 1. **NEVER `kill`/`pkill` by a fuzzy/partial match** on `bot.py` / `python bot.py`. No
-   hand-rolled `pkill -f bot.py`.
+   hand-rolled `pkill -f bot.py` — that string now only ever names somebody else's bot.
 2. **Identify a PID by disambiguating signals, not the cmdline string:**
    - **cwd** is decisive: `readlink /proc/<pid>/cwd` → tells you which project it is.
    - **pid-file ownership**: a PID is "bot X" only if X's own pid-file contains it
@@ -65,8 +72,8 @@ cmdline alone. Mis-killing one takes down someone's production bot.
    If a PID's cwd is not my code dir, or it's not in one of my pid-files, **it is NOT mine —
    leave it alone.**
 4. **To restart only me, use the existing anchored tools** (`bot/run.sh restart`,
-   `bot/restart_crab.sh`) — they match the ABSOLUTE krevetka python+bot.py path and never touch
-   other projects. Don't improvise a kill.
+   `bot/restart_crab.sh`) — they match the ABSOLUTE `bot/krevetka.py` path and never touch other
+   projects. Don't improvise a kill.
 5. **Before any manual `kill <pid>`**: verify cwd + pid-file ownership. If unsure → do NOT kill,
    ask the user.
 
@@ -100,8 +107,8 @@ is still fine.
 
 ## Self-modification
 
-To add features or fix bugs in bot.py:
-1. Edit `bot/bot.py`
+To add features or fix bugs in my bot code:
+1. Edit `bot/krevetka.py`
 2. Install dependencies: `bot/.venv/bin/pip install ...`
 3. **Run validation** - MANDATORY before restart:
    - Light changes (new function, config, text): `cd bot && ./validate.sh`
@@ -111,7 +118,7 @@ To add features or fix bugs in bot.py:
 5. Write restart reason to `bot/restart_reason.txt` (1-3 lines, shown in startup message)
 6. Restart: `bot/run.sh restart`
 
-Restart MUST come last - `run.sh restart` kills the current process. If bot doesn't come back and backup exists: `cp bot/bot.py.bak bot/bot.py && bot/run.sh restart`
+Restart MUST come last - `run.sh restart` kills the current process. If bot doesn't come back and backup exists: `cp bot/krevetka.py.bak bot/krevetka.py && bot/run.sh restart`
 
 - The secret-scan gate aborts the public push if any token/codename/personal path leaks.
 - Details: `knowledge/dual-repo-sync.md`.

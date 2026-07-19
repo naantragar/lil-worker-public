@@ -25,7 +25,7 @@
 # =============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BOT="$SCRIPT_DIR/bot.py"
+BOT="$SCRIPT_DIR/krevetka.py"
 VENV="$SCRIPT_DIR/.venv/bin/python"
 INSTANCES_DIR="$SCRIPT_DIR/instances"
 # Caps live OUTSIDE instances/ on purpose: instances/<n>/ is writable by that instance,

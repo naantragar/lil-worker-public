@@ -67,7 +67,10 @@ WRITE_RE = re.compile(
 LIFECYCLE_RE = re.compile(
     r"\brestart_crab\.sh\b"
     r"|\brun\.sh\b[^\n]*\b(restart|stop|start)\b"
-    r"|\b(pkill|kill|killall)\b[^\n]*\bbot\.py\b"
+    # Both names: the entry file was renamed bot.py -> krevetka.py precisely so a fuzzy match can't
+    # hit another project's bot. This regex must track that, or the "cannot kill the main bot"
+    # guarantee silently disappears with the rename.
+    r"|\b(pkill|kill|killall)\b[^\n]*\b(krevetka|bot)\.py\b"
     r"|\b(pkill|kill|killall)\b[^\n]*lil_worker(\.pid|\b)"
 )
 
@@ -261,6 +264,54 @@ def upstream_check_read(path):
 
 
 # ---------------------------------------------------------------------------
+# profile: trusted-full
+# ---------------------------------------------------------------------------
+# "Everything the main instance can do, EXCEPT touching krevetka itself."
+#
+# For a fully trusted operator who needs real system reach on this box: env files, keys, /etc,
+# cron, packages, docker, and systemctl on ANY unit. Deliberately WIDER than upstream-specialist
+# (which confines writes to three trees) and also wider than the baseline (which forbids
+# systemctl outright) — note that simply removing a cap would REMOVE service management, not add it.
+#
+# What survives, always:
+#   * writes into krevetka's repo — blocked (EDIT_TOOLS via _under_protected, Bash via
+#     WRITE_RE + PROTECTED_ROOT). The agent cannot modify krevetka's code, persona or knowledge.
+#   * killing/restarting any krevetka bot — blocked (baseline LIFECYCLE_RE + protected PIDs).
+#   * krevetka's lifecycle scripts — blocked. This is also what stops the instance from lifting
+#     its OWN cap: `instance.sh cap off <self>` would otherwise write into bot/caps/ from inside a
+#     script, where a path-based write check never sees it.
+#   * power control — a reboot takes the whole box (and krevetka) down with it.
+#
+# Reading krevetka's secrets is ALLOWED under this profile (unlike upstream-specialist). That is the
+# deliberate cost of "full access": grant it only to someone trusted with the bot tokens and keys.
+TRUSTED_DENY_BASH = [
+    (r"\b(shutdown|reboot|poweroff|halt)\b|\binit\s+[06]\b",
+     "power control would take krevetka down with the box"),
+    (r"\bsystemctl\b[^\n]*\b(poweroff|reboot|halt|isolate)\b",
+     "systemctl power verbs would take krevetka down with the box"),
+    (r"\b(instance\.sh|run\.sh|restart_crab\.sh|watchdog\.sh)\b",
+     "krevetka's process-lifecycle scripts are main-only (this is also what keeps a cap from "
+     "lifting itself)"),
+    (r"\brm\s+-[a-zA-Z]*[rf][a-zA-Z]*\s+/(\s|$)",
+     "rm -rf / — no"),
+]
+
+
+def trusted_check_bash(cmd, norm):
+    for pattern, reason in TRUSTED_DENY_BASH:
+        if re.search(pattern, norm):
+            _deny(reason, "trusted-full")
+
+    # kill/pkill by NUMERIC pid aimed at any krevetka bot process (the name-based regexes are
+    # already handled by the baseline LIFECYCLE_RE).
+    if re.search(r"\b(kill|pkill|killall)\b", norm):
+        for pid in _protected_pids():
+            if re.search(rf"(^|\s){re.escape(pid)}(\s|$)", norm):
+                _deny(f"PID {pid} is a krevetka bot process — its lifecycle is main-only",
+                      "trusted-full")
+
+
+# ---------------------------------------------------------------------------
 
 def main():
     try:
@@ -301,7 +352,7 @@ def main():
         if LIFECYCLE_RE.search(norm):
             _deny("refused a command that could kill/restart the MAIN bot — process lifecycle is "
                   "main-only; a secondary instance manages only itself.")
-        if cap != "upstream-specialist" and SYSTEMCTL_MUTATE_RE.search(norm):
+        if cap not in ("upstream-specialist", "trusted-full") and SYSTEMCTL_MUTATE_RE.search(norm):
             # upstream-specialist replaces this with a per-unit allow-list (see upstream_check_bash)
             _deny("refused systemctl — service lifecycle is main-only for a plain secondary "
                   "instance.")
@@ -313,6 +364,8 @@ def main():
                 _deny("refused Bash command that writes into krevetka's repo (shared code).")
         if cap == "upstream-specialist":
             upstream_check_bash(cmd, norm)
+        elif cap == "trusted-full":
+            trusted_check_bash(cmd, norm)
         sys.exit(0)
 
     sys.exit(0)

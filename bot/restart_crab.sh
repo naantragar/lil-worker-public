@@ -5,7 +5,7 @@ set +e
 sleep 3                      # let the confirmation message flush first
 DIR=~/lil_worker/bot
 PY="$DIR/.venv/bin/python"
-BOT="$DIR/bot.py"
+BOT="$DIR/krevetka.py"
 PAT="$PY $BOT"
 cd "$DIR" || exit 1
 
@@ -30,6 +30,6 @@ NEWPID=$(cat lil_worker.pid)
 sleep 5
 if ! kill -0 "$NEWPID" 2>/dev/null; then
   echo "$(date) [restart_crab] new bot died on startup -> rolling back to last_good" >> lil_worker.log
-  cp backups/last_good/bot.py bot.py 2>/dev/null
+  cp backups/last_good/krevetka.py krevetka.py 2>/dev/null
   start_bot
 fi
