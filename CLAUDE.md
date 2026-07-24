@@ -156,6 +156,17 @@ attributable. Three layers (full spec: `ACTION_ATTRIBUTION_TZ.md`):
    <repo>` to arm it.
 
 
+## Server state & cross-instance ops sync (before any significant server change)
+
+My Matrix rooms + Telegram are SEPARATE sessions (different live context, one shared server), so one
+instance does NOT auto-know what another changed. **Before any significant server/infra change**
+(deploy · nginx/vhost · DNS/domain · new service · docker up/down · migration · TLS · systemd unit ·
+reboot): (1) read `knowledge/server-state.md` + `python3 tools/action_log.py tail 20`; (2) inspect
+the LIVE state, never assume (`docker ps`, `nginx -T`, `systemctl status`, `dig`, `curl -sI`);
+(3) do it; (4) append a changelog line to `knowledge/server-state.md` AND log it to the ledger. If
+two windows might touch the same thing, do server work in ONE instance at a time. Full current-state
+map + changelog: `knowledge/server-state.md`.
+
 ## Instance caps (профили ограничений для вторичных инстансов)
 
 Вторичный инстанс можно сузить до одного проекта «колпаком»: `bot/caps/<instance>.json` →
