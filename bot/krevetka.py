@@ -2490,6 +2490,10 @@ async def _notify_finished_jobs(bot: Bot) -> None:
             spec = json.loads((job_dir / "spec.json").read_text())
         except (OSError, json.JSONDecodeError):
             spec = {}
+        # A job launched from a Matrix room reports back THERE (the bridge's own poller delivers it).
+        # Leave it untouched — don't mark notified — so the Matrix side can pick it up.
+        if (spec.get("reply_to") or {}).get("door") == "matrix":
+            continue
         owner = spec.get("owner_uid")
         if owner not in ALLOWED_USERS:
             # never message a non-allowed chat; mark handled so we don't rescan forever

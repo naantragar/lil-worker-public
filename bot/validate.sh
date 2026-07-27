@@ -32,7 +32,7 @@ echo -n "[2] Import check... "
 IMPORT_OUT=$($VENV -c "
 import sys
 sys.path.insert(0, '$SCRIPT_DIR')
-from bot import markdown_to_telegram_html, format_tool_notification
+from krevetka import markdown_to_telegram_html, format_tool_notification
 print('OK')
 " 2>&1)
 if echo "$IMPORT_OUT" | grep -q "OK"; then
@@ -51,7 +51,7 @@ if [ "$DEEP" = true ]; then
   FUNC_OUT=$($VENV -c "
 import sys
 sys.path.insert(0, '$SCRIPT_DIR')
-from bot import markdown_to_telegram_html, format_tool_notification
+from krevetka import markdown_to_telegram_html, format_tool_notification
 
 # Test markdown renderer
 r1 = markdown_to_telegram_html('**bold** and \`code\`')

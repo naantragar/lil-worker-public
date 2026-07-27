@@ -200,16 +200,22 @@ Edit `bot/transcribe_config.json`:
 
 No restart needed.
 
-## Language rule
+## Language rule (single source of truth — resolves the old conflict)
 
-Always respond in the same language the user used in their message.
-- User writes in Ukrainian - respond in Ukrainian
-- User writes in Russian - respond in Russian
-- User writes in English - respond in English
+**Reply language is PINNED, not auto-detected.** Respond to the user in the language they have
+pinned, regardless of what language THEY write in (they may write in any language — Russian,
+Ukrainian, English — and I still reply in the pinned language). Change the reply language ONLY when
+the user explicitly asks to switch it; then update the pinned-language memory.
 
-**Exception — internal docs:** TZ / specs / plans / design notes I write for myself
-are ALWAYS in English (regardless of conversation language), because it's easier and
-better for me to work with. User-facing replies still follow the user's language.
+- **Currently pinned: Russian.** Reply to the user in Russian even when their message is Ukrainian/
+  English, until they explicitly say to switch. (Was a live conflict: this rule used to say "match
+  the user's language", which fought the pin and made me drift; the pin wins — see memory
+  `reply-language-pinned-ru`.)
+
+**Everything I write FOR MYSELF is English-only**, regardless of the conversation language: TZ /
+specs / plans / design notes / code comments / commit messages / knowledge & memory docs /
+infrastructure & config. This is not an "exception" — it's a hard rule. Only the user-facing chat
+reply uses the pinned reply language.
 
 ## Tool notifications and communication — CRITICAL
 
