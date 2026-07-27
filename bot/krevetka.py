@@ -1571,8 +1571,39 @@ async def run_claude_streaming(
         # Heartbeat messages keep the user informed.
         # Absolute safety net: 30 min (1800s).
         _stream_start = time.monotonic()
-        _ABSOLUTE_TIMEOUT = 1800  # 30 min safety net
-        _POLL_INTERVAL = 30       # check process every 30s
+        # The 1800s cap is ONLY ever reached from this silent-poll branch, so it never meant
+        # "turns may not exceed 30 min" — it meant "a turn silent at 30s granularity may not be
+        # older than 30 min". An inline Workflow swarm is exactly that shape (the main stream goes
+        # quiet while subagents work) and used to be killed mid-run (3 incidents). LIVENESS FIX:
+        # while a workflow journal (subagents/workflows/<runId>/journal.jsonl — the same file we
+        # salvage killed swarms from) keeps advancing, the swarm IS doing work — extend past the
+        # silence cap up to a hard ceiling instead of killing. A genuinely wedged process (no
+        # journal progress) still dies at the cap. Mechanical: needs zero discipline from the model.
+        _SILENCE_CAP = 1800        # 30 min of silence with NO detectable progress -> kill
+        _WF_LIVENESS_WINDOW = 300  # a workflow journal touched within 5 min = "alive"
+        _HARD_CEILING = 10800      # 3 h absolute max, even for a live swarm
+        _POLL_INTERVAL = 30        # check process every 30s
+        _hb_last = 0.0
+
+        def _wf_alive() -> bool:
+            """True if a Workflow swarm's journal under the current session advanced recently."""
+            sid = new_session_id or session_id
+            if not sid:
+                return False
+            latest = 0.0
+            try:
+                for jr in (Path.home() / ".claude" / "projects").glob(
+                    f"*/{sid}/subagents/workflows/*/journal.jsonl"
+                ):
+                    try:
+                        m = jr.stat().st_mtime
+                        if m > latest:
+                            latest = m
+                    except OSError:
+                        pass
+            except Exception:
+                return False
+            return latest > 0 and (time.time() - latest) < _WF_LIVENESS_WINDOW
 
         while True:
             try:
@@ -1586,13 +1617,20 @@ async def run_claude_streaming(
                     )
                     break
                 elapsed = time.monotonic() - _stream_start
-                if elapsed > _ABSOLUTE_TIMEOUT:
-                    logger.error(f"Claude absolute timeout ({_ABSOLUTE_TIMEOUT}s)")
+                if elapsed > _SILENCE_CAP:
+                    alive = _wf_alive()
+                    if alive and elapsed < _HARD_CEILING:
+                        # background swarm is actively working — extend, don't kill.
+                        if time.monotonic() - _hb_last > 120:
+                            _hb_last = time.monotonic()
+                            logger.info(f"Claude silent {int(elapsed)}s but workflow journal live — extending (hard cap {_HARD_CEILING}s)")
+                        continue
+                    reason = ("⏱ Timeout: Claude не ответил за 30 минут." if elapsed < _HARD_CEILING
+                              else f"⏱ Timeout: жёсткий потолок {_HARD_CEILING // 3600}ч исчерпан.")
+                    logger.error(f"Claude killed at {int(elapsed)}s (wf_alive={alive})")
                     proc.kill()
                     await proc.communicate()
-                    final_result = provider_unavailable_message(
-                        PROVIDER_CLAUDE, "⏱ Timeout: Claude не ответил за 30 минут."
-                    )
+                    final_result = provider_unavailable_message(PROVIDER_CLAUDE, reason)
                     break
                 # Process alive, under limit — keep waiting
                 continue
