@@ -101,6 +101,17 @@ python3 tools/workflow_job.py launch --script <path.js> [--args-file <json>] [--
 It runs the swarm in a detached nested `claude -p` (survives the turn via `bot/job_ctl.py`), and on
 completion the existing wake-poller reports the result in my voice. Args are injected into the script
 (`globalThis.args`) — never rely on the nested model to pass the `args` param (it stringifies it).
+
+**Restart the Matrix bridge ONLY via `matrix/restart_bridge.sh`** (it refuses while a job is active).
+A plain `systemctl restart matrix-bridge-bot` once wiped a live swarm: `setsid` escapes the process
+tree but NOT the cgroup, and the unit kills its whole cgroup. Runners now launch in their own
+`systemd-run --scope`, so this is no longer fatal — but the guard stays. **`ps --ppid` can never see
+a durable job** (it reparents to init) — check with `python3 bot/job_ctl.py list`.
+Other verbs: `job_ctl.py cancel <id> --reason "…"` (deliberate stop, terminal + delivered),
+`job_ctl.py reap` (heal jobs whose runner died), `tools/workflow_job.py harvest <jobId|runId>`
+(salvage a dead swarm's finished agents from its journal). The launch gate is per originating
+room/user (global ceiling 3).
+
 Details + the known limitation (no auto-resume across a server restart yet):
 `knowledge/durable-workflow-jobs.md`. Quick swarms whose result I need THIS turn → inline `Workflow`
 is still fine.

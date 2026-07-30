@@ -2499,12 +2499,26 @@ async def _wake_and_report(bot: Bot, job_dir: Path, spec: dict, status: str) -> 
         return True
 
 
+def _reap_stuck_jobs() -> None:
+    """Delegate to job_ctl's reaper (single source of truth, shared with the Matrix door).
+
+    Imported lazily and defensively: the poller must keep running even if job_ctl is mid-edit."""
+    try:
+        import job_ctl  # same directory as this file
+        healed = job_ctl.reap_all()
+        for name in healed:
+            logger.warning(f"job {name}: runner died out-of-band → marked failed by the reaper")
+    except Exception as e:
+        logger.warning(f"job reaper failed: {e}")
+
+
 async def _notify_finished_jobs(bot: Bot) -> None:
     """Scan JOBS_DIR once: message the owner about any terminal, not-yet-notified job, then mark
     it notified. Prune old notified jobs. Owner must be an allowed user. Idempotent per tick —
     a send failure is retried next tick (the notified marker is written only after a good send)."""
     if not JOBS_DIR.is_dir():
         return
+    _reap_stuck_jobs()  # a killed runner leaves status=running forever — heal before reading statuses
     now = time.time()
     for job_dir in sorted(JOBS_DIR.iterdir()):
         if not job_dir.is_dir() or not (job_dir / "spec.json").exists():
@@ -2521,7 +2535,7 @@ async def _notify_finished_jobs(bot: Bot) -> None:
                 pass
             continue
 
-        if status not in ("done", "failed"):
+        if status not in ("done", "failed", "cancelled"):
             continue
 
         try:
@@ -2537,6 +2551,19 @@ async def _notify_finished_jobs(bot: Bot) -> None:
             # never message a non-allowed chat; mark handled so we don't rescan forever
             logger.warning(f"job {job_dir.name}: owner {owner} not in ALLOWED_USERS — skip notify")
             notified.write_text("skipped-owner")
+            continue
+
+        if status == "cancelled":
+            # A cancel is always deliberate — the user (or I) stopped it on purpose. A full reasoning
+            # wake-report on an intentional stop is pure waste; one line is the honest amount.
+            try:
+                await bot.send_message(
+                    owner, f"⏹ Фоновая задача «{spec.get('label', 'job')}» отменена.\n"
+                           f"{_job_read(job_dir / 'result.txt')[-500:]}", parse_mode=None)
+            except Exception as e:
+                logger.warning(f"job {job_dir.name}: cancel notice failed, will retry: {e}")
+                continue
+            notified.write_text(time.strftime("%Y-%m-%dT%H:%M:%S%z"))
             continue
 
         if spec.get("wake"):

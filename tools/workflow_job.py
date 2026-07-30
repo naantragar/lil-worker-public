@@ -163,6 +163,84 @@ def cmd_list(_a: argparse.Namespace) -> None:
     subprocess.run([sys.executable, str(JOB_CTL), "list"])
 
 
+# ── harvest ───────────────────────────────────────────────────────────────────────────────────────
+# When a swarm dies mid-flight (killed runner, server restart), the agents that ALREADY finished are
+# not lost — their returns sit in the run's journal.jsonl. `resumeFromRunId` is same-session only, so
+# a killed swarm cannot simply be resumed; the salvage path is to pull those results out and feed
+# them into the relaunch. Doing that by hand is what produced knowledge/bladerf-rx-survey-partial.md
+# on 2026-07-30; this makes it one command.
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
+
+
+def _find_run_dirs(needle: str) -> list[Path]:
+    """`needle` may be a workflow runId (wf_…) or a job id — for a job we scan every run dir and keep
+    the ones whose journal was alive during that job's lifetime."""
+    runs = sorted(PROJECTS_DIR.glob("*/*/subagents/workflows/wf_*"))
+    if needle.startswith("wf_"):
+        return [p for p in runs if p.name == needle or p.name.startswith(needle)]
+    job_dir = Path(__file__).resolve().parent.parent / "bot" / "jobs" / needle
+    if not job_dir.is_dir():
+        return []
+    try:
+        start = (job_dir / "spec.json").stat().st_mtime
+    except OSError:
+        return []
+    try:
+        end = (job_dir / "status").stat().st_mtime + 60
+    except OSError:
+        end = start + 86400
+    out = []
+    for p in runs:
+        j = p / "journal.jsonl"
+        try:
+            if start - 60 <= j.stat().st_mtime <= end:
+                out.append(p)
+        except OSError:
+            pass
+    return out
+
+
+def cmd_harvest(a: argparse.Namespace) -> None:
+    run_dirs = _find_run_dirs(a.target)
+    if not run_dirs:
+        sys.exit(f"no workflow run found for {a.target!r} (looked under {PROJECTS_DIR})")
+    chunks: list[str] = []
+    total = 0
+    for rd in run_dirs:
+        journal = rd / "journal.jsonl"
+        if not journal.exists():
+            continue
+        rows = []
+        for line in journal.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        results = [r for r in rows if r.get("type") == "result"]
+        started = sum(1 for r in rows if r.get("type") == "started")
+        chunks.append(f"# Harvest of workflow run `{rd.name}`\n\n"
+                      f"- agents started: **{started}**\n- agents that returned: **{len(results)}**\n"
+                      f"- journal: `{journal}`\n")
+        for i, r in enumerate(results, 1):
+            label = r.get("label") or r.get("agentLabel") or f"agent-{i}"
+            val = r.get("result", r.get("value", ""))
+            if not isinstance(val, str):
+                val = json.dumps(val, ensure_ascii=False, indent=2)
+            chunks.append(f"\n---\n\n## [{i}/{len(results)}] {label}\n\n{val}\n")
+            total += 1
+    if not total:
+        sys.exit(f"found {len(run_dirs)} run dir(s) but no completed agent results to harvest")
+    text = "\n".join(chunks)
+    if a.out:
+        Path(a.out).write_text(text)
+        print(f"harvested {total} agent result(s) from {len(run_dirs)} run(s) -> {a.out}")
+    else:
+        sys.stdout.write(text)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="run a Claude Code Workflow as a durable background job")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -180,6 +258,11 @@ def main() -> None:
 
     p = sub.add_parser("list")
     p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("harvest", help="salvage finished agents' results from a dead/partial swarm")
+    p.add_argument("target", help="workflow runId (wf_…) or a job id")
+    p.add_argument("--out", help="write Markdown here instead of stdout")
+    p.set_defaults(func=cmd_harvest)
 
     a = ap.parse_args()
     a.func(a)
