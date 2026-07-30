@@ -180,15 +180,28 @@ map + changelog: `knowledge/server-state.md`.
 
 ## Model switching
 
-Edit `bot/model_config.json` - takes effect on next message, no restart needed:
-- `{"model": "sonnet"}` - claude-sonnet-4-6 (default, fast)
-- `{"model": "opus"}` - claude-opus-4-6 (smartest, slower)
-- `{"model": "haiku"}` - claude-haiku-4-5 (fastest, cheapest)
+Edit `bot/model_config.json` - takes effect on next message, no restart needed. BOTH doors
+(Telegram `bot/` and Matrix `matrix/`) read this ONE file, so a switch applies to both
+(`matrix/bot/claude_bridge.py:_model()` reads it too).
+
+Use the EXPLICIT model id, not an alias, so the pinned model can't drift:
+- `{"model": "claude-opus-5"}` - **current default** (flagship, released 2026-07-24; id has no
+  date suffix). Has an "effort dial" (lower effort = fewer tokens, most of the capability).
+- `{"model": "claude-opus-4-8"}` - previous Opus, fall back here if 5 ever misbehaves
+- `{"model": "claude-sonnet-5"}` - faster/cheaper for routine turns
+- `{"model": "claude-haiku-4-5"}` - fastest, cheapest
+(Aliases `opus`/`sonnet`/`haiku` still work — the CLI resolves them to its own current mapping,
+which is exactly the drift we avoid by pinning an id.)
 
 Quick commands - if user's entire message is one of these words, switch immediately:
-- `opus` - switch to opus
-- `sonnet` - switch to sonnet
-- `haiku` - switch to haiku
+- `opus` - switch to `claude-opus-5`
+- `sonnet` - switch to `claude-sonnet-5`
+- `haiku` - switch to `claude-haiku-4-5`
+
+**Verify before pinning a NEW id** (model names outrun my knowledge cutoff — I was wrong about
+Opus 5 not existing until the user pushed back): `claude -p --model <id> "Reply OK"` must exit 0.
+Then edit the config. My knowledge of "latest model" is NOT authoritative — web-search + that
+smoke test are.
 
 ## Transcription language
 
