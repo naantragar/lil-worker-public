@@ -18,9 +18,12 @@ sleep 0.3
 start_bot() {
   # CLEAN env: unset inherited instance/token vars so bot/.env (the main token) is authoritative,
   # even if this restart was triggered from a secondary instance / contaminated environment.
+  # KREVETKA_DOOR/KREVETKA_ROOM: same scrub as run.sh — a restart fired from a Matrix turn would
+  # otherwise pin the Telegram daemon's durable jobs to that Matrix room for its whole lifetime.
   nohup env -u TELEGRAM_BOT_TOKEN -u ALLOWED_USERS -u CLAUDE_MODEL -u CODEX_MODEL \
     -u CODEX_SANDBOX_MODE -u CODEX_APPROVAL_POLICY -u OPENAI_API_KEY -u OPENAI_VOICE_MODEL \
     -u LIL_WORKER_INSTANCE -u LIL_WORKER_DATA_DIR -u LIL_WORKER_BOT_CWD -u LIL_WORKER_EFFORT \
+    -u KREVETKA_DOOR -u KREVETKA_ROOM \
     PYTHONUNBUFFERED=1 "$PY" "$BOT" >> lil_worker.log 2>&1 &
   echo $! > lil_worker.pid
 }

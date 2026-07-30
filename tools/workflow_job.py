@@ -204,6 +204,13 @@ def cmd_harvest(a: argparse.Namespace) -> None:
     run_dirs = _find_run_dirs(a.target)
     if not run_dirs:
         sys.exit(f"no workflow run found for {a.target!r} (looked under {PROJECTS_DIR})")
+    # A job id is matched by journal mtime overlap only, so with several swarms running at once
+    # (now normal: the gate is per-origin with a ceiling of 3) this can sweep in ANOTHER room's run
+    # and silently merge it into one report. Ambiguity must be a question, never a quiet merge.
+    if not a.target.startswith("wf_") and len(run_dirs) > 1:
+        sys.exit("ambiguous: several workflow runs overlap this job's lifetime — "
+                 + ", ".join(p.name for p in run_dirs)
+                 + "\nre-run with the explicit wf_… run id you want.")
     chunks: list[str] = []
     total = 0
     for rd in run_dirs:

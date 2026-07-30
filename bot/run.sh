@@ -297,9 +297,14 @@ case "$1" in
     # Start the MAIN bot with a CLEAN env: unset any inherited instance/token vars so bot/.env is
     # authoritative. Prevents a start invoked from a secondary/other-project context from bringing
     # the main bot up on the wrong token (the cross-context env-leak class of bug).
+    # KREVETKA_DOOR/KREVETKA_ROOM must be scrubbed too: a restart triggered from a MATRIX turn
+    # inherits them, and job_ctl reads reply_to straight from the environment — so every durable job
+    # launched from Telegram afterwards would report into a Matrix room (breaking room separation)
+    # and collide with that room's per-origin launch gate.
     nohup env -u TELEGRAM_BOT_TOKEN -u ALLOWED_USERS -u CLAUDE_MODEL -u CODEX_MODEL \
       -u CODEX_SANDBOX_MODE -u CODEX_APPROVAL_POLICY -u OPENAI_API_KEY -u OPENAI_VOICE_MODEL \
       -u LIL_WORKER_INSTANCE -u LIL_WORKER_DATA_DIR -u LIL_WORKER_BOT_CWD -u LIL_WORKER_EFFORT \
+      -u KREVETKA_DOOR -u KREVETKA_ROOM \
       PYTHONUNBUFFERED=1 "$VENV_PYTHON" "$BOT_SCRIPT" >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
     echo "Started (PID $!)"

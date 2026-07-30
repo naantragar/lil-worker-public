@@ -2379,6 +2379,18 @@ async def handle_document(message: Message, bot: Bot):
     await send_files(message, streamed_files + file_paths)
 
 
+@router.message(F.text & F.text.startswith("/"))
+async def handle_unknown_slash(message: Message, bot: Bot):
+    """Slash text that matches no command must NOT vanish.
+
+    Registered AFTER every Command() handler, so real commands still win. Before this, anything
+    starting with "/" that wasn't a registered command matched no handler at all and aiogram dropped
+    it without a word — so "/jobs" got silence, and so did ordinary prose like
+    "/etc/nginx is where it lives". The Matrix door already passes unknown slash text through to
+    claude; this makes the two doors behave the same."""
+    await handle_message(message, bot)
+
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_message(message: Message, bot: Bot):
     user_id = message.from_user.id
