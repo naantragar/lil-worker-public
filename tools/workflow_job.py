@@ -33,6 +33,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 BOT_DIR = Path(__file__).resolve().parent.parent / "bot"
@@ -185,10 +186,20 @@ def _find_run_dirs(needle: str) -> list[Path]:
         start = (job_dir / "spec.json").stat().st_mtime
     except OSError:
         return []
+    # The window's end must follow the job's ACTUAL lifetime. For a still-running job the status file
+    # was last written at launch, so `mtime + 60` closed the window a minute after the swarm started
+    # — and the live run's journal, being written right now, fell outside it. Harvest then answered
+    # "no workflow run found" in exactly the situation it exists for: salvaging a swarm mid-flight.
+    try:
+        status = (job_dir / "status").read_text().strip()
+    except OSError:
+        status = ""
     try:
         end = (job_dir / "status").stat().st_mtime + 60
     except OSError:
         end = start + 86400
+    if status in ("queued", "running"):
+        end = max(end, time.time() + 60)
     out = []
     for p in runs:
         j = p / "journal.jsonl"

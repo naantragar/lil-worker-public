@@ -110,7 +110,13 @@ cmd_start() {
   set +a
 
   local log; log="$(inst_log "$name")"
-  nohup env PYTHONUNBUFFERED=1 "$VENV" "$BOT" --instance-tag "$name" >> "$log" 2>&1 &
+  # KREVETKA_DOOR/KREVETKA_ROOM scrub — same reason as run.sh: if this start was invoked from a
+  # MATRIX turn, the daemon inherits those vars, and job_ctl reads reply_to straight from the
+  # environment. Every durable job this instance later launches would then report into that Matrix
+  # room and share its per-origin launch gate. run.sh and restart_crab.sh already scrub; this was
+  # the third path that starts a daemon and did not.
+  nohup env -u KREVETKA_DOOR -u KREVETKA_ROOM \
+    PYTHONUNBUFFERED=1 "$VENV" "$BOT" --instance-tag "$name" >> "$log" 2>&1 &
   echo "Запущен инстанс '$name' (PID $!). Лог: $log"
 }
 

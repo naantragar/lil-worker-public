@@ -142,6 +142,7 @@ JOBS_DIR = DATA_DIR / "jobs"
 JOBS_POLL_INTERVAL = int(os.environ.get("LIL_WORKER_JOBS_POLL_SEC", "20"))
 JOBS_RESULT_PREVIEW = 1500          # chars of result tail included in the raw (v0) message
 JOBS_PRUNE_DAYS = 3                 # delete notified job dirs older than this
+JOBS_DELIVER_RETRY_SEC = 900        # a "delivering:" marker older than this = the report never landed
 # v1 "wake & reason": a `wake` job, on completion, wakes a fresh ISOLATED claude turn that reports
 # the result in my own voice. Isolated = a synthetic user_id (-owner) → its own .sessions.json entry
 # + its own _active_procs slot, so it NEVER races the interactive chat (which keys on the real uid).
@@ -2008,6 +2009,25 @@ async def run_codex_streaming(
     return final_result or "No response", new_session_id, []
 
 
+def neutralize_leading_slash(prompt: str) -> str:
+    """A prompt handed to a CLI as `-p "/something"` is parsed by that CLI as a SLASH COMMAND.
+
+    This is not cosmetic. `handle_unknown_slash` was added so slash text stops vanishing, but it
+    passed the text through verbatim — so `/jobs` reached `claude -p "/jobs"`, the CLI answered
+    "Unknown command: /jobs" WITHOUT ever calling the model, and anything after the first line was
+    dropped. Worse, the commands the CLI *does* know (`/clear`, `/init`, `/model`, plus every skill
+    in this repo) would have been EXECUTED in the repo cwd with Write/Edit/Bash rights, on nothing
+    more than the user typing a slash word.
+
+    Any prompt whose first non-space character is "/" is therefore wrapped so the CLI sees text.
+    Deliberately blunt (leading "/" at all, not a command-shaped token): a false wrap costs one line
+    of scaffolding the model ignores, a missed one costs an executed command."""
+    if not prompt.lstrip().startswith("/"):
+        return prompt
+    return ("[user message, verbatim — the leading slash is part of the text, not a command]\n"
+            + prompt)
+
+
 async def run_provider_streaming(
     provider: str,
     prompt: str,
@@ -2018,6 +2038,8 @@ async def run_provider_streaming(
     lang: str = "Russian",
     user_id: int | None = None,
 ) -> tuple[str, str | None, list[str]]:
+    # Single choke point for BOTH providers: every user text reaching a CLI passes through here.
+    prompt = neutralize_leading_slash(prompt)
     if provider == PROVIDER_CODEX:
         return await run_codex_streaming(
             prompt, session_id, reply_msg, bot, files=files, lang=lang, user_id=user_id
@@ -2199,6 +2221,26 @@ async def handle_photo(message: Message, bot: Bot):
 
     task = asyncio.create_task(_flush_photo_buffer(user_id, bot))
     _photo_buffer[user_id]["task"] = task
+
+
+@router.message(F.video | F.video_note)
+async def handle_video(message: Message, bot: Bot):
+    """Video is out of scope by decision — say so in one line instead of failing silently.
+
+    Nothing is downloaded and the model is never called: there is no video understanding here, so
+    pulling tens of megabytes to then say "I can't" would be pure cost. Before this, a video matched
+    no handler at all and aiogram dropped it without a word, which reads exactly like the bot being
+    broken. A video sent as an uncompressed FILE lands in handle_document instead and is refused
+    there by the suffix allow-list. F.animation (GIF) is deliberately NOT matched: an animation
+    message also carries `document`, so it already gets a correct refusal from handle_document, and
+    calling a GIF "видео" would be a regression in wording for no gain."""
+    if not is_allowed(message.from_user.id):
+        return
+    logger.info(f"VIDEO uid={message.from_user.id} — refused (not supported)")
+    try:
+        await message.answer("🎬 Это видео — с ним я работать не умею.")
+    except Exception:
+        logger.exception("video refusal reply failed")
 
 
 @router.message((F.voice | F.audio | F.document) & F.caption.startswith("/saveasset"))
@@ -2508,7 +2550,10 @@ async def _wake_and_report(bot: Bot, job_dir: Path, spec: dict, status: str) -> 
         if cleaned:
             await send_long_message(lead, markdown_to_telegram_html(cleaned))
         await send_files(lead, streamed_files + file_paths)
-        return True
+        # "The turn did not crash" is NOT the same as "the owner was told something". An empty
+        # reasoning result used to still report success, so the raw-dump fallback never fired and
+        # the owner got only the lead-in line for a job that ran for an hour.
+        return bool(cleaned or streamed_files or file_paths)
 
 
 def _reap_stuck_jobs() -> None:
@@ -2539,13 +2584,31 @@ async def _notify_finished_jobs(bot: Bot) -> None:
         notified = job_dir / "notified"
 
         if notified.exists():
-            # already handled — prune if it has aged out
-            try:
-                if (now - notified.stat().st_mtime) > JOBS_PRUNE_DAYS * 86400:
-                    shutil.rmtree(job_dir, ignore_errors=True)
-            except OSError:
-                pass
-            continue
+            # Two-phase marker, mirroring the Matrix poller. "delivering:<ts>" means CLAIMED but not
+            # yet delivered: it is written before the wake report and replaced by the final timestamp
+            # only once something actually reached the owner. Before this, the final marker was
+            # written UP FRONT, so a bot restart (or a lead-in send failure) anywhere inside a
+            # multi-minute wake report lost that report permanently — no retry, and the whole job dir
+            # deleted three days later.
+            marker = _job_read(notified)
+            if marker.startswith("delivering:"):
+                try:
+                    stale = (now - notified.stat().st_mtime) > JOBS_DELIVER_RETRY_SEC
+                except OSError:
+                    stale = False
+                if not stale:
+                    continue  # a delivery is in flight (this process blocks here) — leave it alone
+                logger.warning(f"job {job_dir.name}: report never completed → retrying delivery")
+                # fall through and deliver again
+            else:
+                # already delivered — prune if it has aged out. Never prune a "delivering:" dir:
+                # that would throw away a report that is still owed.
+                try:
+                    if (now - notified.stat().st_mtime) > JOBS_PRUNE_DAYS * 86400:
+                        shutil.rmtree(job_dir, ignore_errors=True)
+                except OSError:
+                    pass
+                continue
 
         if status not in ("done", "failed", "cancelled"):
             continue
@@ -2579,15 +2642,18 @@ async def _notify_finished_jobs(bot: Bot) -> None:
             continue
 
         if spec.get("wake"):
-            # v1: mark handled up-front so a mid-wake bot restart can't double-report, then wake an
-            # isolated reasoning turn. On wake failure, fall back to the raw v0 dump.
-            notified.write_text(time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+            # Phase 1: CLAIM the job (so a crash mid-wake cannot double-report) without declaring it
+            # delivered. Phase 2 (the final timestamp) is written only after something actually
+            # landed in the owner's chat; anything else leaves "delivering:" for the retry above.
+            notified.write_text(f"delivering:{time.strftime('%Y-%m-%dT%H:%M:%S%z')}")
             ok = await _wake_and_report(bot, job_dir, spec, status)
             if not ok:
                 try:
                     await bot.send_message(owner, _job_dump_text(job_dir, spec, status), parse_mode=None)
                 except Exception as e:
-                    logger.warning(f"job {job_dir.name}: fallback dump failed: {e}")
+                    logger.warning(f"job {job_dir.name}: fallback dump failed, will retry: {e}")
+                    continue  # marker stays "delivering:" → retried, not lost
+            notified.write_text(time.strftime("%Y-%m-%dT%H:%M:%S%z"))
             logger.info(f"job {job_dir.name}: wake-report done (ok={ok}) owner={owner}")
             continue
 
