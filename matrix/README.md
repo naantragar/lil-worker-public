@@ -10,10 +10,32 @@ Telegram-бот працює далі.
 
 ## Що потрібно
 
-- Сервер, де вже стоїть `lil_worker` і авторизований Claude Code CLI (`claude login`)
+- Сервер з Ubuntu/Debian і авторизованим Claude Code CLI (`claude login`)
 - Окремий Matrix-акаунт **для бота** + твій власний акаунт
 - Свій homeserver **не потрібен** — безкоштовний акаунт на matrix.org підходить:
   [app.element.io](https://app.element.io)
+
+**Telegram не потрібен.** Ця двері не імпортує нічого з `bot/` — ні токена, ні venv, ні aiogram.
+Єдиний дотик до тієї половини — читання `bot/model_config.json` (файл є в репозиторії, а якщо його
+нема, модель береться з `CLAUDE_MODEL`). Можна поставити тільки Element і ніколи не запускати
+`bot/run.sh`.
+
+---
+
+## Встановлення з нуля БЕЗ Telegram
+
+```bash
+sudo apt update && sudo apt install -y git curl python3 python3-venv
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo bash -
+sudo apt install -y nodejs
+npm install -g @anthropic-ai/claude-code
+claude login
+
+cd ~ && git clone https://github.com/naantragar/lil-worker-public.git lil_worker
+cd lil_worker && bash matrix/setup.sh
+```
+
+Кореневий `setup.sh` (той, що питає токен Telegram) запускати не треба.
 
 ---
 
