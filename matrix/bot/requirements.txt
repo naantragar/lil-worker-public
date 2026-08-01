@@ -1,0 +1,9 @@
+# Path A (default, unencrypted room): matrix-nio==0.25.2
+# Path B (full E2EE): matrix-nio[e2e]==0.25.2  + system libolm 3.x
+matrix-nio==0.25.2
+aiofiles
+aiohttp
+Markdown
+python-dotenv
+openai
+mutagen

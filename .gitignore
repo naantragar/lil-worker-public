@@ -4,6 +4,12 @@ bot/.sessions.json
 bot/.providers.json
 bot/.sessions_codex.json
 bot/instances/
+matrix/.env
+matrix/bot/sessions.json
+matrix/bot/store/
+matrix/bot/.venv/
+matrix/bot/matrix-bridge.pid
+matrix/logs/
 # Python
 bot/.venv/
 __pycache__/
