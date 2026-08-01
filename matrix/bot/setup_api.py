@@ -7,6 +7,7 @@ message — instead of telling them to dig through Element's settings for a toke
 room id. Stdlib only: it must run before the venv has any dependencies installed.
 
 Subcommands (all print JSON on stdout, human errors on stderr, non-zero exit on failure):
+    resolve  <domain_or_url>               # → real client-API base URL (.well-known aware)
     login    <homeserver> <user_or_mxid> <password>
     whoami   <homeserver> <token>
     rooms    <homeserver> <token>          # joined + invited, with names
@@ -51,6 +52,40 @@ def _call(hs: str, path: str, token: str | None = None, body: dict | None = None
 def die(msg: str) -> None:
     print(msg, file=sys.stderr)
     raise SystemExit(1)
+
+
+def _probe(url: str) -> dict | None:
+    """GET that returns None instead of dying — used for discovery, where failure is expected."""
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode() or "{}")
+    except Exception:
+        return None
+
+
+def cmd_resolve(server: str) -> dict:
+    """Turn whatever the operator typed into the real client-API base URL.
+
+    Self-hosted servers routinely delegate: you sign into Element as @you:example.com while the
+    actual homeserver lives at matrix.example.com. The client API has no redirect for that — it is
+    published at /.well-known/matrix/client — so without this step the installer would ask for a URL
+    that looks right and fails at login.
+    """
+    raw = server.strip().rstrip("/")
+    base = raw if raw.startswith(("http://", "https://")) else "https://" + raw
+
+    wk = _probe(base + "/.well-known/matrix/client")
+    delegated = ((wk or {}).get("m.homeserver") or {}).get("base_url")
+    candidates = [c for c in (delegated and delegated.rstrip("/"), base) if c]
+
+    for cand in candidates:
+        if _probe(cand + "/_matrix/client/versions"):
+            return {"base_url": cand, "delegated": bool(delegated and cand == delegated.rstrip("/"))}
+    die(f"no Matrix homeserver answered at {base}"
+        + (f" or at the delegated {delegated}" if delegated else "")
+        + " — check the address (and that TLS is valid)")
+    return {}
 
 
 def cmd_login(hs: str, user: str, password: str) -> dict:
@@ -116,6 +151,7 @@ def main(argv: list[str]) -> None:
         die(__doc__ or "usage: setup_api.py <command> …")
     cmd, args = argv[1], argv[2:]
     table = {
+        "resolve": (cmd_resolve, 1),
         "login": (cmd_login, 3),
         "whoami": (cmd_whoami, 2),
         "rooms": (cmd_rooms, 2),

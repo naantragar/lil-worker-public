@@ -70,8 +70,16 @@ echo
 bold "[2/6] Bot account"
 echo "The bot needs its OWN Matrix account (separate from yours)."
 echo "No self-hosted server required — a free account on matrix.org works: https://app.element.io"
-HS="$(ask 'Homeserver URL' "${OLD_HS:-https://matrix.org}")"
-case "$HS" in http://*|https://*) ;; *) HS="https://$HS" ;; esac
+echo "Works with any homeserver — your own or matrix.org. Domain or full URL, both fine."
+HS_INPUT="$(ask 'Homeserver' "${OLD_HS:-https://matrix.org}")"
+echo "      checking…"
+RESOLVE_JSON="$("$PY" "$API" resolve "$HS_INPUT")" || fail "homeserver not reachable"
+HS="$("$PY" -c 'import json,sys;print(json.loads(sys.argv[1])["base_url"])' "$RESOLVE_JSON")"
+if [ "$("$PY" -c 'import json,sys;print(json.loads(sys.argv[1])["delegated"])' "$RESOLVE_JSON")" = "True" ]; then
+  echo "      .well-known points the client API at: $HS"
+else
+  echo "      ok: $HS"
+fi
 
 TOKEN=""
 if [ -n "$OLD_TOKEN" ] && confirm "Keep the existing bot access token?"; then
