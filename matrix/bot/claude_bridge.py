@@ -17,6 +17,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mblog import clip as _clip, log as _log, since as _since  # noqa: E402
 
+# Repo root — same derivation as matrix_bridge: CLAUDE_CWD when set, else two levels up from here.
+_REPO = Path(os.environ.get("CLAUDE_CWD") or Path(__file__).resolve().parents[2])
+
 ALLOWED_TOOLS = "Read,Write,Edit,Bash,Glob,Grep,WebFetch,WebSearch,Task,Agent,Workflow,Skill"
 
 # Turn deadlines (see the read loop). Silence, not wall-clock: a long turn that keeps streaming is
@@ -88,6 +91,14 @@ async def run(prompt: str, session_id: str | None, images: list[str] | None = No
         "--allowedTools", ALLOWED_TOOLS,
         "--append-system-prompt", SYSTEM_PROMPT,
     ]
+    # Force every swarm through the durable-job path. An inline Workflow dies when this turn ends and
+    # its report is lost (2026-08-02: five agents finished, nothing was ever reported). The hook
+    # converts the call instead of relying on the model to remember the rule; it fails open.
+    _hook = _REPO / "tools" / "hooks" / "durable_swarm.py"
+    if _hook.exists():
+        cmd += ["--settings", json.dumps({"hooks": {"PreToolUse": [
+            {"matcher": "Workflow",
+             "hooks": [{"type": "command", "command": f"python3 {_hook}"}]}]}})]
     stdin_bytes = None
     if images:
         cmd += ["--input-format", "stream-json"]

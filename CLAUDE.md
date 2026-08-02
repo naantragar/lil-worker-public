@@ -97,8 +97,14 @@ a backup exists: `cp bot/krevetka.py.bak bot/krevetka.py && bot/run.sh restart`
 ## Durable workflow jobs — long swarms that survive between messages
 
 A background `Workflow` runs INSIDE the one-shot `claude -p` turn; when the final reply is emitted the
-turn ends and a still-running swarm is **killed** (lost report). For any workflow that must outlive the
-turn, launch it as a **durable job** instead of the inline tool:
+turn ends and a still-running swarm is **killed** (lost report).
+
+Both doors therefore pass a PreToolUse hook, `tools/hooks/durable_swarm.py`, that intercepts every
+`Workflow` call, launches the same script as a durable job and refuses the inline call, returning the
+job id. It fails open, and passes through inside a durable job (`KREVETKA_JOB_ID`, set by
+`bot/jobs/run_job.sh`) or with `KREVETKA_INLINE_SWARM=1` when a result is genuinely needed this turn.
+
+To launch one directly:
 ```
 python3 tools/workflow_job.py launch --script <path.js> [--args-file <json>] [--label L]
 ```

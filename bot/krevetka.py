@@ -1468,18 +1468,27 @@ async def run_claude_streaming(
             "--append-system-prompt", build_provider_system_prompt(lang),
         ]
 
+    # PreToolUse hooks. Built as ONE list: --settings can only be passed once, so a second
+    # cmd.extend would silently replace the first instead of adding to it.
+    _pre_tool_use = []
+    # Every swarm goes through the durable-job path. An inline Workflow is killed when the turn ends
+    # and its finished work is never reported (2026-08-02, Matrix room). The hook converts the call
+    # so this cannot be forgotten; it fails open if anything about it breaks.
+    _durable_hook = os.path.join(BOT_CWD, "tools", "hooks", "durable_swarm.py")
+    if os.path.exists(_durable_hook):
+        _pre_tool_use.append({
+            "matcher": "Workflow",
+            "hooks": [{"type": "command", "command": f"python3 {_durable_hook}"}],
+        })
     if not ALLOW_SELF_MODIFICATION:
         # Secondary instance: block modification of krevetka's own code via a PreToolUse guard.
         # Read is matched too so a cap can additionally hide krevetka's secrets (bot/caps/<n>.json).
-        guard_settings = json.dumps({
-            "hooks": {
-                "PreToolUse": [{
-                    "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|Read",
-                    "hooks": [{"type": "command", "command": f"python3 {SELFMOD_GUARD_PATH}"}],
-                }]
-            }
+        _pre_tool_use.append({
+            "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|Read",
+            "hooks": [{"type": "command", "command": f"python3 {SELFMOD_GUARD_PATH}"}],
         })
-        cmd.extend(["--settings", guard_settings])
+    if _pre_tool_use:
+        cmd.extend(["--settings", json.dumps({"hooks": {"PreToolUse": _pre_tool_use}})])
 
     for _d in INSTANCE_ADD_DIRS:
         cmd.extend(["--add-dir", _d])
