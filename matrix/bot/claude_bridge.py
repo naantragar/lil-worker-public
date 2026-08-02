@@ -10,7 +10,12 @@ import base64
 import json
 import os
 import signal
+import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mblog import clip as _clip, log as _log, since as _since  # noqa: E402
 
 ALLOWED_TOOLS = "Read,Write,Edit,Bash,Glob,Grep,WebFetch,WebSearch,Task,Agent,Workflow,Skill"
 
@@ -135,6 +140,16 @@ async def run(prompt: str, session_id: str | None, images: list[str] | None = No
     text, new_sid = "", None
     assert proc.stdout is not None
 
+    started = time.monotonic()
+    # Live picture of what the turn is DOING. Without it a long turn is a black box: the room goes
+    # quiet and there is no way to tell "the model is grinding through 40 tool calls" from "it hung".
+    # Every tool call is logged as it streams, and a heartbeat reports progress while it runs.
+    _log(f"claude: pid {proc.pid}, model {_model()},"
+         f" {'resume ' + session_id[:8] if session_id else 'fresh session'}"
+         f"{f', {len(images)} image(s)' if images else ''}")
+    stats = {"events": 0, "tools": 0, "last_tool": "", "last_event": time.monotonic(),
+             "first_out": None, "workflows": 0}
+
     def _ingest(raw: bytes) -> None:
         nonlocal text, new_sid
         line = raw.decode("utf-8", "replace").strip()
@@ -144,9 +159,46 @@ async def run(prompt: str, session_id: str | None, images: list[str] | None = No
             evt = json.loads(line)
         except json.JSONDecodeError:
             return
-        if evt.get("type") == "result":
+        stats["events"] += 1
+        stats["last_event"] = time.monotonic()
+        if stats["first_out"] is None:
+            stats["first_out"] = time.monotonic()
+            _log(f"claude: first output after {_since(started)}")
+        etype = evt.get("type")
+        if etype == "assistant":
+            for block in ((evt.get("message") or {}).get("content") or []):
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    name = block.get("name") or "?"
+                    stats["tools"] += 1
+                    stats["last_tool"] = name
+                    inp = block.get("input") or {}
+                    hint = (inp.get("command") or inp.get("file_path") or inp.get("pattern")
+                            or inp.get("prompt") or inp.get("description") or "")
+                    if name in ("Workflow", "Task", "Agent"):
+                        stats["workflows"] += 1
+                        # The exact failure seen on 2026-08-02: a swarm launched INSIDE a turn keeps
+                        # running only as long as the turn does. Name it in the log so a later
+                        # "where is my report?" has an answer.
+                        _log(f"claude: tool {name} — a swarm inside the turn; it dies when the turn"
+                             f" ends unless it was launched as a durable job", _clip(hint, 60))
+                    else:
+                        _log(f"claude: tool {name}", _clip(hint, 70))
+        elif etype == "result":
             text = evt.get("result", "") or text
             new_sid = evt.get("session_id", new_sid)
+
+    async def _heartbeat() -> None:
+        """Say something every minute so a long turn is visibly ALIVE in the log."""
+        while True:
+            await asyncio.sleep(60)
+            quiet = time.monotonic() - stats["last_event"]
+            _log(f"claude: still running {_since(started)} — {stats['events']} events,"
+                 f" {stats['tools']} tool calls, last '{stats['last_tool'] or '-'}',"
+                 f" quiet for {quiet:.0f}s")
+
+    heartbeat = asyncio.create_task(_heartbeat())
 
     # Read WITHOUT the StreamReader 64KB line limit: `async for line in stdout` (readline) raises
     # LimitOverrunError ("Separator is found, but chunk is longer than limit") on a long stream-json
@@ -157,7 +209,6 @@ async def run(prompt: str, session_id: str | None, images: list[str] | None = No
     # recover except restarting the bridge. Silence-based (not wall-clock), so a legitimately long
     # turn that keeps streaming is never cut off, with a hard ceiling as the final backstop.
     buf = b""
-    started = time.monotonic()
     timed_out = ""
     while True:
         try:
@@ -180,6 +231,7 @@ async def run(prompt: str, session_id: str | None, images: list[str] | None = No
 
     async def _finish() -> str:
         """Stop draining and return the tail of stderr. Bounded: a wedged child must not hang us."""
+        heartbeat.cancel()
         try:
             await asyncio.wait_for(stderr_task, timeout=5)
         except (asyncio.TimeoutError, Exception):
@@ -187,6 +239,8 @@ async def run(prompt: str, session_id: str | None, images: list[str] | None = No
         return b"".join(stderr_buf).decode("utf-8", "replace")
 
     if timed_out:
+        _log(f"claude: DEADLINE HIT ({timed_out}) after {_since(started)} —"
+             f" killing the process group ({stats['tools']} tool calls so far)")
         _kill_tree(proc)
         try:
             await asyncio.wait_for(proc.wait(), timeout=10)
@@ -200,6 +254,12 @@ async def run(prompt: str, session_id: str | None, images: list[str] | None = No
 
     await proc.wait()
     err = await _finish()
+    _log(f"claude: exit {proc.returncode} after {_since(started)} —"
+         f" {stats['events']} events, {stats['tools']} tool calls, reply {len(text)} chars"
+         + (f", {stats['workflows']} in-turn swarm launch(es)" if stats["workflows"] else "")
+         + ("" if text else " — NO TEXT IN RESULT"))
+    if err.strip():
+        _log("claude: stderr tail", _clip(err[-300:], 200))
     if proc.returncode != 0 and not text:
         raise RuntimeError(f"claude -p exited {proc.returncode}: {err[-400:]}")
     return (text or "(пустой ответ)"), new_sid, bool(text)
