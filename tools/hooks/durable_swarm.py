@@ -39,6 +39,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 LAUNCHER = REPO / "tools" / "workflow_job.py"
+RUNNER = REPO / "bot" / "jobs" / "run_job.sh"   # job_ctl refuses to launch without it
 AUTO_DIR = REPO / "tools" / "workflows" / "auto"
 HOOK_LOG = REPO / "bot" / "jobs" / "durable_swarm_hook.log"
 LAUNCH_TIMEOUT_S = 90
@@ -86,8 +87,11 @@ def main() -> None:
     ti = payload.get("tool_input") or {}
     script, script_path, named = ti.get("script"), ti.get("scriptPath"), ti.get("name")
 
-    if not LAUNCHER.exists():
-        _log(f"launcher missing at {LAUNCHER} — allowing inline")
+    # Install-incomplete is NOT a policy decision: if the durable machinery is not there, blocking
+    # would leave the model unable to run a swarm at all. Only refuse when we can offer the durable
+    # path in exchange.
+    if not LAUNCHER.exists() or not RUNNER.exists():
+        _log(f"durable machinery missing ({LAUNCHER.exists()=}, {RUNNER.exists()=}) — allowing inline")
         _allow()
 
     if named and not (script or script_path):

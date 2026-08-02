@@ -4,6 +4,8 @@ bot/.sessions.json
 bot/.providers.json
 bot/.sessions_codex.json
 bot/instances/
+bot/jobs/*
+!bot/jobs/run_job.sh
 matrix/.env
 matrix/bot/sessions.json
 matrix/bot/store/
