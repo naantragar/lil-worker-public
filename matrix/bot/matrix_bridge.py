@@ -216,7 +216,10 @@ async def _typing_keepalive(room_id: str) -> None:
     """Re-assert "typing…" until cancelled. A transient failure must never kill the turn."""
     while True:
         try:
-            await _client.room_typing(room_id, True, timeout=_TYPING_TTL_MS)
+            # Bounded: nio's default request timeout is 60 s, so ONE stalled PUT used to blank the
+            # indicator for a whole minute — longer than the TTL it was refreshing.
+            await asyncio.wait_for(
+                _client.room_typing(room_id, True, timeout=_TYPING_TTL_MS), timeout=10)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -224,11 +227,43 @@ async def _typing_keepalive(room_id: str) -> None:
         await asyncio.sleep(_TYPING_REFRESH_S)
 
 
+# Refcounted per room, because more than one thing legitimately wants the indicator up at once:
+# the turn wrapper holds it across the queue wait, and _answer holds it across the model run. The
+# indicator goes out only when the LAST holder releases it — otherwise an inner release would blank
+# it while the outer stage was still working.
+_typing_tasks: dict[str, asyncio.Task] = {}
+_typing_holders: dict[str, int] = {}
+
+
+def _typing_on(room_id: str) -> None:
+    _typing_holders[room_id] = _typing_holders.get(room_id, 0) + 1
+    if room_id not in _typing_tasks:
+        _typing_tasks[room_id] = asyncio.create_task(_typing_keepalive(room_id))
+
+
+async def _typing_off(room_id: str) -> None:
+    left = _typing_holders.get(room_id, 1) - 1
+    _typing_holders[room_id] = max(0, left)
+    if left > 0:
+        return
+    task = _typing_tasks.pop(room_id, None)
+    if task:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+    try:
+        await asyncio.wait_for(_client.room_typing(room_id, False), timeout=10)
+    except Exception:
+        pass
+
+
 async def _answer(room_id: str, prompt: str, images: list[str] | None = None) -> None:
     """Run claude for THIS room's session, then post text + any [FILE]/[VOICE] the reply emitted."""
     # Keepalive spans the claude run AND the sends (TTS synthesis + uploads take seconds too), so the
     # indicator stays up until the message really lands in the room.
-    keepalive = asyncio.create_task(_typing_keepalive(room_id))
+    _typing_on(room_id)
     gen = _gen(room_id)  # captured BEFORE the run; a /new during it invalidates the session write
     sid = _sessions().get(room_id)
     _log(f"answer: prompt {len(prompt)} chars,"
@@ -280,15 +315,7 @@ async def _answer(room_id: str, prompt: str, images: list[str] | None = None) ->
             await _send_file(room_id, fp)
             _log(f"answer: sent file {_clip(fp, 60)} in {_since(t_f)}")
     finally:
-        keepalive.cancel()
-        try:
-            await keepalive
-        except (asyncio.CancelledError, Exception):
-            pass
-        try:
-            await _client.room_typing(room_id, False)
-        except Exception:
-            pass
+        await _typing_off(room_id)
 
 
 def _mine(room: MatrixRoom, event) -> bool:
@@ -323,8 +350,14 @@ _turns: set[asyncio.Task] = set()  # strong refs — a bare create_task may be G
 _turn_seq = 0  # per-turn id so interleaved lines from parallel rooms can be told apart
 
 
-def _spawn_turn(room_id: str, coro, kind: str = "turn") -> None:
-    """Run `coro` off the sync loop, serialized against other turns in the SAME room."""
+def _spawn_turn(room_id: str, coro, kind: str = "turn", typing_from_start: bool = True) -> None:
+    """Run `coro` off the sync loop, serialized against other turns in the SAME room.
+
+    `typing_from_start` puts "typing…" up the moment the message is ACCEPTED — including the wait in
+    the room queue, which is exactly when the owner walks in to check whether anything is happening.
+    Media turns pass False: while we are still pulling THEIR upload off the homeserver there is
+    nothing to claim we are typing about; those turns raise the indicator once the download is done.
+    """
     global _turn_seq
     _turn_seq += 1
     tid = _turn_seq
@@ -332,26 +365,32 @@ def _spawn_turn(room_id: str, coro, kind: str = "turn") -> None:
     async def _serialized():
         lock = _room_locks.setdefault(room_id, asyncio.Lock())
         label = _room_label(room_id)
+        if typing_from_start:
+            _typing_on(room_id)
         # A message that arrives while the room is busy waits here, invisibly. That wait was the
         # single most confusing thing about this door: from the outside a queued message and a dead
         # bridge look identical. Log both the fact and how long it cost.
         queued_at = time.monotonic()
         if lock.locked():
             _log(f"#{tid} {kind} QUEUED in {label} — the room is busy with an earlier turn")
-        async with lock:
-            waited = time.monotonic() - queued_at
-            _log(f"#{tid} {kind} START in {label}"
-                 + (f" (waited {waited:.1f}s in queue)" if waited > 0.5 else ""))
-            t0 = time.monotonic()
-            try:
-                await coro
-                _log(f"#{tid} {kind} END in {label} after {_since(t0)}")
-            except Exception as e:                     # a failed turn must never kill the bridge
-                _log(f"#{tid} {kind} FAILED in {label} after {_since(t0)}", repr(e))
+        try:
+            async with lock:
+                waited = time.monotonic() - queued_at
+                _log(f"#{tid} {kind} START in {label}"
+                     + (f" (waited {waited:.1f}s in queue)" if waited > 0.5 else ""))
+                t0 = time.monotonic()
                 try:
-                    await _send_text(room_id, f"⚠️ сбой обработки: {e}")
-                except Exception as se:
-                    _log(f"#{tid} could not even report the failure", repr(se))
+                    await coro
+                    _log(f"#{tid} {kind} END in {label} after {_since(t0)}")
+                except Exception as e:                 # a failed turn must never kill the bridge
+                    _log(f"#{tid} {kind} FAILED in {label} after {_since(t0)}", repr(e))
+                    try:
+                        await _send_text(room_id, f"⚠️ сбой обработки: {e}")
+                    except Exception as se:
+                        _log(f"#{tid} could not even report the failure", repr(se))
+        finally:
+            if typing_from_start:
+                await _typing_off(room_id)
     t = asyncio.create_task(_serialized())
     _turns.add(t)
     t.add_done_callback(_turns.discard)
@@ -472,14 +511,17 @@ async def on_text(room, event: RoomMessageText) -> None:
 async def on_image(room, event: RoomMessageImage) -> None:
     if _mine(room, event):
         _log("image", event.url)
-        _spawn_turn(room.room_id, _turn_image(room.room_id, event), "image")
+        _spawn_turn(room.room_id, _turn_image(room.room_id, event), "image", typing_from_start=False)
 
 
 async def _turn_image(room_id: str, event: RoomMessageImage) -> None:
+    t0 = time.monotonic()
     data = await _download_event_media(event)
     if not data:
+        _log("image: download FAILED")
         await _send_text(room_id, "⚠️ не смог скачать изображение")
         return
+    _log(f"image: downloaded {len(data)/1024:.0f} KB in {_since(t0)}")
     ext = (event.body or "img").rsplit(".", 1)[-1].lower()
     ext = ext if ext in ("jpg", "jpeg", "png", "gif", "webp") else "jpg"
     p = TMP / f"mb_img_{int(time.time()*1000)}.{ext}"
@@ -495,7 +537,7 @@ async def _turn_image(room_id: str, event: RoomMessageImage) -> None:
 async def on_audio(room, event: RoomMessageAudio) -> None:
     if _mine(room, event):
         _log("audio", event.url)
-        _spawn_turn(room.room_id, _turn_audio(room.room_id, event), "voice")
+        _spawn_turn(room.room_id, _turn_audio(room.room_id, event), "voice", typing_from_start=False)
 
 
 async def _turn_audio(room_id: str, event: RoomMessageAudio) -> None:
@@ -512,27 +554,33 @@ async def _turn_audio(room_id: str, event: RoomMessageAudio) -> None:
     p.write_bytes(data)
     dur_ms = media.audio_duration_ms(str(p))
     t1 = time.monotonic()
+    # Download is over — from here the work is OURS, so the indicator goes up: transcription of a
+    # long voice note is seconds of otherwise unexplained silence before the model even starts.
+    _typing_on(room_id)
     try:
-        text = await media.transcribe(str(p))
-    except Exception as e:
-        _log(f"voice: transcription FAILED after {_since(t1)}", repr(e))
-        await _send_text(room_id, f"⚠️ ошибка транскрипции: {e}")
-        return
+        try:
+            text = await media.transcribe(str(p))
+        except Exception as e:
+            _log(f"voice: transcription FAILED after {_since(t1)}", repr(e))
+            await _send_text(room_id, f"⚠️ ошибка транскрипции: {e}")
+            return
+        finally:
+            try: p.unlink()
+            except OSError: pass
+        _log(f"voice: {dur_ms/1000:.0f}s of audio transcribed in {_since(t1)}"
+             f" → {len(text)} chars", _clip(text, 60))
+        if not text:
+            await _send_text(room_id, "⚠️ не удалось распознать речь")
+            return
+        await _answer(room_id, text)
     finally:
-        try: p.unlink()
-        except OSError: pass
-    _log(f"voice: {dur_ms/1000:.0f}s of audio transcribed in {_since(t1)}"
-         f" → {len(text)} chars", _clip(text, 60))
-    if not text:
-        await _send_text(room_id, "⚠️ не удалось распознать речь")
-        return
-    await _answer(room_id, text)
+        await _typing_off(room_id)
 
 
 async def on_file(room, event: RoomMessageFile) -> None:
     if _mine(room, event):
         _log("file", event.body, event.url)
-        _spawn_turn(room.room_id, _turn_file(room.room_id, event), "file")
+        _spawn_turn(room.room_id, _turn_file(room.room_id, event), "file", typing_from_start=False)
 
 
 async def on_video(room, event) -> None:
@@ -589,11 +637,11 @@ async def on_bad_event(room, event: BadEvent) -> None:
     shim = _RawMedia(content)
     _log("rescued encrypted-forward media", msgtype, shim.body)
     if msgtype == "m.audio":
-        _spawn_turn(room.room_id, _turn_audio(room.room_id, shim), "voice(rescued)")
+        _spawn_turn(room.room_id, _turn_audio(room.room_id, shim), "voice(rescued)", typing_from_start=False)
     elif msgtype == "m.image":
-        _spawn_turn(room.room_id, _turn_image(room.room_id, shim), "image(rescued)")
+        _spawn_turn(room.room_id, _turn_image(room.room_id, shim), "image(rescued)", typing_from_start=False)
     else:
-        _spawn_turn(room.room_id, _turn_file(room.room_id, shim), "file(rescued)")
+        _spawn_turn(room.room_id, _turn_file(room.room_id, shim), "file(rescued)", typing_from_start=False)
 
 
 async def _turn_file(room_id: str, event: RoomMessageFile) -> None:
