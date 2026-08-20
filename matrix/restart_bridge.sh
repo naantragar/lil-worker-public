@@ -56,6 +56,29 @@ fi
 
 [ -n "$ACTIVE" ] && echo "WARNING: restarting with active job(s) because --force was given:" && echo "$ACTIVE" | sed 's/^/  · /'
 
+# An in-flight CONVERSATION turn is just as unrecoverable as a lost job, and until 2026-08-20 this
+# script did not look for one. It cost a real answer: at 02:35:53 a turn in the main room ran
+# manage_users.py (password changed, token reissued), and a restart at 02:37:10 killed it before it
+# could report — the side effects had happened, the room heard nothing, and the owner had to ask
+# again two hours later. A turn is a child `claude` of the bridge, so it is trivial to see.
+MAIN_PID="$(systemctl show "$UNIT" -p MainPID --value 2>/dev/null || echo 0)"
+TURNS=""
+if [ "${MAIN_PID:-0}" -gt 0 ]; then
+    TURNS="$(pgrep -P "$MAIN_PID" -a 2>/dev/null | grep -F 'claude' || true)"
+fi
+
+if [ -n "$TURNS" ] && [ "$FORCE" -eq 0 ]; then
+    echo "REFUSING to restart $UNIT — a turn is IN FLIGHT:"
+    echo "$TURNS" | sed 's/^/  · /' | cut -c1-120
+    echo
+    echo "Killing it loses the answer even when the work already happened (tool calls are not"
+    echo "rolled back). Wait for it — 'tail -n 5 $REPO/matrix/logs/matrix-bridge.log' shows the"
+    echo "room and how long it has been running — or override with: $0 --force"
+    exit 4
+fi
+
+[ -n "$TURNS" ] && echo "WARNING: killing an in-flight turn because --force was given."
+
 systemctl restart "$UNIT" || exit 1
 sleep 3
 systemctl is-active --quiet "$UNIT" && echo "$UNIT restarted OK" || { echo "$UNIT FAILED to come back"; exit 1; }

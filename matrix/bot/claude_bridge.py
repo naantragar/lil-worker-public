@@ -9,6 +9,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -57,7 +58,151 @@ def _image_stdin(prompt: str, images: list[str]) -> bytes:
     return (json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n").encode()
 
 
-def _model() -> str:
+def _room_prompt(room_id: str | None) -> str:
+    """Extra system prompt for THIS room, read fresh on every turn.
+
+    Rooms are otherwise identical — same repo, same CLAUDE.md, same tools — and differ only by
+    session. A room can now also carry its own behaviour: bot/room_profiles.json maps a room id to a
+    markdown file under bot/prompts/, whose text is appended to SYSTEM_PROMPT.
+
+    Read on EVERY turn on purpose: tuning such a room means editing that markdown and sending the
+    next message, with no bridge restart and no turn lost. Any error here is swallowed — a broken
+    profile must degrade to the plain krevetka, never to a dead room.
+    """
+    if not room_id:
+        return ""
+    try:
+        here = Path(__file__).resolve().parent
+        profiles = json.loads((here / "room_profiles.json").read_text())
+        entry = profiles.get(room_id) or {}
+        rel = entry.get("prompt")
+        if not rel:
+            return ""
+        # One file or an ordered list of them. A tuned room grows a corpus (task, glossary,
+        # examples, accepted pairs) and keeping those in separate files is what makes it editable —
+        # a single blob would have to be rewritten wholesale on every correction.
+        parts = [rel] if isinstance(rel, str) else list(rel)
+        chunks = []
+        for part in parts:
+            try:
+                chunks.append((here / part).read_text().strip())
+            except Exception:
+                continue
+        return "\n\n".join(c for c in chunks if c)
+    except Exception:
+        return ""
+
+
+# Every dash-like codepoint the model may reach for, mapped to a plain ASCII hyphen. Cheaper and
+# far more reliable than asking for it in the prompt — a formatting habit this deep survives any
+# number of rules, and the log it feeds wants one dash character, not five.
+_DASHES = {
+    "\u2010": "-",  # hyphen
+    "\u2011": "-",  # non-breaking hyphen
+    "\u2012": "-",  # figure dash
+    "\u2013": "-",  # en dash
+    "\u2014": "-",  # em dash
+    "\u2015": "-",  # horizontal bar
+    "\u2212": "-",  # minus sign
+    "\u2043": "-",  # hyphen bullet
+    "\ufe58": "-",  # small em dash
+    "\ufe63": "-",  # small hyphen-minus
+    "\uff0d": "-",  # fullwidth hyphen-minus
+}
+_DASH_RE = re.compile("[" + "".join(_DASHES) + "]")
+
+_TIME_IN = re.compile(r"\b\d{1,2}:\d{2}\b|\b\d{2}\.\d{2}\.\d{4}\b")
+# Also catches PLACEHOLDER stamps — the model sometimes writes "12:XX" or "--:--" when it knows it
+# has no time but still wants the slot filled. Those are just as wrong in a log as an invented one.
+_D = r"[\dXxХх?\-]"
+_DATE = rf"{_D}{{2}}\.{_D}{{2}}\.{_D}{{4}}"
+_TIME = rf"{_D}{{1,2}}:{_D}{{2}}(?::{_D}{{2}})?"
+# A date ALONE also counts — the model hedges with things like "12.07.2026 (?)," when it has no
+# stamp but still wants the slot filled. Optional "(?)"/"?" hedge is eaten with it.
+_TIME_LEAD = re.compile(
+    rf"(?m)^[ \t]*(?:{_DATE}(?:\s*\(\?\)|\s*\?)?\s*,?\s*(?:{_TIME})?|{_TIME})\s*")
+
+
+# Two leftovers the model keeps producing once a timestamp is not available: a hedging clause about
+# the missing time ("ім час не вказано - …"), and a bullet dash opening the only line. Both are
+# noise in a log line, and both resist prompting — the mere mention of timestamps in the rules is
+# what makes it talk about them, so this is handled here instead.
+_TIME_META = re.compile(r"(?mi)^\s*(?:ім\s+|йм\s+)?(?:час[ауи]?|дат[аи]|мітк\w*|позначк\w*)\b[^-\n]{0,40}-\s*")
+_BULLET = re.compile(r"(?m)^[ \t]*[-•*]\s+")
+
+
+def _room_postprocess(room_id: str | None, prompt: str, reply: str) -> str:
+    """Profile-driven cleanup of the model's reply. Deterministic, because some habits cannot be
+    prompted away.
+
+    `strip_timestamp_if_absent`: the refraz room's log lines normally start with the timestamp of
+    the intercept, and the example corpus is full of them — so when a fragment arrives WITHOUT any
+    time, the model still reaches for one and copies a plausible-looking time out of the corpus.
+    Five prompt revisions did not stop it; a fabricated timestamp in an intercept log is worse than
+    an ugly one, so it is cut here: no time anywhere in the input → no time at the start of a line.
+    """
+    if not room_id or not reply:
+        return reply
+    try:
+        here = Path(__file__).resolve().parent
+        entry = (json.loads((here / "room_profiles.json").read_text()).get(room_id)) or {}
+        out = reply
+        if entry.get("strip_dialogue_echo"):
+            # A summary must never contain the intercepted speech itself. The model occasionally
+            # opens by echoing the first "–" line before summarising; drop any such line outright.
+            kept = [ln for ln in out.splitlines() if not ln.lstrip().startswith(("–", "—", "- –"))]
+            joined = "\n".join(kept).strip()
+            if joined and joined != out.strip():
+                _log("claude: dropped echoed dialogue line(s) from the summary")
+                out = joined
+        if entry.get("strip_timestamp_if_absent") and not _TIME_IN.search(prompt):
+            cleaned = _TIME_LEAD.sub("", out).strip()
+            if cleaned and cleaned != out.strip():
+                _log("claude: stripped an invented timestamp (none in the input)")
+            out = cleaned or out
+            meta_free = _TIME_META.sub("", out).strip()
+            if meta_free and meta_free != out.strip():
+                _log("claude: dropped a hedge about the missing timestamp")
+                out = meta_free
+        if entry.get("normalize_dashes"):
+            # Deliberately last: strip_dialogue_echo matches lines starting with "–", so flattening
+            # dashes before it would hide exactly the lines it is meant to drop.
+            flat = _DASH_RE.sub(lambda m: _DASHES[m.group()], out)
+            if flat != out:
+                _log("claude: normalised dashes to plain '-'")
+                out = flat
+            debulleted = _BULLET.sub("", out).strip()
+            if debulleted and debulleted != out.strip():
+                _log("claude: dropped a leading bullet dash")
+                out = debulleted
+        return out
+    except Exception:
+        pass
+    return reply
+
+
+def room_cfg(room_id: str | None) -> dict:
+    """This room's profile entry, or {}. Never raises — a broken file must not take a room down."""
+    if not room_id:
+        return {}
+    try:
+        here = Path(__file__).resolve().parent
+        return (json.loads((here / "room_profiles.json").read_text()).get(room_id)) or {}
+    except Exception:
+        return {}
+
+
+def _model(room_id: str | None = None) -> str:
+    """Effective model for this room.
+
+    A room may pin its own: a narrow formatting room does not need the flagship the main room runs
+    on, and the choice must NOT leak — bot/model_config.json is shared by every room AND by the
+    Telegram door, so switching it there would move everything at once. The per-room value wins and
+    affects nothing else.
+    """
+    pinned = str(room_cfg(room_id).get("model") or "").strip()
+    if pinned:
+        return pinned
     try:
         cfg = os.path.join(os.environ.get("CLAUDE_CWD", "."), "bot", "model_config.json")
         return str(json.load(open(cfg)).get("model", "")).strip() or os.environ.get("CLAUDE_MODEL", "sonnet")
@@ -87,10 +232,16 @@ async def run(prompt: str, session_id: str | None, images: list[str] | None = No
     cmd = [
         os.environ.get("CLAUDE_BIN", "claude"), "-p",
         "--output-format", "stream-json", "--verbose",
-        "--model", _model(),
+        "--model", _model(room_id),
         "--allowedTools", ALLOWED_TOOLS,
-        "--append-system-prompt", SYSTEM_PROMPT,
     ]
+    _effort = str(room_cfg(room_id).get("effort") or "").strip()
+    if _effort:
+        cmd += ["--effort", _effort]
+    _extra = _room_prompt(room_id)
+    if _extra:
+        _log(f"claude: room profile applied (+{len(_extra)} chars of system prompt)")
+    cmd += ["--append-system-prompt", SYSTEM_PROMPT + ("\n\n" + _extra if _extra else "")]
     # Force every swarm through the durable-job path. An inline Workflow dies when this turn ends and
     # its report is lost (2026-08-02: five agents finished, nothing was ever reported). The hook
     # converts the call instead of relying on the model to remember the rule; it fails open.
@@ -155,7 +306,8 @@ async def run(prompt: str, session_id: str | None, images: list[str] | None = No
     # Live picture of what the turn is DOING. Without it a long turn is a black box: the room goes
     # quiet and there is no way to tell "the model is grinding through 40 tool calls" from "it hung".
     # Every tool call is logged as it streams, and a heartbeat reports progress while it runs.
-    _log(f"claude: pid {proc.pid}, model {_model()},"
+    _log(f"claude: pid {proc.pid}, model {_model(room_id)}"
+         + (f" effort={_effort}" if _effort else "") + ","
          f" {'resume ' + session_id[:8] if session_id else 'fresh session'}"
          f"{f', {len(images)} image(s)' if images else ''}")
     stats = {"events": 0, "tools": 0, "last_tool": "", "last_event": time.monotonic(),
@@ -273,7 +425,7 @@ async def run(prompt: str, session_id: str | None, images: list[str] | None = No
         _log("claude: stderr tail", _clip(err[-300:], 200))
     if proc.returncode != 0 and not text:
         raise RuntimeError(f"claude -p exited {proc.returncode}: {err[-400:]}")
-    return (text or "(пустой ответ)"), new_sid, bool(text)
+    return _room_postprocess(room_id, prompt, text or "(пустой ответ)"), new_sid, bool(text)
 
 
 def _kill_tree(proc) -> None:

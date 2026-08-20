@@ -445,13 +445,88 @@ async def _cmd_new(room_id: str) -> None:
                               + "\n\nДругие комнаты не затронуты.")
 
 
+_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def _write_room_cfg(room_id: str, key: str, value) -> None:
+    """Set/clear ONE key in this room's profile entry, leaving everything else alone."""
+    path = HERE / "room_profiles.json"
+    try:
+        profiles = json.loads(path.read_text())
+    except Exception:
+        profiles = {}
+    entry = profiles.setdefault(room_id, {})
+    if value is None:
+        entry.pop(key, None)
+    else:
+        entry[key] = value
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(profiles, ensure_ascii=False, indent=2) + "\n")
+    os.replace(tmp, path)
+
+
+async def _cmd_model(room_id: str, arg: str) -> None:
+    """Pin the model for THIS room only. Other rooms and the Telegram door are untouched."""
+    pinned = claude_bridge.room_cfg(room_id).get("model")
+    if not arg:
+        await _send_text(room_id,
+                         f"**Модель цієї кімнати:** `{claude_bridge._model(room_id)}`"
+                         + ("" if pinned else " _(глобальна, не закріплена за кімнатою)_")
+                         + "\n\n`/model <id>` — закріпити · `/model default` — зняти закріплення")
+        return
+    if arg in ("default", "-", "off", "reset"):
+        _write_room_cfg(room_id, "model", None)
+        await _send_text(room_id, f"🔓 Закріплення знято. Діє глобальна: `{claude_bridge._model(room_id)}`")
+        return
+    # Verify BEFORE pinning: a typo would otherwise brick this room until someone edits the file by
+    # hand. Model names outrun what I know, so the smoke test is the authority, not my opinion.
+    await _send_text(room_id, f"⏳ Перевіряю `{arg}`…")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            os.environ.get("CLAUDE_BIN", "claude"), "-p", "Reply OK", "--model", arg,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            cwd=os.environ.get("CLAUDE_CWD", os.getcwd()))
+        _, err = await asyncio.wait_for(proc.communicate(), timeout=120)
+        ok = proc.returncode == 0
+    except Exception as e:
+        ok, err = False, str(e).encode()
+    if not ok:
+        await _send_text(room_id, f"❌ `{arg}` не приймається — нічого не змінено.\n"
+                                  f"```\n{(err or b'').decode(errors='replace')[-300:]}\n```")
+        return
+    _write_room_cfg(room_id, "model", arg)
+    await _send_text(room_id, f"✅ Модель цієї кімнати: `{arg}`. Діє з наступного повідомлення, "
+                              f"інші кімнати й Telegram не зачеплені.")
+
+
+async def _cmd_effort(room_id: str, arg: str) -> None:
+    """Reasoning depth for THIS room only."""
+    cur = claude_bridge.room_cfg(room_id).get("effort")
+    if not arg:
+        await _send_text(room_id, f"**Рівень мислення:** `{cur or 'за замовчуванням'}`\n\n"
+                                  f"`/effort {'|'.join(_EFFORTS)}` · `/effort default` — зняти")
+        return
+    if arg in ("default", "-", "off", "reset"):
+        _write_room_cfg(room_id, "effort", None)
+        await _send_text(room_id, "🔓 Рівень мислення — за замовчуванням.")
+        return
+    if arg not in _EFFORTS:
+        await _send_text(room_id, f"❌ Невідоме значення. Доступні: `{'`, `'.join(_EFFORTS)}`")
+        return
+    _write_room_cfg(room_id, "effort", arg)
+    await _send_text(room_id, f"✅ Рівень мислення цієї кімнати: `{arg}`. Діє з наступного повідомлення.")
+
+
 async def _cmd_status(room_id: str) -> None:
     sid = _sessions().get(room_id)
     _, active = _jobs_snapshot()
     up = int((time.time() * 1000 - _started) / 1000)
     await _send_text(room_id, "\n".join([
         "**Статус**",
-        f"· модель: `{claude_bridge._model()}`",
+        f"· модель: `{claude_bridge._model(room_id)}`"
+        + (" (комнатная)" if claude_bridge.room_cfg(room_id).get("model") else " (глобальная)"),
+        f"· уровень мышления: `{claude_bridge.room_cfg(room_id).get('effort') or 'по умолчанию'}`",
+        f"· профиль комнаты: `{claude_bridge.room_cfg(room_id).get('label') or 'нет'}`",
         f"· сессия комнаты: `{sid[:8] + '…' if sid else 'нет (следующее сообщение начнёт новую)'}`",
         f"· комнат подключено: {len(ROOMS)} (работают параллельно)",
         f"· фоновых задач активно: {active}",
@@ -475,8 +550,10 @@ async def _cmd_help(room_id: str) -> None:
         "· `/new` — сбросить сессию ЭТОЙ комнаты (остальные не трогает)",
         "· `/status` — модель, сессия, комнаты, активные задачи",
         "· `/jobs` — фоновые durable-задачи и их статусы",
+        "· `/model [id|default]` — модель ЭТОЙ комнаты (проверяется перед закреплением)",
+        "· `/effort [low|medium|high|xhigh|max|default]` — глубина мышления ЭТОЙ комнаты",
         "",
-        "_Единственное действие — `/new`; остальное только смотрит._",
+        "_`/new`, `/model`, `/effort` меняют только ЭТУ комнату; остальное только смотрит._",
         "_Отвечают сразу, даже пока идёт длинный ответ._",
     ]))
 
@@ -487,6 +564,10 @@ async def _dispatch_command(room_id: str, body: str) -> bool:
     cmd = parts[0].lower()
     if cmd == "/new":
         _spawn_free(_cmd_new(room_id))
+    elif cmd == "/model":
+        _spawn_free(_cmd_model(room_id, " ".join(parts[1:]).strip()))
+    elif cmd == "/effort":
+        _spawn_free(_cmd_effort(room_id, " ".join(parts[1:]).strip().lower()))
     elif cmd == "/status":
         _spawn_free(_cmd_status(room_id))
     elif cmd == "/jobs":
