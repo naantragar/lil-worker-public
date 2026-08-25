@@ -1,0 +1,31 @@
+{
+  "_readme": [
+    "Commands that must ALWAYS run as a durable job, even in the foreground — read by",
+    "tools/hooks/durable_bash.py. Anything with run_in_background:true is converted regardless of",
+    "this list; this file exists for the long runners that get started in the foreground and would",
+    "otherwise die with the turn.",
+    "",
+    "Add an entry the moment a command turns out to be long-running and worth surviving. `pattern`",
+    "is a Python regex searched against the whole command string, so keep it specific enough that a",
+    "quick `--help` or a grep over the same file does not match by accident.",
+    "",
+    "Skipped conversions and launch failures are logged to bot/jobs/durable_bash_hook.log."
+  ],
+  "commands": [
+    {
+      "pattern": "tools/analytics2/run\\.py\\s+--from",
+      "label": "аналитика: отчёт",
+      "why": "прогон отчёта по перехватам идёт десятки минут"
+    },
+    {
+      "pattern": "tools/analytics_run\\.py\\s+--from|tools/analytics_pipeline\\.sh",
+      "label": "аналитика v1",
+      "why": "старый конвейер аналитики идёт десятки минут"
+    },
+    {
+      "pattern": "tools/analytics_sense\\.py\\s+--from",
+      "label": "аналитика: смысловой проход",
+      "why": "проход по всему окну идёт долго"
+    }
+  ]
+}

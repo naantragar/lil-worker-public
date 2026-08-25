@@ -57,17 +57,32 @@ async def transcribe(path: str) -> str:
         tcfg = json.loads((_LILWORKER / "bot" / "transcribe_config.json").read_text())
     except Exception:
         pass
+    _dur_s = audio_duration_ms(path) / 1000
     kwargs = dict(
-        model=os.environ.get("OPENAI_VOICE_MODEL", "gpt-4o-mini-transcribe"),
+        model=os.environ.get("OPENAI_VOICE_MODEL", "gpt-transcribe"),
         prompt="The speaker uses Ukrainian, Russian, or English ONLY. Never output other languages.",
         temperature=tcfg.get("temperature", 0.2),
     )
     if tcfg.get("language"):
         kwargs["language"] = tcfg["language"]
-    with open(path, "rb") as f:
-        kwargs["file"] = f
-        r = await _client().audio.transcriptions.create(**kwargs)
-    return (r.text or "").strip()
+    async def _run(model_name: str) -> str:
+        kw = dict(kwargs, model=model_name)
+        with open(path, "rb") as f:
+            kw["file"] = f
+            return ((await _client().audio.transcriptions.create(**kw)).text or "").strip()
+
+    text = await _run(kwargs["model"])
+    # Silent-truncation guard, same as the Telegram door: these models stop early on long audio and
+    # still return 200. Russian speech is ~10-14 chars/s, so anything under 5 c/s did not finish.
+    min_cps = float(os.environ.get("MIN_CHARS_PER_SECOND", "5"))
+    if _dur_s > 60 and len(text) < _dur_s * min_cps:
+        try:
+            alt = await _run(os.environ.get("FALLBACK_VOICE_MODEL", "whisper-1"))
+            if len(alt) > len(text):
+                text = alt
+        except Exception:
+            pass
+    return text
 
 
 async def synthesize(text: str, speed: float = 1.0) -> Path | None:

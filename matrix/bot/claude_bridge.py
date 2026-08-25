@@ -245,11 +245,18 @@ async def run(prompt: str, session_id: str | None, images: list[str] | None = No
     # Force every swarm through the durable-job path. An inline Workflow dies when this turn ends and
     # its report is lost (2026-08-02: five agents finished, nothing was ever reported). The hook
     # converts the call instead of relying on the model to remember the rule; it fails open.
-    _hook = _REPO / "tools" / "hooks" / "durable_swarm.py"
-    if _hook.exists():
-        cmd += ["--settings", json.dumps({"hooks": {"PreToolUse": [
-            {"matcher": "Workflow",
-             "hooks": [{"type": "command", "command": f"python3 {_hook}"}]}]}})]
+    # The same is done for shell commands that must outlive the turn — every run_in_background call
+    # plus the known long runners in tools/hooks/durable_commands.json. Built as ONE list because
+    # --settings can only be passed once: a second `cmd +=` would replace the first, not add to it.
+    _pre_tool_use = []
+    for _matcher, _name in (("Workflow", "durable_swarm.py"), ("Bash", "durable_bash.py")):
+        _hook = _REPO / "tools" / "hooks" / _name
+        if _hook.exists():
+            _pre_tool_use.append({
+                "matcher": _matcher,
+                "hooks": [{"type": "command", "command": f"python3 {_hook}"}]})
+    if _pre_tool_use:
+        cmd += ["--settings", json.dumps({"hooks": {"PreToolUse": _pre_tool_use}})]
     stdin_bytes = None
     if images:
         cmd += ["--input-format", "stream-json"]

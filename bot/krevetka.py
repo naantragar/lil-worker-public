@@ -61,7 +61,13 @@ CODEX_MODEL = os.environ.get("CODEX_MODEL", "")
 CODEX_SANDBOX_MODE = os.environ.get("CODEX_SANDBOX_MODE", "danger-full-access").strip().lower()
 CODEX_APPROVAL_POLICY = os.environ.get("CODEX_APPROVAL_POLICY", "never").strip().lower()
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_VOICE_MODEL = os.environ.get("OPENAI_VOICE_MODEL", "gpt-4o-mini-transcribe")
+OPENAI_VOICE_MODEL = os.environ.get("OPENAI_VOICE_MODEL", "gpt-transcribe")
+# Fallback used only when the primary result looks truncated (see _transcribe_checked).
+FALLBACK_VOICE_MODEL = os.environ.get("FALLBACK_VOICE_MODEL", "whisper-1")
+# Russian speech runs ~10-14 characters per second. Below this the transcript did not just come out
+# terse — it stopped early, which these models do SILENTLY (HTTP 200, text cut mid-sentence: a
+# 14-minute brief came back ending on "чтобы оно после" on 2026-08-22).
+MIN_CHARS_PER_SECOND = float(os.environ.get("MIN_CHARS_PER_SECOND", "5"))
 
 # ── Per-instance parametrization ───────────────────────────────────────────────
 # One codebase can run as several independent instances (separate Telegram bots).
@@ -84,6 +90,16 @@ INBOX_ALLOWED_SUFFIXES = {
     ".sql", ".csv", ".tsv", ".patch", ".diff", ".ts", ".tsx", ".js", ".jsx", ".css", ".html",
     ".log", ".conf",
 }
+# Office documents: text inside a zip, so they belong in the inbox — but they carry embedded images
+# and easily pass the 512 KB meant for scripts, while the TEXT in them is small. Own, larger cap.
+# Read them with `python3 tools/docx_text.py <path>` (stdlib only; images ignored).
+# .docm is a .docx with a macro blob inside; we unzip and read word/document.xml and never
+# execute anything, so it is exactly as safe to accept and needs no conversion by the sender.
+INBOX_DOC_SUFFIXES = {".docx", ".docm", ".odt"}
+INBOX_DOC_MAX_BYTES = 20 * 1024 * 1024   # Telegram's own bot-API download ceiling
+# The same ceiling, named for what it actually is: getFile refuses anything larger, for documents
+# and voice alike. A local telegram-bot-api server would raise it to 2 GB.
+TG_GETFILE_LIMIT = 20 * 1024 * 1024
 
 # Self-modification is allowed ONLY from the privileged (default) instance.
 # Secondary instances get a PreToolUse guard (selfmod_guard.py) that blocks edits to
@@ -1480,6 +1496,16 @@ async def run_claude_streaming(
             "matcher": "Workflow",
             "hooks": [{"type": "command", "command": f"python3 {_durable_hook}"}],
         })
+    # Same conversion for shell commands that must outlive the turn: anything run_in_background, plus
+    # the known long runners listed in tools/hooks/durable_commands.json. A background Bash task is
+    # killed by teardown exactly like an inline swarm was (2026-08-25: the analytics report run died
+    # twice before being hand-wrapped in a systemd scope — a hand-applied rule is not a mechanism).
+    _durable_bash = os.path.join(BOT_CWD, "tools", "hooks", "durable_bash.py")
+    if os.path.exists(_durable_bash):
+        _pre_tool_use.append({
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": f"python3 {_durable_bash}"}],
+        })
     if not ALLOW_SELF_MODIFICATION:
         # Secondary instance: block modification of krevetka's own code via a PreToolUse guard.
         # Read is matched too so a cap can additionally hide krevetka's secrets (bot/caps/<n>.json).
@@ -2284,7 +2310,31 @@ async def handle_voice(message: Message, bot: Bot):
         return
 
     voice = message.voice or message.audio
-    file = await bot.get_file(voice.file_id)
+
+    # The Bot API refuses getFile above 20 MB, and it refuses it BEFORE handing over a path — so a
+    # too-big voice cannot be downloaded, let alone split into chunks on our side. Until now that
+    # raised inside the handler and the user got NOTHING back: a 21-minute note simply vanished with
+    # only a traceback in the log. Check the size Telegram already told us and say so plainly.
+    size = getattr(voice, "file_size", 0) or 0
+    dur = int(getattr(voice, "duration", 0) or 0)
+    if size > TG_GETFILE_LIMIT:
+        mins = f"{dur // 60}:{dur % 60:02d}" if dur else "?"
+        await message.answer(
+            f"❌ Голосовое {mins} ({size / 1024 / 1024:.1f} МБ) — Telegram не отдаёт боту файлы "
+            f"больше {TG_GETFILE_LIMIT // 1024 // 1024} МБ.\n\n"
+            "Порезать его у себя я не могу: обрыв происходит до скачивания, файла у меня нет вообще. "
+            "Раздели запись на части и пришли по очереди — либо скажи, и я подниму локальный "
+            "Bot API сервер, тогда лимит вырастет до 2 ГБ."
+        )
+        logger.warning(f"VOICE uid={user_id} rejected: {size} bytes > getFile limit")
+        return
+
+    try:
+        file = await bot.get_file(voice.file_id)
+    except Exception as e:                      # network hiccup, expired file_id, anything
+        logger.exception("get_file failed for voice")
+        await message.answer(f"❌ Не смог забрать голосовое у Telegram: {e}")
+        return
 
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
         await bot.download_file(file.file_path, tmp.name)
@@ -2300,6 +2350,7 @@ async def handle_voice(message: Message, bot: Bot):
         _tr_temperature = _tcfg.get("temperature", 0.2)
         logger.info(f"Transcribe config: language={_tr_language}, temperature={_tr_temperature}")
 
+        _dur = int(getattr(voice, "duration", 0) or 0)
         _tr_kwargs = dict(
             model=OPENAI_VOICE_MODEL,
             file=None,
@@ -2310,11 +2361,29 @@ async def handle_voice(message: Message, bot: Bot):
             _tr_kwargs["language"] = _tr_language
 
         client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
-        with open(tmp_path, "rb") as audio_file:
-            _tr_kwargs["file"] = audio_file
-            transcription = await client.audio.transcriptions.create(**_tr_kwargs)
-        text = transcription.text.strip()
-        logger.info(f"VOICE uid={user_id}, transcribed: {text[:120]!r}")
+
+        async def _run(model_name: str) -> str:
+            kw = dict(_tr_kwargs, model=model_name)
+            with open(tmp_path, "rb") as audio_file:
+                kw["file"] = audio_file
+                return ((await client.audio.transcriptions.create(**kw)).text or "").strip()
+
+        text = await _run(OPENAI_VOICE_MODEL)
+        # Truncation guard. Measured 2026-08-22 on a 7-minute probe: gpt-transcribe returned the
+        # whole thing in 11s, whisper-1 in 109s — so whisper is the FALLBACK, never the default.
+        # What actually needs catching is the silent early stop, whichever model does it.
+        if _dur > 60 and len(text) < _dur * MIN_CHARS_PER_SECOND:
+            logger.warning(f"Transcript looks truncated: {len(text)} chars for {_dur}s "
+                           f"({len(text)/max(_dur,1):.1f} c/s) — retrying with {FALLBACK_VOICE_MODEL}")
+            try:
+                alt = await _run(FALLBACK_VOICE_MODEL)
+                if len(alt) > len(text):
+                    logger.info(f"Fallback won: {len(alt)} chars vs {len(text)}")
+                    text = alt
+            except Exception:
+                logger.exception("Fallback transcription failed — keeping the first result")
+        logger.info(f"VOICE uid={user_id}, {_dur}s → {len(text)} chars "
+                    f"({len(text)/max(_dur,1):.1f} c/s): {text[:100]!r}")
     except Exception:
         logger.exception("Voice transcription failed")
         await message.answer("❌ Ошибка транскрипции голосового.")
@@ -2360,6 +2429,88 @@ def _safe_inbox_name(raw: str) -> str:
     return base[:80]
 
 
+# A burst of documents is ONE turn, not one per file.
+#
+# Telegram delivers each document as its own message, so seven reports sent together used to start
+# seven independent `claude -p` turns at once. They overlapped on the same session, each one found
+# all seven files in .inbox, each re-did the whole job, each wrote to the same output files and each
+# answered the user — who got the same report seven times, and I mistook my own siblings' writes for
+# another instance. Media-group ids do not help: files dropped in one gesture often carry none.
+#
+# So the files are buffered per user and the turn fires only after the uploads go quiet. Saving and
+# acknowledging each file stays immediate — only the agent turn is deferred.
+DOC_BATCH_WAIT = 4.0            # seconds of silence that end a burst
+_doc_batches: dict[int, dict] = {}
+
+
+async def _flush_doc_batch(user_id: int, bot: Bot):
+    """Wait out the quiet period, then run ONE turn for everything that arrived."""
+    try:
+        await asyncio.sleep(DOC_BATCH_WAIT)
+    except asyncio.CancelledError:
+        return                                  # another file landed; a fresh timer took over
+    batch = _doc_batches.pop(user_id, None)
+    if not batch or not batch["files"]:
+        return
+    try:
+        await _run_doc_turn(user_id, batch, bot)
+    except Exception:
+        logger.exception("Document batch turn failed")
+        try:
+            await batch["message"].answer("❌ Ошибка при обработке файлов.")
+        except Exception:
+            pass
+
+
+async def _run_doc_turn(user_id: int, batch: dict, bot: Bot):
+    files: list[tuple[Path, str]] = batch["files"]
+    message = batch["message"]
+    caption = "\n".join(batch["captions"]).strip()
+
+    if len(files) == 1:
+        dest, orig = files[0]
+        head = (f"The user sent a file. It is saved at: {dest}\n"
+                f"Original name: {orig}\n\n")
+        no_caption = ("The user sent no instruction — read the file and say what it is and what you "
+                      "propose to do with it, then wait for confirmation.")
+    else:
+        listing = "\n".join(f"  {n}. {p}   (original name: {orig})"
+                            for n, (p, orig) in enumerate(files, 1))
+        head = (f"The user sent {len(files)} files in one go. They are saved at:\n{listing}\n\n"
+                "Treat them as ONE batch — this is a single turn covering all of them, so do the "
+                "work once over the whole set rather than per file.\n\n")
+        no_caption = ("The user sent no instruction — read them and say what they are and what you "
+                      "propose to do with them, then wait for confirmation.")
+
+    prompt = (
+        head
+        + "Read them, then act. If it is a spec/TZ, work through it; if it is a script, review "
+          "it and explain or run it only when that is clearly what was asked. Never execute an "
+          "attached script blindly.\n\n"
+        + (f"The user's instruction with the files:\n{caption}" if caption else no_caption)
+    )
+
+    provider = get_active_provider(user_id)
+    session_id = get_session_id(user_id, provider)
+    lang = detect_language(caption) if caption else detect_language(files[0][1] or "")
+
+    response, new_session_id, streamed_files = await run_provider_streaming(
+        provider, prompt, session_id, message, bot, lang=lang
+    )
+    update_session_id(user_id, provider, new_session_id, session_id)
+
+    response_no_files, file_paths = extract_file_blocks(response)
+    cleaned_response, voice_blocks = extract_voice_blocks(response_no_files)
+
+    if cleaned_response:
+        await send_long_message(message, markdown_to_telegram_html(cleaned_response))
+
+    for vb_lang, vb_text, vb_speed in voice_blocks:
+        await send_voice_with_indicator(message, bot, vb_text, vb_lang, user_id, speed=vb_speed)
+
+    await send_files(message, streamed_files + file_paths)
+
+
 @router.message(F.document)
 async def handle_document(message: Message, bot: Bot):
     """Accept a text/spec/script file, save it into the project's .inbox/ and hand the PATH to
@@ -2373,13 +2524,15 @@ async def handle_document(message: Message, bot: Bot):
     name = _safe_inbox_name(doc.file_name)
     suffix = Path(name).suffix.lower()
 
-    if suffix not in INBOX_ALLOWED_SUFFIXES:
-        allowed = " ".join(sorted(INBOX_ALLOWED_SUFFIXES))
+    if suffix not in INBOX_ALLOWED_SUFFIXES and suffix not in INBOX_DOC_SUFFIXES:
+        allowed = " ".join(sorted(INBOX_ALLOWED_SUFFIXES | INBOX_DOC_SUFFIXES))
         await message.answer(f"❌ Не принимаю файлы <code>{suffix or 'без расширения'}</code>.\n"
                              f"Можно: {allowed}")
         return
-    if (doc.file_size or 0) > INBOX_MAX_BYTES:
-        await message.answer(f"❌ Файл больше {INBOX_MAX_BYTES // 1024} КБ.")
+    cap = INBOX_DOC_MAX_BYTES if suffix in INBOX_DOC_SUFFIXES else INBOX_MAX_BYTES
+    if (doc.file_size or 0) > cap:
+        await message.answer(f"❌ Файл больше {cap // 1024 // 1024} МБ."
+                             if cap >= 1024 * 1024 else f"❌ Файл больше {cap // 1024} КБ.")
         return
 
     INBOX_DIR.mkdir(parents=True, exist_ok=True)
@@ -2397,37 +2550,19 @@ async def handle_document(message: Message, bot: Bot):
     logger.info(f"DOC uid={user_id} saved {dest} ({doc.file_size} bytes)")
     await message.answer(f"📎 Принял: <code>{dest}</code>")
 
-    caption = (message.caption or "").strip()
-    prompt = (
-        f"The user sent a file. It is saved at: {dest}\n"
-        f"Original name: {doc.file_name}\n\n"
-        "Read it, then act on it. If it is a spec/TZ, work through it; if it is a script, review "
-        "it and explain or run it only when that is clearly what was asked. Never execute an "
-        "attached script blindly.\n\n"
-        + (f"The user's instruction with the file:\n{caption}" if caption
-           else "The user sent no instruction — read the file and say what it is and what you "
-                "propose to do with it, then wait for confirmation.")
-    )
-
-    provider = get_active_provider(user_id)
-    session_id = get_session_id(user_id, provider)
-    lang = detect_language(caption) if caption else detect_language(doc.file_name or "")
-
-    response, new_session_id, streamed_files = await run_provider_streaming(
-        provider, prompt, session_id, message, bot, lang=lang
-    )
-    update_session_id(user_id, provider, new_session_id, session_id)
-
-    response_no_files, file_paths = extract_file_blocks(response)
-    cleaned_response, voice_blocks = extract_voice_blocks(response_no_files)
-
-    if cleaned_response:
-        await send_long_message(message, markdown_to_telegram_html(cleaned_response))
-
-    for vb_lang, vb_text, vb_speed in voice_blocks:
-        await send_voice_with_indicator(message, bot, vb_text, vb_lang, user_id, speed=vb_speed)
-
-    await send_files(message, streamed_files + file_paths)
+    # Join the current burst (or open one) and restart the quiet timer. The turn itself runs in
+    # _flush_doc_batch once the uploads stop — see the note above DOC_BATCH_WAIT.
+    batch = _doc_batches.get(user_id)
+    if batch is None:
+        batch = {"files": [], "captions": [], "message": message, "task": None}
+        _doc_batches[user_id] = batch
+    batch["files"].append((dest, doc.file_name or dest.name))
+    if (message.caption or "").strip():
+        batch["captions"].append(message.caption.strip())
+    batch["message"] = message                  # reply under the LAST file of the burst
+    if batch["task"] and not batch["task"].done():
+        batch["task"].cancel()
+    batch["task"] = asyncio.create_task(_flush_doc_batch(user_id, bot))
 
 
 @router.message(F.text & F.text.startswith("/"))
