@@ -13,7 +13,7 @@
   ],
   "commands": [
     {
-      "pattern": "tools/analytics2/run\\.py\\s+--from",
+      "pattern": "tools/analytics2/run\\.py\\s+--(day|from)\\b",
       "label": "аналитика: отчёт",
       "why": "прогон отчёта по перехватам идёт десятки минут"
     },

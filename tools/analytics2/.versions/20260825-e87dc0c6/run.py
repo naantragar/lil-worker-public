@@ -33,11 +33,6 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
-
-# Every time in this pipeline — the window arguments, the intercept headers, the report stamp — is
-# the analyst's local clock, which is Kyiv. Nothing here is ever server-local or UTC.
-KYIV = ZoneInfo("Europe/Kyiv")
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
@@ -50,11 +45,6 @@ OUT_DIR = REPO / "knowledge" / "upstream" / "reports_out"
 VERSIONS = HERE / ".versions"
 
 MARGIN_HOURS = 6          # how far past the window to look for late POSTINGS
-WINDOW_LEAD_IN_MIN = 30   # the window starts this much earlier than it is declared — see main()
-# "A report FOR the 20th" is the 24 hours ending at 15:00 on the 20th. The hour is the analyst's
-# reporting cut, not a preference, and the band has been the same on every run we have made.
-REPORT_HOUR = "15:00"
-DEFAULT_BAND = "ЗАЛІЗНИЧНЕ-ЗАГІРНЕ"
 MAX_CHUNK_CHARS = 16000   # estimated body; renders to ~19k, the size band with the best yield
 OVERLAP = 3               # intercepts repeated across a seam so a straddling event stays whole
 FREQ_TOL_KHZ = 5.0        # channel spacing is 12.5 kHz; closer than this is one channel
@@ -88,16 +78,9 @@ def fetch(dt_from: str, dt_to: str) -> list[dict]:
     lo = datetime.strptime(dt_from, "%Y-%m-%d %H:%M")
     hi = datetime.strptime(dt_to, "%Y-%m-%d %H:%M")
     q_lo, q_hi = lo - timedelta(hours=MARGIN_HOURS), hi + timedelta(hours=MARGIN_HOURS)
-    # The window is given in the analyst's own clock — Kyiv. The database stores UTC. The offset used
-    # to be hardcoded `+03`, which is right only from April to October: after the autumn change Kyiv
-    # is EET/+02 and every boundary would have been an hour out. Derived from the zone per timestamp
-    # instead, so the switch passes unnoticed.
-    def _pg(dt: datetime) -> str:
-        return dt.replace(tzinfo=KYIV).strftime("%Y-%m-%d %H:%M%z")
-
     sql = (f"SELECT id || E'\\x01' || replace(coalesce(text,''), E'\\n', E'\\x02') "
            f"FROM source_messages WHERE group_name='PATAGONIA_GP' "
-           f"AND occurred_ts >= '{_pg(q_lo)}' AND occurred_ts < '{_pg(q_hi)}' "
+           f"AND occurred_ts >= '{q_lo:%Y-%m-%d %H:%M}+03' AND occurred_ts < '{q_hi:%Y-%m-%d %H:%M}+03' "
            f"ORDER BY occurred_ts, id")
     raw = subprocess.run(["docker", "exec", "upstream_db", "psql", "-U", "upstream", "-d", "upstream",
                           "-At", "-c", sql], capture_output=True, text=True, timeout=300).stdout
@@ -488,76 +471,6 @@ def _freq_set(raw: str | None) -> list[float]:
     return out
 
 
-def assign_registers(freqs_of: dict[str, list[str]]) -> dict[str, tuple[list, list]]:
-    """Give every archive network to exactly ONE network of this report.
-
-    The first version asked each report network independently "which archive networks share a
-    frequency with me", and an archive network that matched three of them was printed under all
-    three. The result looked exactly like what it was: `СЕРБ, БАЗА, ГРОМ` and one identical legend
-    standing under `2 мсб 38 омсбр`, under `189 мсп (БАГАТЕ)` and under `189 мсп (НОВОСЕЛІВКА)` in
-    the same report. A register that names the same men on three different nets is worse than none.
-
-    So the assignment is made globally and is exclusive: each archive network goes to the report
-    network it overlaps most, measured first by how many of its frequencies match and then by what
-    share of that report network's own frequencies they cover — the more specific claim wins.
-    """
-    if not REPORTS_DB.exists():
-        return {}
-    try:
-        con = sqlite3.connect(f"file:{REPORTS_DB}?mode=ro", uri=True)
-        archive = [(nid, _freq_set(fr)) for nid, fr in con.execute("SELECT id, freqs FROM networks")]
-    except sqlite3.Error:
-        return {}
-
-    mine_of = {net: [float(x) for x in fr if _is_float(x)] for net, fr in freqs_of.items()}
-    owned: dict[str, list[int]] = defaultdict(list)
-    for nid, afs in archive:
-        best, best_score = None, (0, 0.0)
-        for net, mine in mine_of.items():
-            if not mine:
-                continue
-            hits = sum(1 for a in afs for b in mine if abs(a - b) * 1000 <= FREQ_TOL_KHZ)
-            if not hits:
-                continue
-            score = (hits, hits / len(mine))
-            if score > best_score:
-                best, best_score = net, score
-        if best:
-            owned[best].append(nid)
-
-    out: dict[str, tuple[list, list]] = {}
-    for net, ids in owned.items():
-        out[net] = _pull_register(con, ids)
-    return out
-
-
-def _pull_register(con, ids: list[int]) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
-    marks = ",".join("?" * len(ids))
-
-    def pull(sql: str) -> list[tuple[str, str]]:
-        # Deduped case-insensitively but printed as written: callsigns are uppercase, code words are
-        # not (`«платье»`), so upper-casing the key would mangle half the legend.
-        seen: dict[str, tuple[str, str]] = {}
-        for key, val in con.execute(sql.format(marks=marks), ids):
-            k = str(key or "").strip()
-            # A wrapped source line sometimes leaves the description opening on punctuation
-            # (`- , «прилетит в ворота» – …`); that is the seam, not content.
-            v = " ".join(str(val or "").split()).lstrip(",-–— ").strip()
-            if not k or not v:
-                # A name with no role and a code with no reading tell the reader nothing. They stay
-                # in the database; they do not belong in a report that is meant to be scanned.
-                continue
-            if k.lower() not in seen or len(v) > len(seen[k.lower()][1]):
-                seen[k.lower()] = (k, v)
-        return list(seen.values())
-
-    roster = pull("SELECT callsign, role FROM roster WHERE network_id IN ({marks}) ORDER BY id")
-    legend = pull("SELECT code, meaning FROM legend WHERE network_id IN ({marks}) ORDER BY id")
-    known = known_codes()
-    legend = [(c, m) for c, m in legend if not (_variants(c) & known)]
-    return roster, legend
-
-
 def register_for(freqs: list[str]) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     """The callsign register and the code legend this network is already known to work with.
 
@@ -752,7 +665,6 @@ def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
     styled += [(f"на {dt_to[11:16]} {datetime.strptime(dt_to, '%Y-%m-%d %H:%M'):%d.%m.%Y}",
                 False, True), ("", False, False)]
 
-    registers = assign_registers(freqs_of)
     for i, net in enumerate(sorted(by_net, key=lambda n: -len(by_net[n]))):
         evs = sorted(by_net[net], key=lambda e: stamp(e.get("time")) or 0)
         if i:
@@ -763,7 +675,7 @@ def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
         styled.append((net, True, False))
 
         # The register goes between the header and the events, exactly where the analyst keeps it.
-        roster, legend = registers.get(net, ([], []))
+        roster, legend = register_for(fr)
         if active:
             names, blob = heard_on(active, fr)
             if names or blob:        # fail open: an empty lookup must not blank the register
@@ -816,16 +728,10 @@ def snapshot() -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    # `--day 2026-08-20` IS the normal way to call this. "Звіт на 20 серпня" means one fixed thing —
-    # 19.08 15:00 → 20.08 15:00 — and computing that by hand every time is an invitation to get the
-    # window, the stamp or the filename out of step with each other. Given the day, all three are
-    # derived from one number and cannot disagree.
-    ap.add_argument("--day", help="report day, YYYY-MM-DD or DD.MM.YYYY: window is the 24 h ending "
-                                  "at 15:00 of that day")
-    ap.add_argument("--from", dest="dt_from")
-    ap.add_argument("--to", dest="dt_to")
-    ap.add_argument("--band", default=DEFAULT_BAND)
-    ap.add_argument("--out")
+    ap.add_argument("--from", dest="dt_from", required=True)
+    ap.add_argument("--to", dest="dt_to", required=True)
+    ap.add_argument("--band", default="")
+    ap.add_argument("--out", required=True)
     ap.add_argument("--model", default="claude-sonnet-5")
     ap.add_argument("--effort", default="medium")
     # One pass is the standard. Multi-pass union was inherited from v1, where a single call read a
@@ -844,41 +750,10 @@ def main() -> None:
     # events instead: same facts, new presentation.
     ap.add_argument("--render-only", action="store_true",
                     help="rebuild the files from an existing <out>_events.json, no model calls")
-    # The collector lags 25-30 minutes behind the group, so the last half hour of a window closing at
-    # 15:00 has usually not arrived when the report is made. The answer is not a gate that asks
-    # whether to proceed — it is to start the window half an hour EARLIER than it says. What the
-    # previous report missed off its end, this one picks up off its start. Nothing is lost, the price
-    # is that consecutive reports can repeat an event from that overlap, and that is the cheaper
-    # error. One constant, applied always, nothing to remember and nothing to decide.
-    ap.add_argument("--lead-in", type=int, default=WINDOW_LEAD_IN_MIN,
-                    help="minutes to extend the START of the window by (0 disables)")
     a = ap.parse_args()
 
-    if a.day:
-        for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m"):
-            try:
-                d = datetime.strptime(a.day, fmt)
-                if fmt == "%d.%m":
-                    d = d.replace(year=datetime.now().year)
-                break
-            except ValueError:
-                d = None
-        if d is None:
-            sys.exit(f"не розібрав дату: {a.day!r} (треба YYYY-MM-DD або DD.MM.YYYY)")
-        a.dt_to = f"{d:%Y-%m-%d} {REPORT_HOUR}"
-        a.dt_from = f"{d - timedelta(days=1):%Y-%m-%d} {REPORT_HOUR}"
-        a.out = a.out or f"ZVIT_{d:%d.%m}"
-    elif not (a.dt_from and a.dt_to and a.out):
-        sys.exit("треба або --day, або всі три: --from --to --out")
-
-    print(f"звіт на {a.dt_to}   вікно {a.dt_from} - {a.dt_to}   файл {a.out}", file=sys.stderr)
     print(f"версія правил: {snapshot()}", file=sys.stderr)
-    lo = datetime.strptime(a.dt_from, "%Y-%m-%d %H:%M") - timedelta(minutes=a.lead_in)
-    read_from = f"{lo:%Y-%m-%d %H:%M}"
-    if a.lead_in:
-        print(f"вікно {a.dt_from} - {a.dt_to}, читаємо з {read_from} "
-              f"(перекриття {a.lead_in} хв на затримку колектора)", file=sys.stderr)
-    recs = fetch(read_from, a.dt_to)
+    recs = fetch(a.dt_from, a.dt_to)
     units = units_of_work(recs)
     nets = {u["net"] for u in units}
     print(f"перехватів: {len(recs)}   мереж: {len(nets)}   одиниць роботи: {len(units)}",
@@ -896,16 +771,8 @@ def main() -> None:
         if not src.exists():
             sys.exit(f"немає {src} — нічого перемальовувати")
         events = json.loads(src.read_text())
-        age_h = (time.time() - src.stat().st_mtime) / 3600
         print(f"перемальовування з {src.name}: {len(events)} подій, модель не викликається",
               file=sys.stderr)
-        # The events are frozen at the moment of the original run; the register, the silent list and
-        # the "no events" list are recomputed against the database as it is NOW. Half an hour of drift
-        # is nothing. A day of it would put the header and the silence on one date and the events on
-        # another, and nothing in the output would say so.
-        if age_h > 6:
-            print(f"УВАГА: події зібрані {age_h:.0f} год тому, а решта рахується по свіжій базі — "
-                  f"для чогось старішого за пів дня краще повний прогон", file=sys.stderr)
         finish(a, recs, units, events, freqs_of)
         return
 

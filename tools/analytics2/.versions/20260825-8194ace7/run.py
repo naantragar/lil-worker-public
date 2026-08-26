@@ -33,11 +33,6 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
-
-# Every time in this pipeline — the window arguments, the intercept headers, the report stamp — is
-# the analyst's local clock, which is Kyiv. Nothing here is ever server-local or UTC.
-KYIV = ZoneInfo("Europe/Kyiv")
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
@@ -50,11 +45,6 @@ OUT_DIR = REPO / "knowledge" / "upstream" / "reports_out"
 VERSIONS = HERE / ".versions"
 
 MARGIN_HOURS = 6          # how far past the window to look for late POSTINGS
-WINDOW_LEAD_IN_MIN = 30   # the window starts this much earlier than it is declared — see main()
-# "A report FOR the 20th" is the 24 hours ending at 15:00 on the 20th. The hour is the analyst's
-# reporting cut, not a preference, and the band has been the same on every run we have made.
-REPORT_HOUR = "15:00"
-DEFAULT_BAND = "ЗАЛІЗНИЧНЕ-ЗАГІРНЕ"
 MAX_CHUNK_CHARS = 16000   # estimated body; renders to ~19k, the size band with the best yield
 OVERLAP = 3               # intercepts repeated across a seam so a straddling event stays whole
 FREQ_TOL_KHZ = 5.0        # channel spacing is 12.5 kHz; closer than this is one channel
@@ -88,16 +78,9 @@ def fetch(dt_from: str, dt_to: str) -> list[dict]:
     lo = datetime.strptime(dt_from, "%Y-%m-%d %H:%M")
     hi = datetime.strptime(dt_to, "%Y-%m-%d %H:%M")
     q_lo, q_hi = lo - timedelta(hours=MARGIN_HOURS), hi + timedelta(hours=MARGIN_HOURS)
-    # The window is given in the analyst's own clock — Kyiv. The database stores UTC. The offset used
-    # to be hardcoded `+03`, which is right only from April to October: after the autumn change Kyiv
-    # is EET/+02 and every boundary would have been an hour out. Derived from the zone per timestamp
-    # instead, so the switch passes unnoticed.
-    def _pg(dt: datetime) -> str:
-        return dt.replace(tzinfo=KYIV).strftime("%Y-%m-%d %H:%M%z")
-
     sql = (f"SELECT id || E'\\x01' || replace(coalesce(text,''), E'\\n', E'\\x02') "
            f"FROM source_messages WHERE group_name='PATAGONIA_GP' "
-           f"AND occurred_ts >= '{_pg(q_lo)}' AND occurred_ts < '{_pg(q_hi)}' "
+           f"AND occurred_ts >= '{q_lo:%Y-%m-%d %H:%M}+03' AND occurred_ts < '{q_hi:%Y-%m-%d %H:%M}+03' "
            f"ORDER BY occurred_ts, id")
     raw = subprocess.run(["docker", "exec", "upstream_db", "psql", "-U", "upstream", "-d", "upstream",
                           "-At", "-c", sql], capture_output=True, text=True, timeout=300).stdout
@@ -368,74 +351,6 @@ REPORTS_DB = REPO / "knowledge" / "upstream" / "reports.db"
 KNOWN_CODES = REPO / "knowledge" / "upstream" / "known_codes.md"
 
 
-ROSTER_ACTIVE_DAYS = 3        # a callsign unheard for longer than this is not worth reminding of
-
-
-def activity_index(dt_to: str) -> dict[str, dict]:
-    """Who has actually been on the air lately, per frequency.
-
-    The register printed under a network header is the analyst's accumulated list, and it accumulates
-    forever: one network was printing 40 callsigns above 10 event lines. Most of them had not been
-    heard in weeks — a man who has gone silent for that long has changed callsign, moved, or is dead,
-    and reminding the reader of him costs more than it gives.
-
-    The window ends at the report's own `--to`, so a callsign that surfaced again TODAY is back in
-    immediately and stays for the next `ROSTER_ACTIVE_DAYS`.
-
-    This is pure rendering — it runs after the model is finished and cannot affect what was
-    extracted. The worst it can do is print too few names, so it fails OPEN: if the lookup comes back
-    empty (a bad query, a DB hiccup), the register is printed in full rather than blanked.
-    """
-    hi = datetime.strptime(dt_to, "%Y-%m-%d %H:%M")
-    recs = fetch(f"{hi - timedelta(days=ROSTER_ACTIVE_DAYS):%Y-%m-%d %H:%M}", dt_to)
-    out: dict[str, dict] = defaultdict(lambda: {"names": set(), "speech": []})
-    for r in recs:
-        f = r.get("freq")
-        if not _is_float(f):
-            continue
-        e = out[f]
-        for raw in r.get("stations", []):
-            for part in re.split(r"[,/]| та ", raw or ""):
-                p = part.strip().strip(".").upper()
-                if len(p) > 2:
-                    e["names"].add(p)
-        e["speech"].extend(r.get("speech", []))
-    return out
-
-
-def heard_on(index: dict[str, dict], freqs: list[str]) -> tuple[set[str], str]:
-    """Everything heard on this network's channels inside the activity window."""
-    names: set[str] = set()
-    speech: list[str] = []
-    mine = [float(x) for x in freqs if _is_float(x)]
-    for f, e in index.items():
-        if any(abs(float(f) - x) * 1000 <= FREQ_TOL_KHZ for x in mine):
-            names |= e["names"]
-            speech.extend(e["speech"])
-    return names, "\n".join(speech).lower()
-
-
-def still_active(name: str, names: set[str], blob: str) -> bool:
-    """A callsign counts as active if it keyed the mic OR was talked about.
-
-    Mentions count deliberately: a commander is discussed far more often than he transmits, and
-    dropping him because he does not press the button would be the wrong error. Matching is a prefix
-    match on the stem, so `Катану` and `Катаны` both hit — and a callsign that is also an ordinary
-    word (ЗЕМЛЯ, БЕЛЫЙ, КОРОЛЬ) will match loosely and be KEPT. That bias is on purpose: printing a
-    name too long is a small cost, dropping a live one is not.
-    """
-    key = name.strip().upper()
-    if key in names:
-        return True
-    for v in re.split(r"[,/]", key):
-        v = v.strip()
-        if len(v) < 3:
-            return True             # too short to match safely — never drop on this evidence
-        if re.search(rf"\b{re.escape(v.lower())}", blob):
-            return True
-    return False
-
-
 def _variants(word: str) -> set[str]:
     """A code and its spoken forms. `«глаза, глазки»` is ONE entry holding two."""
     return {v.strip().strip("«»\"'").lower()
@@ -486,76 +401,6 @@ def _freq_set(raw: str | None) -> list[float]:
         except ValueError:
             pass
     return out
-
-
-def assign_registers(freqs_of: dict[str, list[str]]) -> dict[str, tuple[list, list]]:
-    """Give every archive network to exactly ONE network of this report.
-
-    The first version asked each report network independently "which archive networks share a
-    frequency with me", and an archive network that matched three of them was printed under all
-    three. The result looked exactly like what it was: `СЕРБ, БАЗА, ГРОМ` and one identical legend
-    standing under `2 мсб 38 омсбр`, under `189 мсп (БАГАТЕ)` and under `189 мсп (НОВОСЕЛІВКА)` in
-    the same report. A register that names the same men on three different nets is worse than none.
-
-    So the assignment is made globally and is exclusive: each archive network goes to the report
-    network it overlaps most, measured first by how many of its frequencies match and then by what
-    share of that report network's own frequencies they cover — the more specific claim wins.
-    """
-    if not REPORTS_DB.exists():
-        return {}
-    try:
-        con = sqlite3.connect(f"file:{REPORTS_DB}?mode=ro", uri=True)
-        archive = [(nid, _freq_set(fr)) for nid, fr in con.execute("SELECT id, freqs FROM networks")]
-    except sqlite3.Error:
-        return {}
-
-    mine_of = {net: [float(x) for x in fr if _is_float(x)] for net, fr in freqs_of.items()}
-    owned: dict[str, list[int]] = defaultdict(list)
-    for nid, afs in archive:
-        best, best_score = None, (0, 0.0)
-        for net, mine in mine_of.items():
-            if not mine:
-                continue
-            hits = sum(1 for a in afs for b in mine if abs(a - b) * 1000 <= FREQ_TOL_KHZ)
-            if not hits:
-                continue
-            score = (hits, hits / len(mine))
-            if score > best_score:
-                best, best_score = net, score
-        if best:
-            owned[best].append(nid)
-
-    out: dict[str, tuple[list, list]] = {}
-    for net, ids in owned.items():
-        out[net] = _pull_register(con, ids)
-    return out
-
-
-def _pull_register(con, ids: list[int]) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
-    marks = ",".join("?" * len(ids))
-
-    def pull(sql: str) -> list[tuple[str, str]]:
-        # Deduped case-insensitively but printed as written: callsigns are uppercase, code words are
-        # not (`«платье»`), so upper-casing the key would mangle half the legend.
-        seen: dict[str, tuple[str, str]] = {}
-        for key, val in con.execute(sql.format(marks=marks), ids):
-            k = str(key or "").strip()
-            # A wrapped source line sometimes leaves the description opening on punctuation
-            # (`- , «прилетит в ворота» – …`); that is the seam, not content.
-            v = " ".join(str(val or "").split()).lstrip(",-–— ").strip()
-            if not k or not v:
-                # A name with no role and a code with no reading tell the reader nothing. They stay
-                # in the database; they do not belong in a report that is meant to be scanned.
-                continue
-            if k.lower() not in seen or len(v) > len(seen[k.lower()][1]):
-                seen[k.lower()] = (k, v)
-        return list(seen.values())
-
-    roster = pull("SELECT callsign, role FROM roster WHERE network_id IN ({marks}) ORDER BY id")
-    legend = pull("SELECT code, meaning FROM legend WHERE network_id IN ({marks}) ORDER BY id")
-    known = known_codes()
-    legend = [(c, m) for c, m in legend if not (_variants(c) & known)]
-    return roster, legend
 
 
 def register_for(freqs: list[str]) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
@@ -665,60 +510,24 @@ def silent_networks(recs: list[dict], dt_from: str) -> list[tuple[str, int, date
     return out
 
 
-def unattended_networks(units: list[dict], events: list[dict]) -> list[tuple]:
-    """Networks that DID talk in the window and produced no report line at all.
-
-    The other half of the same question, and the half that actually needs watching. A silent channel
-    is usually just a channel that moved. A channel with a day of traffic and nothing selected is
-    either genuinely idle chatter — or our rules looking straight past something, and there is no
-    way to notice that from the report itself, because absence leaves no trace in it.
-    """
-    have = {e.get("_net") for e in events}
-    by_net: dict[str, list[dict]] = defaultdict(list)
-    for u in units:
-        by_net[u["net"]].extend(u["items"])
-    rows = []
-    for net, items in by_net.items():
-        if net in have:
-            continue
-        items.sort(key=lambda r: r["_dt"])
-        freqs = sorted({r["freq"] for r in items if r.get("freq")})
-        chars = sum(len(s) for r in items for s in r.get("speech", []))
-        rows.append((net, len(items), chars, items[0]["_dt"], items[-1]["_dt"], freqs))
-    # Ordered by VOLUME OF SPEECH, not by number of intercepts: how much was said and passed over is
-    # the thing worth checking. One intercept carrying 1386 characters outranks six carrying 587.
-    rows.sort(key=lambda t: -t[2])
-    return rows
-
-
-def build_quiet_file(silent: list[tuple[str, int, datetime, str]], unattended: list[tuple],
-                     dt_from: str, dt_to: str) -> str:
+def build_silent(rows: list[tuple[str, int, datetime, str]], dt_from: str, dt_to: str) -> str:
     """A SEPARATE file, deliberately not part of the report (owner, 2026-08-25).
 
-    It answers a different question from the report — not what happened, but where nothing did. Two
-    sections, because there are two ways for a network to produce nothing and they mean opposite
-    things: one has gone off the air, the other is on the air and we wrote nothing about it.
-
-    Both live in ONE file on purpose: otherwise the second half only ever gets looked at when
-    somebody remembers to ask for it, and that is exactly what happened for four reports running.
+    It answers a different question. The report says what happened; this says where nothing did,
+    which is a lead to follow rather than a line to hand upward — and a channel usually falls silent
+    because it changed frequency, not because the unit did anything.
     """
-    out = [f"Мовчазні та без уваги - вікно звіту {dt_from} - {dt_to}", "",
-           f"=== 1. ЗАМОВКЛИ (працювали попередні {SILENT_LOOKBACK_DAYS} діб, "
-           f"мінімум {SILENT_MIN_PRIOR} перехоплень, у вікні - жодного)", ""]
-    if not silent:
+    out = [f"Мережі, що замовкли",
+           f"вікно звіту: {dt_from} - {dt_to}",
+           f"працювали протягом попередніх {SILENT_LOOKBACK_DAYS} діб "
+           f"(мінімум {SILENT_MIN_PRIOR} перехоплень), у вікні звіту - жодного перехоплення",
+           ""]
+    if not rows:
         out.append("(немає)")
-    for f, n, last, head in silent:
+    for f, n, last, head in rows:
         out.append(f"{f} - {head}")
         out.append(f"    перехоплень за {SILENT_LOOKBACK_DAYS} діб: {n}, "
                    f"останній {last:%d.%m.%Y %H:%M}")
-
-    out += ["", "", "=== 2. ПРАЦЮВАЛИ, АЛЕ ЖОДНОЇ ПОДІЇ У ЗВІТІ", ""]
-    if not unattended:
-        out.append("(немає)")
-    for net, n, chars, first, last, freqs in unattended:
-        out.append(f"{'/'.join(freqs) if freqs else '(без частоти)'} - {net}")
-        out.append(f"    перехоплень: {n}, мовлення: {chars} симв., "
-                   f"{first:%d.%m %H:%M} - {last:%d.%m %H:%M}")
     return "\n".join(out) + "\n"
 
 
@@ -734,7 +543,7 @@ def build_tail() -> list[tuple[str, bool, bool]]:
 
 
 def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
-                 dt_to: str, active: dict[str, dict] | None = None) -> str:
+                 dt_to: str) -> str:
     """Group by network, then by callsign — the analyst's own layout.
 
     Several events about one man are kept together even when other people's events fall between them
@@ -752,7 +561,6 @@ def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
     styled += [(f"на {dt_to[11:16]} {datetime.strptime(dt_to, '%Y-%m-%d %H:%M'):%d.%m.%Y}",
                 False, True), ("", False, False)]
 
-    registers = assign_registers(freqs_of)
     for i, net in enumerate(sorted(by_net, key=lambda n: -len(by_net[n]))):
         evs = sorted(by_net[net], key=lambda e: stamp(e.get("time")) or 0)
         if i:
@@ -763,18 +571,7 @@ def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
         styled.append((net, True, False))
 
         # The register goes between the header and the events, exactly where the analyst keeps it.
-        roster, legend = registers.get(net, ([], []))
-        if active:
-            names, blob = heard_on(active, fr)
-            if names or blob:        # fail open: an empty lookup must not blank the register
-                kept, dropped = [], []
-                for cs, role in roster:
-                    (kept if still_active(cs, names, blob) else dropped).append((cs, role))
-                if dropped:
-                    print(f"реєстр {net[:34]}: {len(roster)} -> {len(kept)} "
-                          f"(за {ROSTER_ACTIVE_DAYS} діб не чути: "
-                          f"{', '.join(c for c, _ in dropped)[:90]})", file=sys.stderr)
-                roster = kept
+        roster, legend = register_for(fr)
         for cs, role in roster:
             styled.append((f"{cs} - {role}" if role else cs, False, False))
         for code, meaning in legend:
@@ -816,16 +613,10 @@ def snapshot() -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    # `--day 2026-08-20` IS the normal way to call this. "Звіт на 20 серпня" means one fixed thing —
-    # 19.08 15:00 → 20.08 15:00 — and computing that by hand every time is an invitation to get the
-    # window, the stamp or the filename out of step with each other. Given the day, all three are
-    # derived from one number and cannot disagree.
-    ap.add_argument("--day", help="report day, YYYY-MM-DD or DD.MM.YYYY: window is the 24 h ending "
-                                  "at 15:00 of that day")
-    ap.add_argument("--from", dest="dt_from")
-    ap.add_argument("--to", dest="dt_to")
-    ap.add_argument("--band", default=DEFAULT_BAND)
-    ap.add_argument("--out")
+    ap.add_argument("--from", dest="dt_from", required=True)
+    ap.add_argument("--to", dest="dt_to", required=True)
+    ap.add_argument("--band", default="")
+    ap.add_argument("--out", required=True)
     ap.add_argument("--model", default="claude-sonnet-5")
     ap.add_argument("--effort", default="medium")
     # One pass is the standard. Multi-pass union was inherited from v1, where a single call read a
@@ -837,48 +628,10 @@ def main() -> None:
     # again, but do not pay for it by default.
     ap.add_argument("--passes", type=int, default=1)
     ap.add_argument("--jobs", type=int, default=6)
-    # Everything downstream of the model — the register, the activity filter, the layout, the docx —
-    # is pure rendering over `<out>_events.json`. A change there should not cost another 40 minutes
-    # of model time, and re-running would also silently produce DIFFERENT events (the model is not
-    # deterministic), which makes a rendering change impossible to judge. This replays the saved
-    # events instead: same facts, new presentation.
-    ap.add_argument("--render-only", action="store_true",
-                    help="rebuild the files from an existing <out>_events.json, no model calls")
-    # The collector lags 25-30 minutes behind the group, so the last half hour of a window closing at
-    # 15:00 has usually not arrived when the report is made. The answer is not a gate that asks
-    # whether to proceed — it is to start the window half an hour EARLIER than it says. What the
-    # previous report missed off its end, this one picks up off its start. Nothing is lost, the price
-    # is that consecutive reports can repeat an event from that overlap, and that is the cheaper
-    # error. One constant, applied always, nothing to remember and nothing to decide.
-    ap.add_argument("--lead-in", type=int, default=WINDOW_LEAD_IN_MIN,
-                    help="minutes to extend the START of the window by (0 disables)")
     a = ap.parse_args()
 
-    if a.day:
-        for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m"):
-            try:
-                d = datetime.strptime(a.day, fmt)
-                if fmt == "%d.%m":
-                    d = d.replace(year=datetime.now().year)
-                break
-            except ValueError:
-                d = None
-        if d is None:
-            sys.exit(f"не розібрав дату: {a.day!r} (треба YYYY-MM-DD або DD.MM.YYYY)")
-        a.dt_to = f"{d:%Y-%m-%d} {REPORT_HOUR}"
-        a.dt_from = f"{d - timedelta(days=1):%Y-%m-%d} {REPORT_HOUR}"
-        a.out = a.out or f"ZVIT_{d:%d.%m}"
-    elif not (a.dt_from and a.dt_to and a.out):
-        sys.exit("треба або --day, або всі три: --from --to --out")
-
-    print(f"звіт на {a.dt_to}   вікно {a.dt_from} - {a.dt_to}   файл {a.out}", file=sys.stderr)
     print(f"версія правил: {snapshot()}", file=sys.stderr)
-    lo = datetime.strptime(a.dt_from, "%Y-%m-%d %H:%M") - timedelta(minutes=a.lead_in)
-    read_from = f"{lo:%Y-%m-%d %H:%M}"
-    if a.lead_in:
-        print(f"вікно {a.dt_from} - {a.dt_to}, читаємо з {read_from} "
-              f"(перекриття {a.lead_in} хв на затримку колектора)", file=sys.stderr)
-    recs = fetch(read_from, a.dt_to)
+    recs = fetch(a.dt_from, a.dt_to)
     units = units_of_work(recs)
     nets = {u["net"] for u in units}
     print(f"перехватів: {len(recs)}   мереж: {len(nets)}   одиниць роботи: {len(units)}",
@@ -890,24 +643,6 @@ def main() -> None:
             if r.get("freq"):
                 freqs_of[u["net"]].add(r["freq"])
     freqs_of = {k: sorted(v) for k, v in freqs_of.items()}
-
-    if a.render_only:
-        src = OUT_DIR / f"{a.out}_events.json"
-        if not src.exists():
-            sys.exit(f"немає {src} — нічого перемальовувати")
-        events = json.loads(src.read_text())
-        age_h = (time.time() - src.stat().st_mtime) / 3600
-        print(f"перемальовування з {src.name}: {len(events)} подій, модель не викликається",
-              file=sys.stderr)
-        # The events are frozen at the moment of the original run; the register, the silent list and
-        # the "no events" list are recomputed against the database as it is NOW. Half an hour of drift
-        # is nothing. A day of it would put the header and the silence on one date and the events on
-        # another, and nothing in the output would say so.
-        if age_h > 6:
-            print(f"УВАГА: події зібрані {age_h:.0f} год тому, а решта рахується по свіжій базі — "
-                  f"для чогось старішого за пів дня краще повний прогон", file=sys.stderr)
-        finish(a, recs, units, events, freqs_of)
-        return
 
     rules = RULES.read_text() + "\n\n---\n\n# Глосарій\n\n" + GLOSSARY.read_text()
 
@@ -946,18 +681,7 @@ def main() -> None:
         print(f"проходи: {' + '.join(str(len(x)) for x in per_pass)} → {len(events)} унікальних "
               f"(>1 проходом: {multi}, лише одним: {len(events)-multi})", file=sys.stderr)
 
-    finish(a, recs, units, events, freqs_of, spent)
-
-
-def finish(a, recs: list[dict], units: list[dict], events: list[dict],
-           freqs_of: dict[str, list[str]], spent: float = 0.0) -> None:
-    """Everything after the model: register, activity filter, layout, the three files.
-
-    Split out so `--render-only` can reach exactly this and nothing else — the guarantee that a
-    presentation change cannot touch the facts is worth more as one shared code path than as a
-    promise.
-    """
-    styled = build_report(events, freqs_of, a.band, a.dt_to, activity_index(a.dt_to))
+    styled = build_report(events, freqs_of, a.band, a.dt_to)
     while styled and not styled[-1][0].strip():     # exactly five blanks, not five plus the ones
         styled.pop()                                # build_report leaves after the last block
     styled += build_tail()
@@ -967,10 +691,8 @@ def finish(a, recs: list[dict], units: list[dict], events: list[dict],
     out.write_text("\n".join(t for t, _, _ in styled))
 
     quiet = silent_networks(recs, a.dt_from)
-    idle = unattended_networks(units, events)
-    (OUT_DIR / f"{a.out}_silent.txt").write_text(
-        build_quiet_file(quiet, idle, a.dt_from, a.dt_to))
-    print(f"замовкли: {len(quiet)}   працювали без жодної події: {len(idle)}", file=sys.stderr)
+    (OUT_DIR / f"{a.out}_silent.txt").write_text(build_silent(quiet, a.dt_from, a.dt_to))
+    print(f"мереж, що замовкли: {len(quiet)}", file=sys.stderr)
     (OUT_DIR / f"{a.out}_events.json").write_text(json.dumps(events, ensure_ascii=False, indent=2))
     docx = out.with_suffix(".docx")
     try:

@@ -47,11 +47,67 @@ RE_EV_TIME = re.compile(r"^\s*(\d{1,2}:\d{2})\s+(.*)$")
 _KEY = r"[А-ЯЁЇІЄҐA-Z0-9][А-ЯЁЇІЄҐA-Z0-9«»\"'’\s,/\.\-]{0,38}?"
 RE_ROSTER = re.compile(rf"^\s*({_KEY})\s*[–—-]\s*(.+)$")
 RE_BARE = re.compile(r"^\s*([А-ЯЁЇІЄҐA-Z][А-ЯЁЇІЄҐA-Z'’\-/ ]{1,38})\s*$")
+# `АВГУСТ мол ком склад, проміжний накопичувач.` — a register entry whose dash the analyst simply
+# forgot. Without this it was swallowed as a continuation of the line above, and BAZA came out
+# carrying three other people's roles. The uppercase head followed directly by a lowercase word is
+# the same case boundary the dashed form relies on, so it is recognised the same way.
+RE_NODASH = re.compile(r"^\s*([А-ЯЁЇІЄҐA-Z][А-ЯЁЇІЄҐA-Z0-9'’\-/]{1,24})\s+([а-яёїієґ].{2,})$")
 RE_LEGEND = re.compile(r"^\s*[«\"']([^»\"']{1,40})[»\"']\s*[–—-]?\s*(.*)$")
 # Some sections quote the raw exchange under the header. A dash opening the line is a speaker turn,
 # never a register entry — and without this the whole dialogue was glued into the role of the last
 # callsign above it.
 RE_SPEECH = re.compile(r"^\s*[—–-]\s")
+
+# In the .docx two register lines sometimes share one paragraph and come out of the extractor with no
+# separator at all: `ГРАНИТ – ком складМОНТАНА – ком склад (…)`, `…прийнято«88» – стан справ ?`. The
+# join is recognisable because a lowercase letter runs straight into a NEW key that is itself
+# followed by a dash. Requiring that following dash is what keeps ordinary roles intact — `ком склад
+# підрозділу ДОН. Ком для ЧАКИ` and `звітує для МАРТ про стан` have capitals in them too, but no
+# dash behind them.
+RE_GLUED = re.compile(r"(?<=[а-яёїієґ])(?=(?:[А-ЯЁЇІЄҐA-Z]{3,}|«[^»]{1,20}»)\s*[–—-]\s)")
+
+# `«54», «55» – стан справ` — one reading, several codes. Parsed as a single entry it made `54` mean
+# the literal string `«55» – стан справ`.
+RE_LEGEND_MULTI = re.compile(r"^\s*((?:[«\"'][^»\"']{1,40}[»\"']\s*,\s*)+[«\"'][^»\"']{1,40}[»\"'])"
+                             r"\s*[–—-]\s*(.+)$")
+
+
+def split_glued(line: str) -> list[str]:
+    """One physical line that holds two register entries -> the two entries."""
+    return [p.strip() for p in RE_GLUED.split(line) if p.strip()]
+
+
+# `НВ` is not a callsign, it is the analyst writing "not established". It was being registered as a
+# man and printed under three networks.
+STOP_CALLSIGN = {"НВ", "НВ.", "Н\\В", "НВ ", "ОК"}
+
+
+def register_line(net: dict, line: str) -> str | None:
+    """Read ONE register line into the network. Returns what kind it was, or None."""
+    m = RE_LEGEND_MULTI.match(line)
+    if m:                       # `«54», «55» – стан справ` — one reading shared by several codes
+        for code in re.findall(r"[«\"']([^»\"']{1,40})[»\"']", m.group(1)):
+            net["legend"].append({"code": code.strip(), "meaning": m.group(2).strip(),
+                                  "source_line": line})
+        return "legend"
+    m = RE_LEGEND.match(line)
+    if m:
+        net["legend"].append({"code": m.group(1).strip(), "meaning": m.group(2).strip(),
+                              "source_line": line})
+        return "legend"
+    m = RE_ROSTER.match(line) or RE_NODASH.match(line)
+    if m and m.group(1).strip():
+        if m.group(1).strip().upper() in STOP_CALLSIGN:
+            return None
+        net["roster"].append({"callsign": m.group(1).strip(), "role": m.group(2).strip()})
+        return "roster"
+    m = RE_BARE.match(line)
+    if m:                       # `ЛЕВША`, `ЗАЗА` — heard on the net, no role established
+        if m.group(1).strip().upper() in STOP_CALLSIGN:
+            return None
+        net["roster"].append({"callsign": m.group(1).strip(), "role": ""})
+        return "roster"
+    return None
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS reports (
@@ -138,21 +194,10 @@ def parse(path: Path) -> dict:
             if RE_SPEECH.match(line):
                 seen_event, last_kind = True, None    # the register zone is over
                 continue
-            m = RE_LEGEND.match(line)
-            if m:
-                net["legend"].append({"code": m.group(1).strip(),
-                                      "meaning": m.group(2).strip(), "source_line": line})
-                last_kind = "legend"
-                continue
-            m = RE_ROSTER.match(line)
-            if m and m.group(1).strip():
-                net["roster"].append({"callsign": m.group(1).strip(), "role": m.group(2).strip()})
-                last_kind = "roster"
-                continue
-            m = RE_BARE.match(line)
-            if m:                       # `ЛЕВША`, `ЗАЗА` — heard on the net, no role established
-                net["roster"].append({"callsign": m.group(1).strip(), "role": ""})
-                last_kind = "roster"
+            kinds = [register_line(net, p) for p in split_glued(line)]
+            kinds = [k for k in kinds if k]
+            if kinds:
+                last_kind = kinds[-1]
                 continue
 
         # anything else after the first event is a wrapped continuation of it
@@ -160,7 +205,10 @@ def parse(path: Path) -> dict:
             net["events"][-1]["text"] += " " + line
         elif last_kind == "legend" and net["legend"]:
             net["legend"][-1]["meaning"] += " " + line
-        elif last_kind == "roster" and net["roster"]:
+        elif last_kind == "roster" and net["roster"] and re.search(r"[а-яёїієґa-z]", line):
+            # A wrapped role always carries lowercase words. A line of nothing but capitals —
+            # `СЕРБ, СЕДОЙ, МАЛОЙ` — is the station list of a quoted exchange, and appending it made
+            # MARK's "role" a list of three other men.
             net["roster"][-1]["role"] += " " + line
 
     return report

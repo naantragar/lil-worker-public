@@ -82,11 +82,57 @@ def build(content, title: str | None = None) -> bytes:
     return doc.encode()
 
 
+# Every zip entry carries a timestamp and a "made on which OS" byte, and `writestr` with a plain
+# string name fills both from the machine: our files were shipping (2026, 8, 25, 14, 18, 32) and
+# create_system=3 (Unix) on all three parts. The document itself has no metadata to leak — this
+# writer builds the package by hand and never emits docProps/core.xml or docProps/app.xml, so there
+# is no author, no company, no "created with" and no revision count anywhere. These three constants
+# close the last of it: the epoch zip uses for "no date", the Windows/FAT origin byte, and no
+# permission bits. Two files with the same text are now byte-identical.
+_EPOCH = (1980, 1, 1, 0, 0, 0)
+
+
+def _entry(name: str) -> zipfile.ZipInfo:
+    zi = zipfile.ZipInfo(name, date_time=_EPOCH)
+    zi.compress_type = zipfile.ZIP_DEFLATED
+    zi.create_system = 0
+    zi.external_attr = 0
+    return zi
+
+
+def _scrub_attrs(dest: Path) -> None:
+    """Zero the external-attributes field of every entry, which the library will not let us leave
+    empty: `_open_to_write` treats `external_attr == 0` as "unset" and substitutes `0o600 << 16`, so
+    the one value we actually want is the one value unreachable through the API. It is only a Unix
+    permission mask — it identifies nobody — but "empty" was the requirement, so it is emptied here.
+
+    The central directory is walked from the end-of-central-directory record rather than by scanning
+    for the `PK\\x01\\x02` signature, because that byte sequence can also occur inside compressed
+    data; EOCD gives the true offset and entry count. No comment is ever written, so EOCD is the
+    final 22 bytes.
+    """
+    raw = bytearray(dest.read_bytes())
+    if len(raw) < 22 or raw[-22:-18] != b"PK\x05\x06":
+        return                                    # unexpected shape — leave the file alone
+    count = int.from_bytes(raw[-14:-12], "little")
+    pos = int.from_bytes(raw[-6:-2], "little")    # offset of the central directory
+    for _ in range(count):
+        if raw[pos:pos + 4] != b"PK\x01\x02":
+            return
+        raw[pos + 38:pos + 42] = b"\x00\x00\x00\x00"
+        n = int.from_bytes(raw[pos + 28:pos + 30], "little")
+        extra = int.from_bytes(raw[pos + 30:pos + 32], "little")
+        comment = int.from_bytes(raw[pos + 32:pos + 34], "little")
+        pos += 46 + n + extra + comment
+    dest.write_bytes(bytes(raw))
+
+
 def write(content, dest: Path, title: str | None = None) -> Path:
     with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("[Content_Types].xml", CONTENT_TYPES)
-        z.writestr("_rels/.rels", RELS)
-        z.writestr("word/document.xml", build(content, title))
+        z.writestr(_entry("[Content_Types].xml"), CONTENT_TYPES)
+        z.writestr(_entry("_rels/.rels"), RELS)
+        z.writestr(_entry("word/document.xml"), build(content, title))
+    _scrub_attrs(dest)
     return dest
 
 

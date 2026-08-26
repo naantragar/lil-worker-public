@@ -231,14 +231,9 @@ Digging in, fortifying a shelter, building a tunnel, putting up obstacles. Repor
 callsign or a place.
 
     22:00 група ПАСЬЯН облаштовує тунель у н\в укритті
-    06:01 гр ШПАК залишила т 38, відійшла східніше, обладнує укриття
 
 Its value is the opposite of movement's: movement says a man can still be caught somewhere, this
-says they intend to stay and how much work it will take to remove them. **A new shelter being made
-is among the most valuable things in the report** — take it every time it is audible.
-
-The line is the fact itself and nothing around it: what they are short of while digging, how far
-along they are, whether the tools arrived. See «Із чого складається РЯДОК».
+says they intend to stay and how much work it will take to remove them.
 
 ### 11. Мінування
 
@@ -302,31 +297,6 @@ Several intercepts often describe ONE event: the start in one, the continuation 
 - Weak link → separate lines. Splitting too much is the safer error.
 - The same exchange is sometimes posted twice by different people. Report it once, prefer the fuller
   wording, list both indices in `src`.
-
-## Із чого складається РЯДОК — the three parts, and nothing else
-
-A line is **who**, **what happened**, and **where**. Those three parts are the whole of it. A piece
-of the exchange that is none of them has nowhere in the line to go — this is not a prohibition, it
-is the shape of the thing.
-
-**"What happened" carries the substance of the event itself** — the nature of a wound, what exactly
-was destroyed, that the shelter is being dug. That is the event, and it stays.
-
-What is NOT one of the three parts is commentary AROUND the event: how hard it was, what they are
-short of, how much of the way is left, who is annoyed with whom.
-
-    так: 06:01 гр ШПАК залишила т 38, відійшла східніше, обладнує укриття
-    ні:  … (лише розпочато, проблеми з доставкою води й лопат)
-
-The fact is that they are digging in at a new place — that is who, what and where, and it is one of
-the most valuable things this report carries. Their shortage of water and shovels is neither: the
-shelter gets dug with shovels or with hands, and the fact does not change.
-
-    так: 12:03 переміщення в\с ЛЕШИЙ до т8
-    ні:  … , залишилось приблизно 600 м
-
-The distance still to walk is a measurement of the same fact, not a fourth part of it. It is true of
-every man on the move, it changes every minute, and it says nothing the destination has not said.
 
 ## The register
 

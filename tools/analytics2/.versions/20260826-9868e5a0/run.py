@@ -488,76 +488,6 @@ def _freq_set(raw: str | None) -> list[float]:
     return out
 
 
-def assign_registers(freqs_of: dict[str, list[str]]) -> dict[str, tuple[list, list]]:
-    """Give every archive network to exactly ONE network of this report.
-
-    The first version asked each report network independently "which archive networks share a
-    frequency with me", and an archive network that matched three of them was printed under all
-    three. The result looked exactly like what it was: `СЕРБ, БАЗА, ГРОМ` and one identical legend
-    standing under `2 мсб 38 омсбр`, under `189 мсп (БАГАТЕ)` and under `189 мсп (НОВОСЕЛІВКА)` in
-    the same report. A register that names the same men on three different nets is worse than none.
-
-    So the assignment is made globally and is exclusive: each archive network goes to the report
-    network it overlaps most, measured first by how many of its frequencies match and then by what
-    share of that report network's own frequencies they cover — the more specific claim wins.
-    """
-    if not REPORTS_DB.exists():
-        return {}
-    try:
-        con = sqlite3.connect(f"file:{REPORTS_DB}?mode=ro", uri=True)
-        archive = [(nid, _freq_set(fr)) for nid, fr in con.execute("SELECT id, freqs FROM networks")]
-    except sqlite3.Error:
-        return {}
-
-    mine_of = {net: [float(x) for x in fr if _is_float(x)] for net, fr in freqs_of.items()}
-    owned: dict[str, list[int]] = defaultdict(list)
-    for nid, afs in archive:
-        best, best_score = None, (0, 0.0)
-        for net, mine in mine_of.items():
-            if not mine:
-                continue
-            hits = sum(1 for a in afs for b in mine if abs(a - b) * 1000 <= FREQ_TOL_KHZ)
-            if not hits:
-                continue
-            score = (hits, hits / len(mine))
-            if score > best_score:
-                best, best_score = net, score
-        if best:
-            owned[best].append(nid)
-
-    out: dict[str, tuple[list, list]] = {}
-    for net, ids in owned.items():
-        out[net] = _pull_register(con, ids)
-    return out
-
-
-def _pull_register(con, ids: list[int]) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
-    marks = ",".join("?" * len(ids))
-
-    def pull(sql: str) -> list[tuple[str, str]]:
-        # Deduped case-insensitively but printed as written: callsigns are uppercase, code words are
-        # not (`«платье»`), so upper-casing the key would mangle half the legend.
-        seen: dict[str, tuple[str, str]] = {}
-        for key, val in con.execute(sql.format(marks=marks), ids):
-            k = str(key or "").strip()
-            # A wrapped source line sometimes leaves the description opening on punctuation
-            # (`- , «прилетит в ворота» – …`); that is the seam, not content.
-            v = " ".join(str(val or "").split()).lstrip(",-–— ").strip()
-            if not k or not v:
-                # A name with no role and a code with no reading tell the reader nothing. They stay
-                # in the database; they do not belong in a report that is meant to be scanned.
-                continue
-            if k.lower() not in seen or len(v) > len(seen[k.lower()][1]):
-                seen[k.lower()] = (k, v)
-        return list(seen.values())
-
-    roster = pull("SELECT callsign, role FROM roster WHERE network_id IN ({marks}) ORDER BY id")
-    legend = pull("SELECT code, meaning FROM legend WHERE network_id IN ({marks}) ORDER BY id")
-    known = known_codes()
-    legend = [(c, m) for c, m in legend if not (_variants(c) & known)]
-    return roster, legend
-
-
 def register_for(freqs: list[str]) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     """The callsign register and the code legend this network is already known to work with.
 
@@ -752,7 +682,6 @@ def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
     styled += [(f"на {dt_to[11:16]} {datetime.strptime(dt_to, '%Y-%m-%d %H:%M'):%d.%m.%Y}",
                 False, True), ("", False, False)]
 
-    registers = assign_registers(freqs_of)
     for i, net in enumerate(sorted(by_net, key=lambda n: -len(by_net[n]))):
         evs = sorted(by_net[net], key=lambda e: stamp(e.get("time")) or 0)
         if i:
@@ -763,7 +692,7 @@ def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
         styled.append((net, True, False))
 
         # The register goes between the header and the events, exactly where the analyst keeps it.
-        roster, legend = registers.get(net, ([], []))
+        roster, legend = register_for(fr)
         if active:
             names, blob = heard_on(active, fr)
             if names or blob:        # fail open: an empty lookup must not blank the register

@@ -80,7 +80,11 @@ def _block(reason: str) -> None:
 # waiting on it, and the wrapper turns from a guard into a self-destruct: the very first converted
 # analytics run was killed at 60s with exit 124, having done nothing but read the window. Strip it.
 RE_TIMEOUT = re.compile(r"^\s*timeout\s+(?:-k\s+\S+\s+|-{1,2}\S+\s+)*\d+(?:\.\d+)?[smhd]?\s+")
-RE_INLINE_PREFIX = re.compile(r"^\s*KREVETKA_INLINE_BASH=1\s+")
+# Not anchored at all. Anchoring was tried twice and failed twice for the same reason: a real command
+# has the assignment after a `cd` line, or after a `;`, or inside a loop — never at offset zero. This
+# is an explicit opt-in marker that only I write, so a plain substring is both sufficient and
+# predictable, which an anchor demonstrably was not.
+RE_INLINE_PREFIX = re.compile(r"\bKREVETKA_INLINE_BASH=1\b")
 
 
 def _strip_timeout(command: str) -> tuple[str, bool]:
@@ -131,7 +135,9 @@ def main() -> None:
     # assignment that the command string opens with. Documenting `KREVETKA_INLINE_BASH=1 <cmd>` while
     # only checking os.environ made the hatch a no-op — found the first time it was needed, on a
     # command that matched the registry by accident (a test string that merely quoted the path).
-    if RE_INLINE_PREFIX.match(command):
+    # search(), not match(): `re.M` makes `^` match at every line start, but `match()` only ever
+    # tries position 0, so the multi-line form stayed broken after the anchor was widened.
+    if RE_INLINE_PREFIX.search(command):
         _allow()
 
     entry = None

@@ -129,11 +129,6 @@ Their shelters and their movements are of interest **when the unit and/or the ca
 out** — made out in the sense of «Що таке ІМ'Я» below, not merely present as a sound. If neither is
 established, an exchange that merely mentions «союзники» is not a line.
 
-    07:14 зазначено що на ор ЭЛЕРОН знаходиться укриття в\с НЕМЕЦ, 67 омсбр
-
-Both halves are audible there — the unit number and the callsign — and the shelter is tied to a
-named orientir. That is the fullest form this category takes and it must not be passed over.
-
 ### 5. Вогневе ураження — only with a confirmed RESULT
 
 Fire landing on them is NOT an event by itself. It becomes one only when the speech confirms an
@@ -168,15 +163,14 @@ product.
 Water, food, МТЗ, batteries, equipment, packages of any other sort: **not events.** They are not
 listed above, and that is the whole of it.
 
-### 8. Перехід на інший канал - хто, кому, і на який канал
+### 8. Перехід на інший канал - факт і номер
 
-A switch to another channel earns a line when the channel is named AND at least one CALLSIGN is
-audible - who gave the order, or who it was given to. Both is better; one is enough.
+When an exchange states that they are moving to another channel AND names it, that is a line. Take
+the fact and the channel; nothing else from the exchange belongs in it.
 
-    18:57 наказ в\с БАДЫЛЬ перейти на 1 канал
-    09:30 наказ СВЯТОГО всім своїм перейти на 4 канал
+    09:30 наказ усім перейти на 4 канал
 
-The material the rule was written from:
+The material this was written from:
 
     — Потом надо будет всем, всем переключиться на четвертый.
     — Берес, тебя это тоже касается, всех своих, всех своих. На четвертый канал переключай.
@@ -184,14 +178,12 @@ The material the rule was written from:
 
 Why it earns a line: a network that stops being heard is far more often a network that moved than a
 unit that was destroyed, and this announcement is the only thing that tells the two apart. It is
-also the thread by which the traffic can be picked up again - but only if it is attached to a
-person, because people are what we track. (The exchange above was found the day after `422.8850`
-went quiet, and it explained the silence completely.)
+also the thread by which the traffic can be picked up again. (The exchange above was found the day
+after `422.8850` went quiet, and it explained the silence completely.)
 
-**A nameless switch is not a line.** `всім перейти на 4 канал`, with neither the speaker nor the
-addressee audible, tells us a channel moved and nothing about whom. Also not lines: a request to
-change with no channel named (`не слышу, перейди куда-нибудь`, `смени частоту`), asking what
-frequency someone is on, and a channel mentioned with nobody moving to it.
+Requires BOTH halves. A request to change with no channel named — `не слышу, перейди куда-нибудь`,
+`смени частоту` — is not a line; neither is asking what frequency someone is on, nor a channel
+mentioned without anyone moving to it.
 
 ## What is never written
 
@@ -208,50 +200,6 @@ frequency someone is on, and a channel mentioned with nobody moving to it.
 - Halts, waits and bivouacs on their own — the march simply continues later.
 - Separate lines for the legs of ONE march — see §1, they belong in a single line.
 - Anything whose content cannot be established from the speech.
-
-### 9. Пошуково-штурмові дії та зіткнення
-
-Assault work by their infantry: search-and-assault sweeps, an order to conduct them, a report that
-they were conducted. Write who and where, as far as either is audible.
-
-    07:36 пошуково-штурмові дії шг ЗАЯЦ у н\в н\п
-
-Their own report of OUR people near them belongs here too — a group of СОУ passing their shelters,
-voices heard, a contact starting. It tells the reader where our side has been seen and that a clash
-is close.
-
-    09:11 зазначено про переміщення шг СОУ повз укриття в\с ГУДОК, ДАНТЕС
-
-This does NOT open the door to their fire on our positions: their UAV crews and artillery stay out
-(see "What is never written"). This is their infantry acting on the ground.
-
-### 10. Інженерне обладнання позицій
-
-Digging in, fortifying a shelter, building a tunnel, putting up obstacles. Reportable when tied to a
-callsign or a place.
-
-    22:00 група ПАСЬЯН облаштовує тунель у н\в укритті
-    06:01 гр ШПАК залишила т 38, відійшла східніше, обладнує укриття
-
-Its value is the opposite of movement's: movement says a man can still be caught somewhere, this
-says they intend to stay and how much work it will take to remove them. **A new shelter being made
-is among the most valuable things in the report** — take it every time it is audible.
-
-The line is the fact itself and nothing around it: what they are short of while digging, how far
-along they are, whether the tools arrived. See «Із чого складається РЯДОК».
-
-### 11. Мінування
-
-Mined ground, mined tracks, remote mining — write it with the place, whoever laid it. This is a
-state rather than a strike, so it does not need §5's confirmed result; the point is that a piece of
-ground is now dangerous and they know it.
-
-    10:47 дистанційне мінування ор БЕРГАМОТ/ВКЛАДЫШ, ИЗЮМ
-
-It is often discovered by the casualty that revealed it. Then both go in - the mining as its own
-line, the 300 as its own.
-
-    — Прям на тропе Изюм весь заминирован, просто еле прошел там вообще жопа
 
 ## Що таке ІМ'Я — the test a callsign, a point or a code has to pass to anchor a line
 
@@ -302,31 +250,6 @@ Several intercepts often describe ONE event: the start in one, the continuation 
 - Weak link → separate lines. Splitting too much is the safer error.
 - The same exchange is sometimes posted twice by different people. Report it once, prefer the fuller
   wording, list both indices in `src`.
-
-## Із чого складається РЯДОК — the three parts, and nothing else
-
-A line is **who**, **what happened**, and **where**. Those three parts are the whole of it. A piece
-of the exchange that is none of them has nowhere in the line to go — this is not a prohibition, it
-is the shape of the thing.
-
-**"What happened" carries the substance of the event itself** — the nature of a wound, what exactly
-was destroyed, that the shelter is being dug. That is the event, and it stays.
-
-What is NOT one of the three parts is commentary AROUND the event: how hard it was, what they are
-short of, how much of the way is left, who is annoyed with whom.
-
-    так: 06:01 гр ШПАК залишила т 38, відійшла східніше, обладнує укриття
-    ні:  … (лише розпочато, проблеми з доставкою води й лопат)
-
-The fact is that they are digging in at a new place — that is who, what and where, and it is one of
-the most valuable things this report carries. Their shortage of water and shovels is neither: the
-shelter gets dug with shovels or with hands, and the fact does not change.
-
-    так: 12:03 переміщення в\с ЛЕШИЙ до т8
-    ні:  … , залишилось приблизно 600 м
-
-The distance still to walk is a measurement of the same fact, not a fourth part of it. It is true of
-every man on the move, it changes every minute, and it says nothing the destination has not said.
 
 ## The register
 
