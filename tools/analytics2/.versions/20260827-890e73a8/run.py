@@ -410,28 +410,7 @@ REPORTS_DB = REPO / "knowledge" / "upstream" / "reports.db"
 KNOWN_CODES = REPO / "knowledge" / "upstream" / "known_codes.md"
 
 
-# The printed register is cut to the men CONFIRMED ON THE AIR within this many days, and the rule
-# applies to EVERY name — the analyst's last list has no immunity (owner's decision, 27.08 evening).
-# Printing the whole accumulated register was 145 callsigns over 97 events, longer than the report
-# it heads. Two days brings that to ~58. Deliberately NOT done: a per-network cap (the owner sees no
-# reason for one) and a floor (if only one man was heard on a net, one man is the truth). Command
-# staff get no exemption either — `ком склад` stands against 41 of the 145 names, so exempting them
-# would not filter anything.
-# Nothing is lost by this: the FULL accumulated register, with each man's last time on the air, is
-# written to `<out>_reestr.txt` next to the report (see build_register_file).
-ROSTER_ACTIVE_DAYS = 2
-
-# How far back the companion file looks when dating a silent callsign. Only the file uses it; the
-# report itself never reads more than ROSTER_ACTIVE_DAYS.
-REGISTER_FILE_DAYS = 14
-
-# A network that barely spoke gives no evidence either way, and cutting its register on that silence
-# says "these men are gone" when the truth is "we heard almost nothing". On 28.08 that turned
-# 189 мсп (НОВОСЕЛІВКА) into 8 -> 2 off 14 intercepts and 141.500 into 1 -> 0 off SIX — a header
-# with nobody under it. Below this much speech in the activity window the register prints in full.
-# Deliberately NOT applied to nets that did talk: шг 38 омсбр had 144 intercepts and 21k characters
-# and still lost 7 of 8 names, and that cut is honest — those men really were not on the air.
-MIN_ACTIVITY_CHARS = 4000
+ROSTER_ACTIVE_DAYS = 3        # a callsign unheard for longer than this is not worth reminding of
 
 
 def activity_index(dt_to: str) -> dict[str, dict]:
@@ -565,45 +544,6 @@ def unit_tags(text: str) -> set[str]:
     return {f"{n} {k.lower()}" for n, k in _UNIT.findall(text or "") if k.lower() in big}
 
 
-_BIG_UNIT = re.compile(r"(\d{1,4})\s*(омсбр|омбр|мсбр|мсп|пмп|полк)", re.I)
-
-
-def net_group(net: str) -> str:
-    """The formation a network block belongs to — `38 омсбр`, `189 мсп`, `60 омсбр`.
-
-    Deliberately the regiment/brigade and NOT the division: `3 мсб 114 мсп 127 мсд` is the 114 мсп's
-    net to the analyst, and grouping it under 127 мсд would put it next to strangers. A header that
-    names no formation at all (`нв підрозділу (дорозвідка р-н НОВОСЕЛІВКА)`) gets an empty group and
-    sinks to the bottom — it belongs to nobody, so it cannot break anybody's run.
-    """
-    m = _BIG_UNIT.search(net or "")
-    return f"{m.group(1)} {m.group(2).lower()}" if m else ""
-
-
-def order_networks(by_net: dict[str, list]) -> list[str]:
-    """Print order: formations stay TOGETHER, biggest formation first.
-
-    Sorting purely by event count scattered one brigade across the whole report — 26.08 ran 60 омсбр
-    and then 454.0700 of the 38th, with the other five nets of the 38th spread below — and the desk
-    reads it formation by formation. So the primary key is the formation's total, the secondary is
-    the net's own; the analyst's own reports are grouped the same way.
-
-    Captured radios go last, as they do in his reports: they are somebody else's net that we happen
-    to hear, and they should not sit inside a formation's run.
-    """
-    tot: dict[str, int] = defaultdict(int)
-    for net, evs in by_net.items():
-        tot[net_group(net)] += len(evs)
-
-    def key(net: str):
-        g = net_group(net)
-        trophy = 1 if re.search(r"троф", net or "", re.I) else 0
-        # no formation named → after the named ones, before nothing else
-        return (trophy, 0 if g else 1, -tot[g], g, -len(by_net[net]), net)
-
-    return sorted(by_net, key=key)
-
-
 def same_unit(mine_header: str, archive_header: str) -> bool:
     """May this archive network's register be printed under this report network?
 
@@ -723,31 +663,9 @@ def _pull_register(con, ids: list[int]) -> tuple[list[tuple[str, str]], list[tup
                 seen[k.lower()] = (k, v)
         return list(seen.values())
 
-    def fold_variants(rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
-        """`СПАРТАК/ПАРТАК` and `СПАРТАК` are ONE man written twice — merge them.
-
-        The analyst records a callsign he has heard two ways as `A/B`, and on another day writes
-        just `A`. Both then stood in the register as separate people (186 мсп printed СПАРТАК and
-        СПАРТАК/ПАРТАК side by side). Rows whose variant sets intersect are folded into the one with
-        the most information: the widest spelling, and the longest role text of the group.
-        """
-        out: list[tuple[set, str, str]] = []
-        for name, role in rows:
-            vs = _variants(name)
-            for i, (seen, kept_name, kept_role) in enumerate(out):
-                if vs & seen:
-                    best_name = kept_name if len(kept_name) >= len(name) else name
-                    best_role = kept_role if len(kept_role) >= len(role) else role
-                    out[i] = (seen | vs, best_name, best_role)
-                    break
-            else:
-                out.append((vs, name, role))
-        return [(n, r) for _v, n, r in out]
-
-    core = fold_variants(pull_roster(core_ids))
-    core_vars = {v for c, _ in core for v in _variants(c)}
-    older = [(c, r) for c, r in fold_variants(pull_roster(ids))
-             if not (_variants(c) & core_vars)]
+    core = pull_roster(core_ids)
+    core_keys = {c.lower() for c, _ in core}
+    older = [(c, r) for c, r in pull_roster(ids) if c.lower() not in core_keys]
     legend = pull("SELECT code, meaning FROM legend WHERE network_id IN ({marks}) ORDER BY id")
     legend = [(c, m) for c, m in legend if m]
     known = known_codes()
@@ -755,166 +673,6 @@ def _pull_register(con, ids: list[int]) -> tuple[list[tuple[str, str]], list[tup
     # (callsign, role, is_older) — is_older marks a name the analyst had on this net BEFORE his last
     # report; those are the only ones the activity check may drop.
     return [(c, r, False) for c, r in core] + [(c, r, True) for c, r in older], legend
-
-
-def archive_records(callsign: str) -> list[tuple[str, str, str, str]]:
-    """Every archived line the analyst ever wrote for this callsign: (source, freqs, header, role)."""
-    if not REPORTS_DB.exists():
-        return []
-    try:
-        con = sqlite3.connect(f"file:{REPORTS_DB}?mode=ro", uri=True)
-        rows = con.execute(
-            "SELECT r.source, n.freqs, n.header, ro.role FROM roster ro "
-            "JOIN networks n ON n.id = ro.network_id JOIN reports r ON r.id = n.report_id "
-            "WHERE upper(ro.callsign) = ? ORDER BY r.source", (callsign.upper(),)).fetchall()
-    except sqlite3.Error:
-        return []
-    seen, out = set(), []
-    for src, fr, hdr, role in rows:
-        key = (" ".join(str(hdr or "").split())[:60], " ".join(str(role or "").split())[:60])
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append((str(src or ""), "/".join(_freq_str(fr)), key[0], key[1]))
-    return out
-
-
-def _freq_str(raw) -> list[str]:
-    try:
-        vals = json.loads(raw) if str(raw).strip().startswith("[") else str(raw).split("/")
-    except Exception:                                   # noqa: BLE001
-        vals = [str(raw)]
-    return [str(v).strip() for v in vals if str(v).strip()]
-
-
-def build_dupes_file(registers: dict, nets: list[str], dt_from: str, dt_to: str) -> str:
-    """Callsigns standing in the register of MORE THAN ONE network of this report.
-
-    Deliberately a separate file and NOT part of the report: the same callsign in two formations is
-    usually two different men (`ФОКС` is documented as one commander in one net of 38 омсбр and an
-    accumulator in another), so merging them would be the worse error — but seeing the repeat with
-    no explanation is confusing, and the explanation is always in the analyst's own archive. Some of
-    it is HIS uncertainty rather than ours: 411.9630 is signed `2 мсб 38 омсбр` in one report and
-    `189 мсп` in another, which alone puts МАРК on two nets.
-    """
-    where: dict[str, list[tuple[str, str]]] = defaultdict(list)
-    for net in nets:
-        roster, _ = registers.get(net, ([], []))
-        for cs, role, _older in roster:
-            where[cs.upper()].append((net, role))
-    dupes = {c: v for c, v in where.items() if len(v) > 1}
-
-    out = ["Позивні, що стоять у реєстрі більш ніж однієї мережі цього звіту",
-           "довідка для нас, у звіт НЕ йде",
-           f"вікно {dt_from} - {dt_to}", ""]
-    if not dupes:
-        out.append("Таких позивних немає.")
-        return "\n".join(out) + "\n"
-
-    for cs in sorted(dupes):
-        out.append(f"{cs} - у {len(dupes[cs])} мережах цього звіту")
-        for net, role in dupes[cs]:
-            out.append(f"    {net}" + (f" - {role}" if role else ""))
-        arch = archive_records(cs)
-        if arch:
-            out.append("  як це записано в архіві аналітика:")
-            for src, freqs, hdr, role in arch:
-                out.append(f"    {src[:24]:24} {freqs[:30]:30} {hdr}" + (f" | {role}" if role else ""))
-        out.append("")
-    return "\n".join(out) + "\n"
-
-
-def last_heard_map(recs: list[dict], freqs: list[str], names: list[str],
-                   dt_to: str) -> dict[str, float]:
-    """Days since each callsign was last heard on this network's channels, or talked about there.
-
-    Same evidence as the printed register's filter (`still_active`) — a man counts as present when
-    he keys the mic OR when someone names him — so the file can never say "heard yesterday" about
-    somebody the report decided to drop.
-    """
-    mine = [float(x) for x in freqs if _is_float(x)]
-    rows = []
-    for r in recs:
-        f, dt = r.get("freq"), r.get("_dt")
-        if not dt or not _is_float(f):
-            continue
-        if not any(abs(float(f) - x) * 1000 <= FREQ_TOL_KHZ for x in mine):
-            continue
-        st = {p.strip().strip(".").upper()
-              for raw in r.get("stations", []) for p in re.split(r"[,/]| та ", raw or "")}
-        rows.append((dt, st, " ".join(r.get("speech", []) or []).lower()))
-    rows.sort(key=lambda x: x[0], reverse=True)
-    hi = datetime.strptime(dt_to, "%Y-%m-%d %H:%M")
-    out: dict[str, float] = {}
-    for name in names:
-        for dt, st, blob in rows:
-            if still_active(name, st, blob):
-                out[name] = (hi - dt).total_seconds() / 86400
-                break
-    return out
-
-
-def _age_words(days: float | None) -> str:
-    if days is None:
-        return f"не чути {REGISTER_FILE_DAYS}+ діб"
-    if days < 1:
-        return "чути сьогодні"
-    if days < 2:
-        return "чути вчора"
-    return f"останнє чути {days:.0f} діб тому"
-
-
-def build_register_file(registers: dict, nets: list[str], freqs_of: dict[str, list[str]],
-                        dt_from: str, dt_to: str, active: dict | None = None) -> str:
-    """The FULL accumulated register, with the date each man was last on the air.
-
-    The report prints only the men confirmed within ROSTER_ACTIVE_DAYS; this file is what makes that
-    cut safe. Nothing is deleted from the archive, and a name the report dropped is here with the
-    reason next to it, so a man who is heard again comes back into the report by himself.
-
-    The `без ролі` block is deliberate: those are the analyst's own entries with no role written.
-    We do not invent one — the block exists so he can fill it in and we pick it up.
-    """
-    hi = datetime.strptime(dt_to, "%Y-%m-%d %H:%M")
-    recs = fetch(f"{hi - timedelta(days=REGISTER_FILE_DAYS):%Y-%m-%d %H:%M}", dt_to)
-
-    out = ["Повний реєстр позивних, накопичений з архіву аналітика",
-           "довідка для нас, у звіт НЕ йде",
-           f"вікно звіту {dt_from} - {dt_to}",
-           f"у звіт друкуються ті, кого чути за {ROSTER_ACTIVE_DAYS} доби; решта — тут",
-           f"давність рахується за {REGISTER_FILE_DAYS} діб назад", ""]
-    for net in nets:
-        roster, _legend = registers.get(net, ([], []))
-        if not roster:
-            continue
-        fr = freqs_of.get(net) or []
-        ages = last_heard_map(recs, fr, [c for c, _, _ in roster], dt_to)
-        thin = False
-        if active:
-            _n, _blob = heard_on(active, fr)
-            thin = len(_blob) < MIN_ACTIVITY_CHARS
-        if thin:
-            # the report printed this register whole (too little air to judge) — say so here too
-            shown = [(c, r) for c, r, _ in roster]
-        else:
-            shown = [(c, r) for c, r, _ in roster if (ages.get(c) is not None
-                                                     and ages[c] <= ROSTER_ACTIVE_DAYS)]
-        hidden = [(c, r) for c, r, _ in roster if (c, r) not in shown]
-        out += ["/".join(fr), net,
-                f"  у звіті ({len(shown)} з {len(roster)})"
-                + ("  [мало ефіру — реєстр не різався]" if thin else "") + ":"]
-        for c, r in shown:
-            out.append(f"    {c + (' - ' + r if r else ''):<58} {_age_words(ages.get(c))}")
-        if not shown:
-            out.append("    (нікого — за поріг не чути жодного)")
-        out.append(f"  не друкується ({len(hidden)}):")
-        for c, r in sorted(hidden, key=lambda x: ages.get(x[0], 1e9)):
-            out.append(f"    {c + (' - ' + r if r else ''):<58} {_age_words(ages.get(c))}")
-        no_role = [c for c, r, _ in roster if not r]
-        if no_role:
-            out.append(f"  без ролі (аналітик не вказав, ми не вигадуємо): {', '.join(no_role)}")
-        out.append("")
-    return "\n".join(out) + "\n"
 
 
 def register_for(freqs: list[str]) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
@@ -1112,7 +870,7 @@ def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
                 False, True), ("", False, False)]
 
     registers = assign_registers(freqs_of)
-    for i, net in enumerate(order_networks(by_net)):
+    for i, net in enumerate(sorted(by_net, key=lambda n: -len(by_net[n]))):
         evs = sorted(by_net[net], key=lambda e: stamp(e.get("time")) or 0)
         if i:
             styled.append(("", False, False))       # two blank lines between network blocks
@@ -1123,23 +881,22 @@ def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
 
         # The register goes between the header and the events, exactly where the analyst keeps it.
         roster, legend = registers.get(net, ([], []))
-        # Every name has to prove it is still on the air, the analyst's last list included. What the
-        # filter removes is not lost — it stands in `<out>_reestr.txt` with the date it was last
-        # heard, so a man who comes back is printed again the same day.
-        if ROSTER_ACTIVE_DAYS > 0 and active:
+        # The activity check ADDS, it does not subtract. It used to cut every name unheard for three
+        # days out of the whole register, and on this archive that removed 39% of it and left 13
+        # networks with no register at all — a net printed with a header and no people, which is
+        # worse than a name too many. Now the analyst's last list is printed as he kept it, and only
+        # the OLDER names — ones he had dropped from that list himself — have to prove they are
+        # still on the air.
+        if active:
             names, blob = heard_on(active, fr)
-            if len(blob) < MIN_ACTIVITY_CHARS:
-                print(f"реєстр {net[:34]}: НЕ ріжемо — за {ROSTER_ACTIVE_DAYS} доби лише "
-                      f"{len(blob)} симв. ефіру (мало доказів)", file=sys.stderr)
-                names, blob = set(), ""
             if names or blob:        # fail open: an empty lookup must not touch the register
                 kept, dropped = [], []
                 for cs, role, older in roster:
-                    tgt = kept if still_active(cs, names, blob) else dropped
+                    tgt = kept if (not older or still_active(cs, names, blob)) else dropped
                     tgt.append((cs, role, older))
                 if dropped:
                     print(f"реєстр {net[:34]}: {len(roster)} -> {len(kept)} "
-                          f"(за {ROSTER_ACTIVE_DAYS} доби не чути: "
+                          f"(зі старіших списків, за {ROSTER_ACTIVE_DAYS} діб не чути: "
                           f"{', '.join(c for c, _, _ in dropped)[:90]})", file=sys.stderr)
                 roster = kept
         for cs, role, _older in roster:
@@ -1344,20 +1101,6 @@ def finish(a, recs: list[dict], units: list[dict], events: list[dict],
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     out = OUT_DIR / f"{a.out}.txt"
     out.write_text("\n".join(t for t, _, _ in styled))
-
-    nets_in_report = list(dict.fromkeys(e.get("_net") for e in events if e.get("_net")))
-    dupes_txt = build_dupes_file(assign_registers(freqs_of), nets_in_report, a.dt_from, a.dt_to)
-    (OUT_DIR / f"{a.out}_dubli.txt").write_text(dupes_txt)
-    n_dupes = sum(1 for l in dupes_txt.splitlines() if " - у " in l and "мережах" in l)
-    print(f"позивних у кількох мережах: {n_dupes} (довідка у {a.out}_dubli.txt)", file=sys.stderr)
-
-    try:
-        reg_txt = build_register_file(assign_registers(freqs_of), nets_in_report, freqs_of,
-                                      a.dt_from, a.dt_to, activity_index(a.dt_to))
-        (OUT_DIR / f"{a.out}_reestr.txt").write_text(reg_txt)
-        print(f"повний реєстр: {a.out}_reestr.txt", file=sys.stderr)
-    except Exception as e:                      # noqa: BLE001 — a reference file must not lose a run
-        print(f"повний реєстр не вийшов: {e!r}", file=sys.stderr)
 
     quiet = silent_networks(recs, a.dt_from)
     idle = unattended_networks(units, events)

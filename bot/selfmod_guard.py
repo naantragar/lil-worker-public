@@ -25,6 +25,8 @@ Profiles:
   upstream-specialist   — baseline + writes confined to the upstream tree, infra deny-list,
                        systemctl/docker allow-lists, cannot stop itself, cannot read
                        krevetka's secrets.
+  game-dev           — baseline + writes confined to the match3 trees, full systemctl over its own
+                       match3* units (and their unit files), cannot read krevetka's secrets.
 
 Fail-closed: if a cap file exists but can't be parsed, every mutating tool is blocked.
 
@@ -264,6 +266,95 @@ def upstream_check_read(path):
 
 
 # ---------------------------------------------------------------------------
+# profile: game-dev
+# ---------------------------------------------------------------------------
+# The match3 instance builds and tests its own game, including a dev stand. It was blocked from
+# `systemctl restart` by the baseline (a plain secondary instance may not touch service lifecycle)
+# and had to resort to signalling processes by hand, which is worse in every way: no unit file, no
+# restart-on-crash, and the owner had to be pulled in to restart things for it.
+#
+# So: full service lifecycle over ITS OWN units (anything named match3*), and the right to write
+# their unit files, but nothing else on the box. Everything the baseline protects still holds —
+# krevetka's code, krevetka's processes, krevetka's secrets, power control.
+GAME_WRITE_ROOTS = [
+    "~/match3",        # the game
+    "~/match3-dev",    # the dev stand
+    "/tmp",
+]
+# Unit files for its own services — the ONLY place under /etc it may write.
+GAME_UNIT_RE = re.compile(r"^/etc/systemd/system/match3[\w.@-]*\.(service|timer|socket)$")
+GAME_DENY_BASH = [
+    (r"\b(shutdown|reboot|poweroff|halt)\b|\binit\s+[06]\b",
+     "power control would take krevetka down with the box"),
+    (r"\bsystemctl\b[^\n]*\b(poweroff|reboot|halt|isolate|mask|unmask)\b",
+     "systemctl power/mask verbs are not allowed"),
+    (r"\b(ufw|iptables|ip6tables|nft|nftables)\b", "firewall changes are not allowed"),
+    (r"\b(useradd|userdel|usermod|adduser|deluser|groupadd|passwd|chpasswd|visudo)\b",
+     "user/permission management is not allowed"),
+    (r"\bcrontab\b|/etc/cron", "cron changes are not allowed"),
+    (r"\b(mkfs|mkfs\.\w+|fdisk|parted|wipefs|mkswap)\b",
+     "disk/filesystem operations are not allowed"),
+    (r"\bdd\b[^\n]*\bof=\s*/dev/", "raw writes to block devices are not allowed"),
+    (r"\bdocker\b[^\n]*\b(system|volume|network|image|builder)\s+prune\b",
+     "docker prune can destroy other projects' data"),
+    (r"\b(instance\.sh|run\.sh|restart_crab\.sh|watchdog\.sh)\b",
+     "krevetka's process-lifecycle scripts are main-only (this is also what keeps a cap from "
+     "lifting itself)"),
+    (r"\brm\s+-[a-zA-Z]*[rf][a-zA-Z]*\s+/(\s|$)", "rm -rf / — no"),
+    (r"\bnginx\b[^\n]*\s-s\s+(stop|quit)\b",
+     "stopping nginx would take down unrelated sites; use reload"),
+]
+
+
+def game_check_bash(cmd, norm):
+    for pattern, reason in GAME_DENY_BASH:
+        if re.search(pattern, norm):
+            _deny(reason, "game-dev")
+
+    if SECRET_RE.search(norm):
+        _deny("that path holds krevetka's own secrets (bot token / API keys / ssh)", "game-dev")
+
+    if re.search(r"\b(kill|pkill|killall)\b", norm):
+        for pid in _protected_pids():
+            if re.search(rf"(^|\s){re.escape(pid)}(\s|$)", norm):
+                _deny(f"PID {pid} is a krevetka bot process — its lifecycle is main-only",
+                      "game-dev")
+
+    # systemctl: read verbs free; mutating verbs only on its own match3* units. `daemon-reload` and
+    # `daemon-reexec` name no unit and are needed after writing a unit file, so they pass.
+    for _flags, verb, unit in SYSTEMCTL_RE.findall(norm):
+        if verb in SYSTEMCTL_READ_VERBS or verb in ("daemon-reload", "daemon-reexec"):
+            continue
+        if (unit or "").removesuffix(".service").startswith("match3"):
+            continue
+        _deny(f"systemctl {verb} {unit or '(no unit)'} — you may only manage match3* units",
+              "game-dev")
+
+    if WRITE_RE.search(norm) and UPSTREAM_SENSITIVE_WRITE_RE.search(norm):
+        # its own unit files are the single exception, and they are matched exactly
+        if not any(GAME_UNIT_RE.match(tok.strip("\"'")) for tok in norm.split()):
+            _deny("writing to system paths (/etc, /usr, /boot, /lib, cron) is not allowed, "
+                  "except /etc/systemd/system/match3*.service", "game-dev")
+
+
+def game_check_write(path):
+    if not path:
+        return
+    ap = _abs(path)
+    if _is_own(ap) or GAME_UNIT_RE.match(ap):
+        return
+    if any(_under(ap, root) for root in GAME_WRITE_ROOTS):
+        return
+    _deny(f"writes are confined to the match3 trees and its own unit files; refused: {ap}",
+          "game-dev")
+
+
+def game_check_read(path):
+    if path and SECRET_RE.search(_abs(path)):
+        _deny("that file holds krevetka's own secrets", "game-dev")
+
+
+# ---------------------------------------------------------------------------
 # profile: trusted-full
 # ---------------------------------------------------------------------------
 # "Everything the main instance can do, EXCEPT touching krevetka itself."
@@ -334,12 +425,17 @@ def main():
     if tool == "Read":
         if cap == "upstream-specialist":
             upstream_check_read(ti.get("file_path") or ti.get("notebook_path") or ti.get("path"))
+        elif cap == "game-dev":
+            game_check_read(ti.get("file_path") or ti.get("notebook_path") or ti.get("path"))
         sys.exit(0)
 
     if tool in EDIT_TOOLS:
         path = ti.get("file_path") or ti.get("notebook_path") or ti.get("path")
         if cap == "upstream-specialist":
             upstream_check_write(path)      # whitelist; strictly narrower than the baseline
+            sys.exit(0)
+        if cap == "game-dev":
+            game_check_write(path)       # match3 trees + its own unit files
             sys.exit(0)
         if _under_protected(path):
             _deny(f"refused {tool} on krevetka's protected path: {path}")
@@ -352,7 +448,8 @@ def main():
         if LIFECYCLE_RE.search(norm):
             _deny("refused a command that could kill/restart the MAIN bot — process lifecycle is "
                   "main-only; a secondary instance manages only itself.")
-        if cap not in ("upstream-specialist", "trusted-full") and SYSTEMCTL_MUTATE_RE.search(norm):
+        if cap not in ("upstream-specialist", "trusted-full", "game-dev") \
+                and SYSTEMCTL_MUTATE_RE.search(norm):
             # upstream-specialist replaces this with a per-unit allow-list (see upstream_check_bash)
             _deny("refused systemctl — service lifecycle is main-only for a plain secondary "
                   "instance.")
@@ -366,6 +463,8 @@ def main():
             upstream_check_bash(cmd, norm)
         elif cap == "trusted-full":
             trusted_check_bash(cmd, norm)
+        elif cap == "game-dev":
+            game_check_bash(cmd, norm)
         sys.exit(0)
 
     sys.exit(0)

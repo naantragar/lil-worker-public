@@ -39,6 +39,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 LAUNCHER = REPO / "tools" / "workflow_job.py"
+# Named absolutely in the refusal text: from a secondary instance the cwd is that
+# instance's own project, where a relative bot/job_ctl.py does not exist.
+JOB_CTL = REPO / "bot" / "job_ctl.py"
 RUNNER = REPO / "bot" / "jobs" / "run_job.sh"   # job_ctl refuses to launch without it
 AUTO_DIR = REPO / "tools" / "workflows" / "auto"
 HOOK_LOG = REPO / "bot" / "jobs" / "durable_swarm_hook.log"
@@ -140,8 +143,8 @@ def main() -> None:
             "Inline swarms are disabled (a swarm inside a turn dies with the turn), and launching "
             f"this one as a durable job failed:\n{err[-600:]}\n"
             "If this is the concurrency gate, wait for a running job to finish "
-            "(`python3 bot/job_ctl.py list`) or cancel one, then launch it yourself with "
-            "`python3 tools/workflow_job.py launch --script <path.js>`."
+            f"(`python3 {JOB_CTL} list`) or cancel one, then launch it yourself with "
+            f"`python3 {REPO / 'tools' / 'workflow_job.py'} launch --script <path.js>`."
         )
 
     job_id = out.splitlines()[-1].strip() if out else "(id not reported)"

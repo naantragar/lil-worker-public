@@ -134,7 +134,7 @@ established, an exchange that merely mentions «союзники» is not a line
 Both halves are audible there — the unit number and the callsign — and the shelter is tied to a
 named orientir. That is the fullest form this category takes and it must not be passed over.
 
-### 5. Вогневе ураження — a confirmed RESULT, or a named target
+### 5. Вогневе ураження — only with a confirmed RESULT
 
 Fire landing on them is NOT an event by itself. It becomes one only when the speech confirms an
 outcome:
@@ -145,19 +145,9 @@ outcome:
     ВУ коптером камікадзе СОУ по в\с ЕЖИК в р\н його укриття - 300
     ВУ коптером камікадзе СОУ з наступною пожежею в р\н укриття в\с ВОСТОК
 
-**Exception — a strike on a NAMED position, shelter or crew is a line even with no losses.** What
-makes it intelligence is not the damage but the fact that the place is now known to the other side
-and they are working it:
-
-    11:54 ВУ БпЛА по входу позиції розрахунку БпЛА НОЯБРЬ, без втрат о\с
-
-The bar is the target, not the outcome: a position, a shelter, an accumulator or a crew, named or
-anchored to a callsign. `ВУ … по укриттю в\с ЛИС, без втрат о\с` therefore IS a line now.
-
-Everything else still goes: `ВУ … по в\с МОСКВА під час переміщення` (a man on the move is not a
-position), repeated strikes with nothing named, and anything where neither target nor result can be
-established. Something arrived and nothing is known about where or with what effect — that is not
-intelligence.
+Everything else goes: `ВУ … по укриттю в\с ЛИС, без втрат о\с`, `декілька ВУ … по укриттю в\с
+БЕРКУТ`, `ВУ … по в\с МОСКВА під час переміщення`. Something arrived and nothing is known to have
+come of it — that is not intelligence. Write it as an event only when the result is stated.
 
 An anonymous "somewhere something exploded" is not an event at all.
 
@@ -211,18 +201,10 @@ frequency someone is on, and a channel mentioned with nobody moving to it.
 - Absence of data — never `немає інформації про…`.
 - Bare acknowledgements, radio checks, `55`, `принял`, numbers with no meaning.
 - Movement with no anchor at all, and movement by personnel none of whom is named.
-- **Planned movement of PEOPLE**, however specific — `заплановано переміщення в\с ХОПКИНС та
-  ХОВРАТ до т ХУРМА о 06:00`. Intentions are cheap and the radio is full of them; a man's movement
-  is reported when it happens. What a plan may still carry is a different category entirely — a
-  group massing at a named accumulator, for instance — and that qualifies as itself, not as a plan.
-  **The exception is a NODE changing place** — a UAV crew, an accumulator, a position, a command
-  post. Those move rarely, the move is prepared in advance, and knowing it beforehand is worth more
-  than the same fact a day later, when the node is already somewhere else:
-
-      14:10 заплановано переміщення розрахунку БпЛА НОЯБРЬ до нового укриття
-
-  The subject has to BE the node (crew / accumulator / position / КНП), not a rifleman attached to
-  one. A plan with neither the node nor its new place audible is still not a line.
+- **Planned movement**, of anyone, however specific — `заплановано переміщення в\с ХОПКИНС та
+  ХОВРАТ до т ХУРМА о 06:00`. Intentions are cheap and the radio is full of them; movement is
+  reported when it happens. What a plan may still carry is a different category entirely — a group
+  massing at a named accumulator, for instance — and that qualifies as itself, not as a plan.
 - Halts, waits and bivouacs on their own — the march simply continues later.
 - Separate lines for the legs of ONE march — see §1, they belong in a single line.
 - Anything whose content cannot be established from the speech.
@@ -270,27 +252,6 @@ It is often discovered by the casualty that revealed it. Then both go in - the m
 line, the 300 as its own.
 
     — Прям на тропе Изюм весь заминирован, просто еле прошел там вообще жопа
-
-### 12. Засоби зв'язку — which radios they have and use
-
-A named RADIO TYPE earns a line: that they have it, that they are told to use it, that they are
-looking for one, that a unit is working on it. Tie it to a callsign or a subunit.
-
-    06:12 зазначено про використання о\с підрозділу р\с «АЗАРТ»
-    08:45 доповідь про переміщення та наявність радіостанцій
-
-The material such a line is written from:
-
-    — А где у них азарты нахуй? Азарты где этого уебана?
-    — Скажи, пускай по Азарта сука выйдет, где его Азарт
-
-Why it earns a line: the type of radio tells us what we will and will not be able to hear from that
-unit, and a unit switching sets to a different type disappears from our receivers exactly like a
-unit that moved channel — §8's problem in a different form.
-
-This is about the EQUIPMENT, not the traffic. Not lines: someone being told to come up on the air,
-a radio that is out of battery, an inaudible correspondent, `перевірка зв'язку`. A radio type named
-with nobody attached to it is not a line either.
 
 ## Що таке ІМ'Я — the test a callsign, a point or a code has to pass to anchor a line
 

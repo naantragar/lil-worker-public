@@ -31,7 +31,10 @@ INSTANCES_DIR="$SCRIPT_DIR/instances"
 # Caps live OUTSIDE instances/ on purpose: instances/<n>/ is writable by that instance,
 # so a cap stored there could be removed by the very instance it constrains.
 CAPS_DIR="$SCRIPT_DIR/caps"
-VALID_CAPS="upstream-specialist"
+# Must list EVERY profile selfmod_guard.py implements, or `cap set` refuses a real profile and the
+# instance silently keeps running on the baseline (which is not "wider" — the baseline forbids
+# systemctl outright). trusted-full was added to the guard without being added here.
+VALID_CAPS="upstream-specialist trusted-full game-dev"
 
 err() { echo "ERROR: $*" >&2; exit 1; }
 

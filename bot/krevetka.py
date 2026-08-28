@@ -362,12 +362,20 @@ _VOICE_RE = re.compile(
     re.DOTALL,
 )
 
-# Pattern: [FILE /absolute/path] — only real Unix paths (ASCII, no spaces, no cyrillic)
+# Pattern: [FILE /absolute/path] — any absolute Unix path with no spaces in it.
 # Must start at beginning of line — prevents matching inline examples in text.
 # Tolerant: case-insensitive, "[FILE " or "[FILE:", optional spaces, optional [/FILE].
+# The character class used to be ASCII-only, so a real file the owner asked for by name —
+# `РЕР_27.08.2026.docx` — did not match and the marker leaked into the chat as literal text
+# (27.08). Filenames here are routinely Cyrillic; the safe boundary is "not a space, not `]`",
+# and the file still has to EXIST before anything is sent (see send_files).
 _FILE_RE = re.compile(
-    r'(?im)^\s*\[FILE[:\s]\s*(/[a-zA-Z0-9_./-]+)\s*\](?:\s*\[/FILE\])?'
+    r'(?im)^\s*\[FILE[:\s]\s*(/[^\]\s]+)\s*\](?:\s*\[/FILE\])?'
 )
+
+# A marker that failed to parse is invisible to me and shows up as raw text to the owner, so a
+# leftover `[FILE` after extraction is logged loudly rather than lost.
+_FILE_LEAK_RE = re.compile(r'(?i)\[FILE[:\s]')
 
 
 def extract_file_blocks(text: str) -> tuple[str, list[str]]:
@@ -377,6 +385,9 @@ def extract_file_blocks(text: str) -> tuple[str, list[str]]:
     """
     paths = [m.group(1).strip() for m in _FILE_RE.finditer(text)]
     cleaned = _FILE_RE.sub("", text).strip()
+    if _FILE_LEAK_RE.search(cleaned):
+        logger.warning("[FILE] marker did not parse and stayed in the text: "
+                       f"{_FILE_LEAK_RE.search(cleaned).string[:200]!r}")
     return cleaned, paths
 
 
@@ -1490,7 +1501,13 @@ async def run_claude_streaming(
     # Every swarm goes through the durable-job path. An inline Workflow is killed when the turn ends
     # and its finished work is never reported (2026-08-02, Matrix room). The hook converts the call
     # so this cannot be forgotten; it fails open if anything about it breaks.
-    _durable_hook = os.path.join(BOT_CWD, "tools", "hooks", "durable_swarm.py")
+    # Hooks live in KREVETKA's repo, not in the instance's project dir. This used to be built from
+    # BOT_CWD, which for the main instance IS the repo — so it worked there and silently did nothing
+    # for every secondary instance (the game instance's cwd is ~/match3, which has no
+    # tools/hooks/). That is why the game instance had no durable jobs at all: not a permission
+    # problem, the conversion hook was simply never wired for it.
+    _hooks_dir = os.path.join(str(CODE_DIR.parent), "tools", "hooks")
+    _durable_hook = os.path.join(_hooks_dir, "durable_swarm.py")
     if os.path.exists(_durable_hook):
         _pre_tool_use.append({
             "matcher": "Workflow",
@@ -1500,7 +1517,7 @@ async def run_claude_streaming(
     # the known long runners listed in tools/hooks/durable_commands.json. A background Bash task is
     # killed by teardown exactly like an inline swarm was (2026-08-25: the analytics report run died
     # twice before being hand-wrapped in a systemd scope — a hand-applied rule is not a mechanism).
-    _durable_bash = os.path.join(BOT_CWD, "tools", "hooks", "durable_bash.py")
+    _durable_bash = os.path.join(_hooks_dir, "durable_bash.py")
     if os.path.exists(_durable_bash):
         _pre_tool_use.append({
             "matcher": "Bash",
@@ -1615,11 +1632,75 @@ async def run_claude_streaming(
         # salvage killed swarms from) keeps advancing, the swarm IS doing work — extend past the
         # silence cap up to a hard ceiling instead of killing. A genuinely wedged process (no
         # journal progress) still dies at the cap. Mechanical: needs zero discipline from the model.
-        _SILENCE_CAP = 1800        # 30 min of silence with NO detectable progress -> kill
+        # Both caps are per-instance (instance.env), because "how long may a turn be" is a property
+        # of the JOB, not of the code: the game instance is told to go build and test on its own for
+        # hours, and it was being killed at 30 min while genuinely working (a long build/test run
+        # produces no stream output at all).
+        _SILENCE_CAP = int(os.environ.get("LIL_WORKER_SILENCE_CAP_S", "1800"))
         _WF_LIVENESS_WINDOW = 300  # a workflow journal touched within 5 min = "alive"
-        _HARD_CEILING = 10800      # 3 h absolute max, even for a live swarm
+        _HARD_CEILING = int(os.environ.get("LIL_WORKER_HARD_CEILING_S", "10800"))
         _POLL_INTERVAL = 30        # check process every 30s
         _hb_last = 0.0
+        _cpu_last = None           # (timestamp, cpu ticks) of the previous liveness poll
+
+        def _tree_cpu() -> int:
+            """CPU ticks burned by the claude process AND everything it spawned.
+
+            The old liveness test only knew about Workflow journals, so an ordinary long turn —
+            `pytest`, a build, a docker pull, anything that runs for half an hour without printing
+            to OUR stream — looked exactly like a wedged process and was killed. A process tree
+            that is burning CPU is, by definition, not wedged.
+            """
+            try:
+                kids = {}
+                for entry in os.listdir("/proc"):
+                    if not entry.isdigit():
+                        continue
+                    try:
+                        with open(f"/proc/{entry}/stat") as fh:
+                            fields = fh.read().rsplit(") ", 1)[1].split()
+                        kids.setdefault(int(fields[1]), []).append(
+                            (int(entry), int(fields[11]) + int(fields[12])))
+                    except (OSError, IndexError, ValueError):
+                        continue
+                total, stack = 0, [proc.pid]
+                while stack:
+                    for pid, ticks in kids.get(stack.pop(), []):
+                        total += ticks
+                        stack.append(pid)
+                try:                                    # the process itself
+                    with open(f"/proc/{proc.pid}/stat") as fh:
+                        f = fh.read().rsplit(") ", 1)[1].split()
+                    total += int(f[11]) + int(f[12])
+                except (OSError, IndexError, ValueError):
+                    pass
+                return total
+            except Exception:                           # noqa: BLE001 — liveness must never raise
+                return -1
+
+        def _busy() -> bool:
+            """Any sign of real work since the last poll: CPU burned, or a fresh session transcript.
+
+            Fails OPEN (returns True) if it cannot tell, so a broken probe can only make a turn last
+            longer, never kill a working one.
+            """
+            nonlocal _cpu_last
+            cpu = _tree_cpu()
+            if cpu < 0:
+                return True
+            grew = _cpu_last is not None and cpu > _cpu_last
+            _cpu_last = cpu
+            if grew:
+                return True
+            sid = new_session_id or session_id
+            if sid:
+                try:
+                    for tr in (Path.home() / ".claude" / "projects").glob(f"*/{sid}.jsonl"):
+                        if time.time() - tr.stat().st_mtime < _WF_LIVENESS_WINDOW:
+                            return True
+                except Exception:                       # noqa: BLE001
+                    return True
+            return False
 
         def _wf_alive() -> bool:
             """True if a Workflow swarm's journal under the current session advanced recently."""
@@ -1653,15 +1734,17 @@ async def run_claude_streaming(
                     )
                     break
                 elapsed = time.monotonic() - _stream_start
+                _busy()          # sampled every poll, so the CPU delta is against 30s ago
                 if elapsed > _SILENCE_CAP:
-                    alive = _wf_alive()
+                    alive = _wf_alive() or _busy()
                     if alive and elapsed < _HARD_CEILING:
-                        # background swarm is actively working — extend, don't kill.
+                        # a swarm, a build, a test run — something is actually working. Extend.
                         if time.monotonic() - _hb_last > 120:
                             _hb_last = time.monotonic()
-                            logger.info(f"Claude silent {int(elapsed)}s but workflow journal live — extending (hard cap {_HARD_CEILING}s)")
+                            logger.info(f"Claude silent {int(elapsed)}s but the process tree is working — extending (hard cap {_HARD_CEILING}s)")
                         continue
-                    reason = ("⏱ Timeout: Claude не ответил за 30 минут." if elapsed < _HARD_CEILING
+                    reason = (f"⏱ Timeout: Claude молчал {_SILENCE_CAP // 60} мин без единого признака работы."
+                              if elapsed < _HARD_CEILING
                               else f"⏱ Timeout: жёсткий потолок {_HARD_CEILING // 3600}ч исчерпан.")
                     logger.error(f"Claude killed at {int(elapsed)}s (wf_alive={alive})")
                     proc.kill()
@@ -2813,9 +2896,13 @@ async def _notify_finished_jobs(bot: Bot) -> None:
 
 
 async def poll_jobs_loop(bot: Bot) -> None:
-    """Periodic tick: only the privileged (main) instance notifies about finished jobs."""
-    if INSTANCE_NAME != PRIVILEGED_INSTANCE:
-        return
+    """Periodic tick: every instance delivers the jobs in ITS OWN JOBS_DIR.
+
+    This used to be main-only, which combined with a shared jobs directory would have delivered a
+    secondary instance's job into krevetka's chat. Both halves are now per-instance (JOBS_DIR here
+    and in job_ctl.py both hang off DATA_DIR), so an instance can only ever see, poll and report its
+    own jobs — no crossing of chats, bots or doors.
+    """
     while True:
         try:
             await _notify_finished_jobs(bot)
@@ -2846,6 +2933,17 @@ async def main():
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
+    # The watch instance gets a button UI (menu + the verdict buttons under a finding). Included
+    # BEFORE the main router so /start and the callbacks are handled there instead of being sent to
+    # the model; on every other instance the module is never imported, so it cannot affect them.
+    # Failure here must not cost the bot its normal handlers — it degrades to a chat-only watch bot.
+    if INSTANCE_NAME == "watch":
+        try:
+            from watch_ui import router as watch_router
+            dp.include_router(watch_router)
+            print("watch UI: loaded")
+        except Exception as e:                          # noqa: BLE001
+            logger.error(f"watch UI not loaded: {e!r}")
     dp.include_router(router)
 
     print("Bot running. Send a message on Telegram.")

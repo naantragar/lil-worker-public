@@ -425,14 +425,6 @@ ROSTER_ACTIVE_DAYS = 2
 # report itself never reads more than ROSTER_ACTIVE_DAYS.
 REGISTER_FILE_DAYS = 14
 
-# A network that barely spoke gives no evidence either way, and cutting its register on that silence
-# says "these men are gone" when the truth is "we heard almost nothing". On 28.08 that turned
-# 189 мсп (НОВОСЕЛІВКА) into 8 -> 2 off 14 intercepts and 141.500 into 1 -> 0 off SIX — a header
-# with nobody under it. Below this much speech in the activity window the register prints in full.
-# Deliberately NOT applied to nets that did talk: шг 38 омсбр had 144 intercepts and 21k characters
-# and still lost 7 of 8 names, and that cut is honest — those men really were not on the air.
-MIN_ACTIVITY_CHARS = 4000
-
 
 def activity_index(dt_to: str) -> dict[str, dict]:
     """Who has actually been on the air lately, per frequency.
@@ -723,31 +715,9 @@ def _pull_register(con, ids: list[int]) -> tuple[list[tuple[str, str]], list[tup
                 seen[k.lower()] = (k, v)
         return list(seen.values())
 
-    def fold_variants(rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
-        """`СПАРТАК/ПАРТАК` and `СПАРТАК` are ONE man written twice — merge them.
-
-        The analyst records a callsign he has heard two ways as `A/B`, and on another day writes
-        just `A`. Both then stood in the register as separate people (186 мсп printed СПАРТАК and
-        СПАРТАК/ПАРТАК side by side). Rows whose variant sets intersect are folded into the one with
-        the most information: the widest spelling, and the longest role text of the group.
-        """
-        out: list[tuple[set, str, str]] = []
-        for name, role in rows:
-            vs = _variants(name)
-            for i, (seen, kept_name, kept_role) in enumerate(out):
-                if vs & seen:
-                    best_name = kept_name if len(kept_name) >= len(name) else name
-                    best_role = kept_role if len(kept_role) >= len(role) else role
-                    out[i] = (seen | vs, best_name, best_role)
-                    break
-            else:
-                out.append((vs, name, role))
-        return [(n, r) for _v, n, r in out]
-
-    core = fold_variants(pull_roster(core_ids))
-    core_vars = {v for c, _ in core for v in _variants(c)}
-    older = [(c, r) for c, r in fold_variants(pull_roster(ids))
-             if not (_variants(c) & core_vars)]
+    core = pull_roster(core_ids)
+    core_keys = {c.lower() for c, _ in core}
+    older = [(c, r) for c, r in pull_roster(ids) if c.lower() not in core_keys]
     legend = pull("SELECT code, meaning FROM legend WHERE network_id IN ({marks}) ORDER BY id")
     legend = [(c, m) for c, m in legend if m]
     known = known_codes()
@@ -865,7 +835,7 @@ def _age_words(days: float | None) -> str:
 
 
 def build_register_file(registers: dict, nets: list[str], freqs_of: dict[str, list[str]],
-                        dt_from: str, dt_to: str, active: dict | None = None) -> str:
+                        dt_from: str, dt_to: str) -> str:
     """The FULL accumulated register, with the date each man was last on the air.
 
     The report prints only the men confirmed within ROSTER_ACTIVE_DAYS; this file is what makes that
@@ -889,20 +859,11 @@ def build_register_file(registers: dict, nets: list[str], freqs_of: dict[str, li
             continue
         fr = freqs_of.get(net) or []
         ages = last_heard_map(recs, fr, [c for c, _, _ in roster], dt_to)
-        thin = False
-        if active:
-            _n, _blob = heard_on(active, fr)
-            thin = len(_blob) < MIN_ACTIVITY_CHARS
-        if thin:
-            # the report printed this register whole (too little air to judge) — say so here too
-            shown = [(c, r) for c, r, _ in roster]
-        else:
-            shown = [(c, r) for c, r, _ in roster if (ages.get(c) is not None
-                                                     and ages[c] <= ROSTER_ACTIVE_DAYS)]
+        shown = [(c, r) for c, r, _ in roster if (ages.get(c) is not None
+                                                  and ages[c] <= ROSTER_ACTIVE_DAYS)]
         hidden = [(c, r) for c, r, _ in roster if (c, r) not in shown]
         out += ["/".join(fr), net,
-                f"  у звіті ({len(shown)} з {len(roster)})"
-                + ("  [мало ефіру — реєстр не різався]" if thin else "") + ":"]
+                f"  у звіті ({len(shown)} з {len(roster)}):"]
         for c, r in shown:
             out.append(f"    {c + (' - ' + r if r else ''):<58} {_age_words(ages.get(c))}")
         if not shown:
@@ -1128,10 +1089,6 @@ def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
         # heard, so a man who comes back is printed again the same day.
         if ROSTER_ACTIVE_DAYS > 0 and active:
             names, blob = heard_on(active, fr)
-            if len(blob) < MIN_ACTIVITY_CHARS:
-                print(f"реєстр {net[:34]}: НЕ ріжемо — за {ROSTER_ACTIVE_DAYS} доби лише "
-                      f"{len(blob)} симв. ефіру (мало доказів)", file=sys.stderr)
-                names, blob = set(), ""
             if names or blob:        # fail open: an empty lookup must not touch the register
                 kept, dropped = [], []
                 for cs, role, older in roster:
@@ -1353,7 +1310,7 @@ def finish(a, recs: list[dict], units: list[dict], events: list[dict],
 
     try:
         reg_txt = build_register_file(assign_registers(freqs_of), nets_in_report, freqs_of,
-                                      a.dt_from, a.dt_to, activity_index(a.dt_to))
+                                      a.dt_from, a.dt_to)
         (OUT_DIR / f"{a.out}_reestr.txt").write_text(reg_txt)
         print(f"повний реєстр: {a.out}_reestr.txt", file=sys.stderr)
     except Exception as e:                      # noqa: BLE001 — a reference file must not lose a run

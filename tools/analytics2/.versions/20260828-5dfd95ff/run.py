@@ -865,7 +865,7 @@ def _age_words(days: float | None) -> str:
 
 
 def build_register_file(registers: dict, nets: list[str], freqs_of: dict[str, list[str]],
-                        dt_from: str, dt_to: str, active: dict | None = None) -> str:
+                        dt_from: str, dt_to: str) -> str:
     """The FULL accumulated register, with the date each man was last on the air.
 
     The report prints only the men confirmed within ROSTER_ACTIVE_DAYS; this file is what makes that
@@ -889,20 +889,11 @@ def build_register_file(registers: dict, nets: list[str], freqs_of: dict[str, li
             continue
         fr = freqs_of.get(net) or []
         ages = last_heard_map(recs, fr, [c for c, _, _ in roster], dt_to)
-        thin = False
-        if active:
-            _n, _blob = heard_on(active, fr)
-            thin = len(_blob) < MIN_ACTIVITY_CHARS
-        if thin:
-            # the report printed this register whole (too little air to judge) — say so here too
-            shown = [(c, r) for c, r, _ in roster]
-        else:
-            shown = [(c, r) for c, r, _ in roster if (ages.get(c) is not None
-                                                     and ages[c] <= ROSTER_ACTIVE_DAYS)]
+        shown = [(c, r) for c, r, _ in roster if (ages.get(c) is not None
+                                                  and ages[c] <= ROSTER_ACTIVE_DAYS)]
         hidden = [(c, r) for c, r, _ in roster if (c, r) not in shown]
         out += ["/".join(fr), net,
-                f"  у звіті ({len(shown)} з {len(roster)})"
-                + ("  [мало ефіру — реєстр не різався]" if thin else "") + ":"]
+                f"  у звіті ({len(shown)} з {len(roster)}):"]
         for c, r in shown:
             out.append(f"    {c + (' - ' + r if r else ''):<58} {_age_words(ages.get(c))}")
         if not shown:
@@ -1353,7 +1344,7 @@ def finish(a, recs: list[dict], units: list[dict], events: list[dict],
 
     try:
         reg_txt = build_register_file(assign_registers(freqs_of), nets_in_report, freqs_of,
-                                      a.dt_from, a.dt_to, activity_index(a.dt_to))
+                                      a.dt_from, a.dt_to)
         (OUT_DIR / f"{a.out}_reestr.txt").write_text(reg_txt)
         print(f"повний реєстр: {a.out}_reestr.txt", file=sys.stderr)
     except Exception as e:                      # noqa: BLE001 — a reference file must not lose a run

@@ -180,9 +180,9 @@ def main() -> None:
         _block(
             f"Эта команда должна пережить текущий ход ({why}), но запустить её durable-джобом не "
             f"вышло:\n{err[-600:]}\n"
-            "Если это гейт запуска — посмотри `python3 bot/job_ctl.py list`, дождись или отмени "
+            f"Если это гейт запуска — посмотри `python3 {JOB_CTL} list`, дождись или отмени "
             "активную джобу, либо запусти вручную:\n"
-            f"    python3 bot/job_ctl.py launch --cmd '<команда>' --label '{label[:40]}' --wake --force"
+            f"    python3 {JOB_CTL} launch --cmd '<команда>' --label '{label[:40]}' --wake --force"
         )
 
     job_id = out.splitlines()[-1].strip() if out else "(id not reported)"
@@ -193,7 +193,7 @@ def main() -> None:
         f"доложит результат, когда закончит.\n\n"
         f"НЕ запускай её повторно и НЕ жди её. Заверши ответ, сказав пользователю, что задача идёт "
         f"как джоба `{job_id}` и отчёт придёт сам. Проверить ход: "
-        f"`python3 bot/job_ctl.py list`.\n"
+        f"`python3 {JOB_CTL} list`.\n"
         f"Если её вывод нужен ПРЯМО в этом ходе — или это ложное срабатывание (команда просто "
         f"упоминает путь) — перезапусти её, начав строку с `KREVETKA_INLINE_BASH=1 `."
     )

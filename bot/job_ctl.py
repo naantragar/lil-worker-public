@@ -23,8 +23,17 @@ import time
 from pathlib import Path
 
 BOT_DIR = Path(__file__).resolve().parent
-JOBS_DIR = BOT_DIR / "jobs"
-RUN_JOB = JOBS_DIR / "run_job.sh"
+# Jobs are PER INSTANCE, exactly like krevetka.py's own JOBS_DIR (DATA_DIR/"jobs"): each instance
+# polls and delivers only its own directory, so the game instance's jobs can never be reported into
+# krevetka's chat and vice versa. The main instance has no LIL_WORKER_DATA_DIR, so it keeps bot/jobs.
+DATA_DIR = Path(os.environ.get("LIL_WORKER_DATA_DIR") or BOT_DIR)
+JOBS_DIR = DATA_DIR / "jobs"
+# The runner script itself is SHARED code and always lives in the repo — only the job state is
+# per-instance.
+RUN_JOB = BOT_DIR / "jobs" / "run_job.sh"
+# Secondary instances inherit the shared secrets file; their own instance.env may override
+# ALLOWED_USERS, and if it does, that is the owner their jobs report to.
+INSTANCE_ENV = DATA_DIR / "instance.env"
 ENV_FILE = BOT_DIR / ".env"
 
 # `cancelled` is terminal too: a deliberate stop must still be delivered (as a one-line notice, not a
@@ -40,14 +49,15 @@ MAX_GLOBAL_ACTIVE = 3
 
 
 def _env(key: str, default: str = "") -> str:
-    """Read one KEY=value from bot/.env without sourcing it."""
-    try:
-        for line in ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if line.startswith(f"{key}="):
-                return line.split("=", 1)[1]
-    except OSError:
-        pass
+    """Read one KEY=value without sourcing it. The instance's own file wins over the shared one."""
+    for path in (INSTANCE_ENV, ENV_FILE):
+        try:
+            for line in path.read_text().splitlines():
+                line = line.strip()
+                if line.startswith(f"{key}="):
+                    return line.split("=", 1)[1]
+        except OSError:
+            continue
     return default
 
 
