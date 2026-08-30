@@ -6,14 +6,21 @@
     "otherwise die with the turn.",
     "",
     "Add an entry the moment a command turns out to be long-running and worth surviving. `pattern`",
-    "is a Python regex searched against the whole command string, so keep it specific enough that a",
-    "quick `--help` or a grep over the same file does not match by accident.",
+    "is a Python regex searched against the whole command string. It no longer has to defend itself",
+    "against being MENTIONED: the hook now also requires the match to sit in command position,",
+    "right behind an interpreter (python3/bash/sh/./), and refuses to convert when the segment's",
+    "verb only inspects things (ls, grep, cat, git, diff...). `ls tools/analytics_pipeline.sh` was",
+    "launched as a durable job on 30.08.2026 before that existed.",
+    "",
+    "Optional `not_if`: a regex that VETOES the entry — for a flag that makes the same script fast,",
+    "like `--render-only`, which rebuilds a report from saved events in about a second.",
     "",
     "Skipped conversions and launch failures are logged to bot/jobs/durable_bash_hook.log."
   ],
   "commands": [
     {
       "pattern": "tools/analytics2/run\\.py\\s+--(day|from)\\b",
+      "not_if": "--render-only\\b",
       "label": "аналитика: отчёт",
       "why": "прогон отчёта по перехватам идёт десятки минут"
     },

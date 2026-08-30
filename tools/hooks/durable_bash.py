@@ -24,6 +24,17 @@ The honest limit, stated so nobody expects more: an unknown slow script run in t
 covered until it is added to the list. There is no way to know in advance that a command will take
 forty minutes. What is covered is every background command, always, plus everything we have learned.
 
+MENTIONING a long runner is not RUNNING it (fixed 2026-08-30). The registry match used to be a
+plain substring search, so `ls tools/analytics_pipeline.sh` became a durable job — the path was in
+the string, and that was the whole test. A match now has to survive four checks: it must not sit
+inside a quoted string, its segment's verb must not be a mere inspector (ls/grep/cat/git/diff...),
+it must stand in command position behind an interpreter (or be the executable itself), and the entry
+must not be vetoed by its own `not_if` (which is how `--render-only`, a one-second rebuild of the
+same report, stops being treated as a forty-minute run). The check is exercised by 25 cases in
+`tools/hooks/test_durable_bash.py` — ten that must convert, fifteen that must not. Run it after ANY
+change here: the first version of these checks silently stopped converting two REAL runners (an
+absolute path, and a pattern that starts mid-path), and only the case list caught it.
+
 Contract (Claude Code PreToolUse hook — same as durable_swarm.py / selfmod_guard.py):
     stdin  = JSON {tool_name, tool_input, cwd, ...}
     exit 0 = allow;  exit 2 = BLOCK, stderr is shown to the model as the reason
@@ -101,13 +112,95 @@ def _registry() -> list[dict]:
         return []
 
 
+# A registry pattern is a PATH, and a path in a command string is not necessarily a command: on
+# 2026-08-30 a plain `ls tools/analytics_pipeline.sh` was launched as a durable job, because the
+# pattern was searched anywhere in the string. Mentioning a long runner — listing it, grepping it,
+# diffing it, quoting it in an echo — is not running it. Two independent checks now separate the
+# two, and both must pass before anything is converted.
+#
+# 1. The match has to sit where a command sits: at the start of a segment (`;`, `&&`, `||`, `|`,
+#    newline), after the env assignments and wrappers that may precede it, and immediately behind an
+#    interpreter — `python3 X`, `bash X`, `./X`. Everything the registry lists is a script; a script
+#    that is being RUN always has one of those in front of it.
+RE_INVOKED = re.compile(
+    r"(?:^|[;&|]+|\n)\s*"                                  # start of a command segment
+    r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"                  # VAR=value prefixes
+    r"(?:(?:timeout|sudo|nice|ionice|nohup|env|time|stdbuf|setsid)\s+"
+    r"(?:-\S+\s+|\d+(?:\.\d+)?[smhd]?\s+)*)*"              # wrappers with their own flags
+    r"(?:(?:python3?|bash|sh)\s+)?$"                       # interpreter, or the script run directly
+)
+
+
+def _token_start(command: str, idx: int) -> int:
+    """Back up to the start of the whitespace-delimited argument the match landed inside.
+
+    Registry patterns begin mid-path (`tools/analytics_run.py`), so a match can start in the middle
+    of `~/lil_worker/tools/analytics_run.py` — and then the interpreter would be judged
+    against `…/lil_worker/` instead of against `python3 `. Both real long runners were skipped this
+    way the first time the check was written, which is what the case list is for.
+    """
+    while idx > 0 and command[idx - 1] not in " \t\n;&|'\"":
+        idx -= 1
+    return idx
+
+
+def _quoted(prefix: str) -> bool:
+    """Is the match inside a quoted string? Then it is text, not a command — `echo 'python3 x.py'`."""
+    return prefix.count("'") % 2 == 1 or prefix.count('"') % 2 == 1
+# 2. Belt and braces: if the segment's leading verb only LOOKS at things, never convert. These
+#    finish in milliseconds, so a conversion is always wrong, and they are exactly the commands that
+#    carry a long runner's path as an argument.
+READ_ONLY_VERBS = {
+    "ls", "cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "wc", "stat",
+    "file", "find", "echo", "printf", "diff", "cmp", "md5sum", "sha256sum", "readlink", "realpath",
+    "dirname", "basename", "which", "type", "sed", "awk", "git", "cp", "mv", "chmod", "test",
+}
+RE_SEGMENT_HEAD = re.compile(
+    r"(?:^|[;&|]+|\n)\s*"
+    r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"
+    r"(?:(?:timeout|sudo|nice|ionice|nohup|env|time|stdbuf|setsid)\s+"
+    r"(?:-\S+\s+|\d+(?:\.\d+)?[smhd]?\s+)*)*"
+    r"([^\s;&|]+)\s*$"
+)
+
+
+def _verb_before(prefix: str) -> str:
+    """The executable of the segment the match sits in — '' if it cannot be read."""
+    m = RE_SEGMENT_HEAD.search(prefix)
+    return Path(m.group(1)).name if m else ""
+
+
 def _match(command: str) -> dict | None:
     for entry in _registry():
         try:
-            if re.search(entry["pattern"], command):
-                return entry
+            m = re.search(entry["pattern"], command)
         except re.error as e:
             _log(f"bad pattern {entry['pattern']!r}: {e}")
+            continue
+        if not m:
+            continue
+        # A flag that makes the same script fast (`--render-only` rebuilds the files from saved
+        # events with no model calls at all — one second) vetoes the entry.
+        veto = entry.get("not_if")
+        if veto:
+            try:
+                if re.search(veto, command):
+                    _log(f"not converted, `not_if` matched ({veto}): {command[:160]}")
+                    continue
+            except re.error as e:
+                _log(f"bad not_if {veto!r}: {e}")
+        prefix = command[:_token_start(command, m.start())]
+        if _quoted(prefix):
+            _log(f"not converted, the path is inside a quoted string: {command[:160]}")
+            continue
+        verb = _verb_before(prefix)
+        if verb in READ_ONLY_VERBS:
+            _log(f"not converted, `{verb}` only inspects the path: {command[:160]}")
+            continue
+        if not RE_INVOKED.search(prefix):
+            _log(f"not converted, path mentioned but not invoked: {command[:160]}")
+            continue
+        return entry
     return None
 
 
