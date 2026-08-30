@@ -223,22 +223,6 @@ frequency someone is on, and a channel mentioned with nobody moving to it.
 
   The subject has to BE the node (crew / accumulator / position / КНП), not a rifleman attached to
   one. A plan with neither the node nor its new place audible is still not a line.
-- **Стан уваги — не подія.** `посилив пильність`, `наказано бути уважнішим`, `слухає повітря`,
-  `спостерігає`, `зауважень немає`, `обстановка спокійна` — це реакція без жодного спостережуваного
-  змісту: ні руху, ні техніки, ні втрат, ні місця, ні наміру. Перевірка перевіркою: **за всі 13
-  архівних звітів власник не написав слова «пильність» жодного разу.** Отже така фраза — наша
-  вигадка, а не його практика.
-  Найчастіше вона чіпляється ХВОСТОМ до нормального рядка — тоді відрізається саме хвіст, а рядок
-  лишається:
-
-      так:  16:38 «союзники» повідомили про прохід 2 ДРГ СОУ (ім «153») в районі
-      ні:   16:38 «союзники» повідомили … в районі; в\с ТРАП посилив пильність
-
-  Те саме з `зауважень немає` після патрулювання: патрулювання лишається, хвіст іде.
-  Якщо ж уся подія — тільки стан уваги, рядка немає взагалі.
-  **Виняток — коли наказ несе конкретику**, якої без нього не знати: напрямок, причина, названа
-  загроза, час. Тоді пишеться сама конкретика, а не «пильність»: `наказано спостерігати за пн-зх
-  напрямком через прохід ДРГ` — це вже про напрямок і загрозу.
 - Halts, waits and bivouacs on their own — the march simply continues later.
 - Separate lines for the legs of ONE march — see §1, they belong in a single line.
 - Anything whose content cannot be established from the speech.
@@ -320,22 +304,6 @@ The transcript is produced and confirmed by human operators, who mishear and mis
 else, and the speech they are working from is fragmentary. So a name counts only when it is heard
 AS a name. This is not an extra prohibition — it is what «названий», «встановлений» and «розібрати»
 mean everywhere above.
-
-- **ВЕЛИКІ ЛІТЕРИ = позивний або орієнтир. НІЧОГО ІНШОГО.** Owner's rule, 29.08. Caps in a line
-  mean exactly two things: the callsign of a person or unit (`ДЕЦЕЛ`, `ГУСЕЙН`), and the name of a
-  point on the ground (`ор ТАЙМЫР`, `т10`, `НЕМО`). A TYPE of thing — a wire obstacle, a vehicle, a
-  piece of kit, a code word — is written the way the analyst writes it: lower case, in quotes.
-  His own reports are consistent about this: `колючий дріт «Єгоза»`, `«нолик»`, `«воробушек»`,
-  `«пончо, халат»`, `«платье»`, `«пятак»` — never caps.
-
-      так:  переміщення в\с ДЕЦЕЛ повз загородження «ежик» (колючий дріт)
-      ні:   переміщення в\с ДЕЦЕЛ повз загородження «ЕЖИК»
-
-  This is not cosmetic. On 28.08 the line said `загородження «ЕЖИК»` about a man describing the wire
-  beside him («колючка из нержавейки, ежиком называется, вот там я перекурил») — and **ЕЖИК is also
-  a real callsign on our own nets** (`переміщення в\с ПРИМОРЕЦ, ЛИС, ЕЖИК о 05:00`). Caps turned a
-  type of obstacle into a person who exists, which is the worst kind of error this report can make:
-  it reads as fact and it is checkable against nothing.
 
 - **A name is normally a WORD.** Callsigns and point names are ordinary words — animals, objects,
   cities, rivers. A string that is not a word in any language and is not a number is a transcription

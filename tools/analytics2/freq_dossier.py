@@ -38,6 +38,10 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 sys.path.insert(0, str(REPO / "tools"))
 from intercept_parse import parse_message  # noqa: E402
+sys.path.insert(0, str(HERE))
+# One door to the corpus for every tool here: the collector's own messages.db, opened read-only.
+# Kept in run.py so a change of source is a one-line change in one file (see the note there).
+from run import corpus_rows  # noqa: E402
 
 REPORTS_DB = REPO / "knowledge" / "upstream" / "reports.db"
 GRID = re.compile(r"\b\d{2}[A-Z]\s+[A-Z]{2}\s+\d{4,5}\s+\d{4,5}")
@@ -58,17 +62,9 @@ def fetch(freq: float, tol_khz: float) -> list[dict]:
     # channel came back empty while the pipeline saw 58 intercepts on it. The real selection is the
     # tolerance check below; this LIKE only exists to keep the query cheap.
     like = f"{int(freq)}."
-    sql = ("SELECT id || E'\\x01' || replace(coalesce(text,''), E'\\n', E'\\x02') "
-           "FROM source_messages WHERE group_name='PATAGONIA_GP' "
-           f"AND text LIKE '%{like}%' ORDER BY occurred_ts, id")
-    raw = subprocess.run(["docker", "exec", "upstream_db", "psql", "-U", "upstream", "-d", "upstream",
-                          "-At", "-c", sql], capture_output=True, text=True, timeout=300).stdout
     out = []
-    for line in raw.split("\n"):
-        if "\x01" not in line:
-            continue
-        mid, body = line.split("\x01", 1)
-        for r in parse_message(body.replace("\x02", "\n")):
+    for mid, body in corpus_rows("text LIKE ?", (f"%{like}%",)):
+        for r in parse_message(body):
             try:
                 if not r.get("freq") or abs(float(r["freq"]) - freq) * 1000 > tol_khz:
                     continue

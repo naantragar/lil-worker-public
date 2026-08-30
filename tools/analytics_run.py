@@ -27,6 +27,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from intercept_parse import parse_message  # noqa: E402
+sys.path.insert(0, str(HERE / "analytics2"))
+# The corpus door lives in one file for every analytics tool — v1 included, so a source change can
+# never leave the old pipeline reading somewhere else.
+from run import corpus_rows as _corpus_rows, _ms  # noqa: E402
 
 REPO = HERE.parent
 # Results live in the repo, not /tmp: a run costs real model time and must survive a reboot or a
@@ -101,18 +105,12 @@ def fetch(dt_from: str, dt_to: str, by: str = "intercept") -> list[dict]:
     q_lo, q_hi = (lo - timedelta(hours=MARGIN_HOURS), hi + timedelta(hours=MARGIN_HOURS)) \
         if by == "intercept" else (lo, hi)
 
-    sql = (f"SELECT id || E'\\x01' || replace(coalesce(text,''), E'\\n', E'\\x02') "
-           f"FROM source_messages WHERE group_name='PATAGONIA_GP' "
-           f"AND occurred_ts >= '{q_lo:%Y-%m-%d %H:%M}+03' AND occurred_ts < '{q_hi:%Y-%m-%d %H:%M}+03' "
-           f"ORDER BY occurred_ts, id")
-    raw = subprocess.run(["docker", "exec", "upstream_db", "psql", "-U", "upstream", "-d", "upstream",
-                          "-At", "-c", sql], capture_output=True, text=True, timeout=300).stdout
+    # Same corpus as v2 and for the same reason: the collector's own file, not a database a third
+    # party owns. See the note above `corpus_rows` in analytics2/run.py. (This also drops the old
+    # hardcoded `+03`, which was wrong for half the year.)
     out, undated = [], 0
-    for line in raw.split("\n"):
-        if "\x01" not in line:
-            continue
-        mid, body = line.split("\x01", 1)
-        for rec in parse_message(body.replace("\x02", "\n")):
+    for mid, body in _corpus_rows("timestamp >= ? AND timestamp < ?", (_ms(q_lo), _ms(q_hi))):
+        for rec in parse_message(body):
             rec["msg_id"] = mid
             rec["_dt"] = _own_dt(rec)
             if by == "intercept":

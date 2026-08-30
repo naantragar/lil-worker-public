@@ -109,6 +109,30 @@ def register_line(net: dict, line: str) -> str | None:
         return "roster"
     return None
 
+# A line in the register zone that heads neither a roster nor a legend entry is USUALLY the wrapped
+# tail of the entry above it — except that in this whole archive it never once was. Both lines that
+# ever reached here were something else: a standalone observation closing the block (`Відмічено за
+# ідентичні татуювання для о\с 60 мсбр`, REP_12.07 l.217) and a stray clock artefact (`15:23:56`,
+# REP_14.08 l.18). Appending them made «платье» read `пончо, халат Відмічено за ідентичні
+# татуювання…` and «55» read `зрозуміло, прийнято 15:23:56` — the analyst's own words, moved onto a
+# word he never attached them to. So the branch sorts them instead of assuming.
+_RE_NOISE_LINE = re.compile(r"^[\d\s:.,\-–—/]+$")
+
+
+def continuation_kind(line: str) -> str:
+    """"noise" (drop) · "wrap" (tail of the entry above) · "note" (a remark of its own).
+
+    A wrapped tail continues a sentence, so it opens on a lowercase letter or on punctuation; a new
+    sentence opens on a capital. Getting this wrong is cheap in one direction only, which is why the
+    doubt is resolved toward "note": a misjudged wrap still prints, on its own line in the same
+    block, whereas a misjudged note silently rewrites the meaning of a code word.
+    """
+    if _RE_NOISE_LINE.match(line):
+        return "noise"
+    head = line.lstrip("«»\"'(-–— ")[:1]
+    return "wrap" if head and head.islower() else "note"
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS reports (
     id INTEGER PRIMARY KEY, source TEXT UNIQUE, sha256 TEXT, lines INTEGER, chars INTEGER);
@@ -120,6 +144,10 @@ CREATE TABLE IF NOT EXISTS roster (
 CREATE TABLE IF NOT EXISTS legend (
     id INTEGER PRIMARY KEY, network_id INTEGER, code TEXT, meaning TEXT, source_line TEXT);
 CREATE INDEX IF NOT EXISTS ix_legend_code ON legend(code);
+-- A remark the analyst writes on its own line inside the register block, belonging to the NETWORK
+-- rather than to any one callsign or code (`Відмічено за ідентичні татуювання для о\с 60 мсбр`).
+CREATE TABLE IF NOT EXISTS notes (
+    id INTEGER PRIMARY KEY, network_id INTEGER, line_no INTEGER, text TEXT);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY, network_id INTEGER, line_no INTEGER,
     date TEXT, time TEXT, ts TEXT, text TEXT);
@@ -166,7 +194,7 @@ def parse(path: Path) -> dict:
                    "unit": (unit.group(1).strip() if unit else None),
                    "area": (area.group(1).strip() if area else None),
                    "dmr": (dmr.group(1) if dmr else None),
-                   "roster": [], "legend": [], "events": []}
+                   "roster": [], "legend": [], "notes": [], "events": []}
             report["networks"].append(net)
             pending_freqs, last_date, seen_event = None, None, False
             last_kind = None
@@ -204,12 +232,21 @@ def parse(path: Path) -> dict:
         if net["events"]:
             net["events"][-1]["text"] += " " + line
         elif last_kind == "legend" and net["legend"]:
-            net["legend"][-1]["meaning"] += " " + line
+            kind = continuation_kind(line)
+            if kind == "wrap":
+                net["legend"][-1]["meaning"] += " " + line
+            elif kind == "note":
+                net["notes"].append({"line_no": i, "text": line})
         elif last_kind == "roster" and net["roster"] and re.search(r"[а-яёїієґa-z]", line):
             # A wrapped role always carries lowercase words. A line of nothing but capitals —
             # `СЕРБ, СЕДОЙ, МАЛОЙ` — is the station list of a quoted exchange, and appending it made
-            # MARK's "role" a list of three other men.
-            net["roster"][-1]["role"] += " " + line
+            # MARK's "role" a list of three other men. (That guard is why the capitals case never
+            # reaches the sort below: here a "note" can only be a normal sentence.)
+            kind = continuation_kind(line)
+            if kind == "wrap":
+                net["roster"][-1]["role"] += " " + line
+            elif kind == "note":
+                net["notes"].append({"line_no": i, "text": line})
 
     return report
 
@@ -223,7 +260,7 @@ def load(db: sqlite3.Connection, rep: dict) -> None:
         (rep["source"],))]
     if old:
         marks = ",".join("?" * len(old))
-        for t in ("events", "roster", "legend"):
+        for t in ("events", "roster", "legend", "notes"):
             db.execute(f"DELETE FROM {t} WHERE network_id IN ({marks})", old)
         db.execute(f"DELETE FROM networks WHERE id IN ({marks})", old)
     db.execute("DELETE FROM reports WHERE source = ?", (rep["source"],))
@@ -241,6 +278,8 @@ def load(db: sqlite3.Connection, rep: dict) -> None:
                        [(nid, r["callsign"], r["role"]) for r in net["roster"]])
         db.executemany("INSERT INTO legend(network_id, code, meaning, source_line) VALUES (?,?,?,?)",
                        [(nid, l["code"], l["meaning"], l["source_line"]) for l in net["legend"]])
+        db.executemany("INSERT INTO notes(network_id, line_no, text) VALUES (?,?,?)",
+                       [(nid, n["line_no"], n["text"]) for n in net["notes"]])
         for ev in net["events"]:
             c = db.execute("INSERT INTO events(network_id, line_no, date, time, ts, text)"
                            " VALUES (?,?,?,?,?,?)",

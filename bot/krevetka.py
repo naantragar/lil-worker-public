@@ -37,6 +37,7 @@ from aiogram.types import Message, FSInputFile
 from aiogram.filters import Command
 from aiogram.enums import ChatAction
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramRetryAfter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -400,7 +401,20 @@ async def send_files(reply_msg: Message, paths: list[str]):
         seen.add(fpath)
         p = Path(fpath)
         if p.exists():
-            await reply_msg.answer_document(FSInputFile(p))
+            # Same flood-control rule as text: one throttled document must not
+            # abort the loop and swallow the files queued behind it.
+            for attempt in range(1, FLOOD_ATTEMPTS + 1):
+                try:
+                    await reply_msg.answer_document(FSInputFile(p))
+                    break
+                except TelegramRetryAfter as e:
+                    if attempt == FLOOD_ATTEMPTS:
+                        logger.error(f"Flood control: gave up sending {p}")
+                        break
+                    await asyncio.sleep(min(float(e.retry_after or 5) + 0.5, FLOOD_MAX_WAIT))
+                except Exception:
+                    logger.exception(f"Failed to send document {p}")
+                    break
         else:
             logger.warning(f"[FILE] not found: {fpath}")
             try:
@@ -801,15 +815,69 @@ def split_message(text: str, limit: int = TG_MSG_LIMIT) -> list[str]:
     return parts
 
 
+# ── Telegram delivery: flood control must never abort a turn ──────────────────
+# Telegram rate-limits a chat that receives many messages in a row and answers
+# 429 "retry after N". The old fallback re-sent immediately, hit the same wall,
+# and THAT second exception escaped the streaming loop — killing the whole turn,
+# losing the answer and dropping the session (incident 2026-08-30 04:11). So:
+# sit out retry_after for what matters, silently drop what doesn't.
+# Note the explicit parse_mode=None for the plain retry: the Bot's default is
+# HTML, so a bare answer() was never actually plain and re-failed on bad markup.
+
+FLOOD_MAX_WAIT = 30.0   # longest single pause we're willing to sit out
+FLOOD_ATTEMPTS = 3
+
+
+async def _deliver(message: Message, text: str, *, html: bool, attempts: int) -> str:
+    """Send ONE Telegram message. Never raises.
+
+    Returns "sent"; "rejected" (Telegram refused the content itself, e.g. broken
+    HTML — the caller may retry it as plain text); or "flooded" (rate-limited
+    longer than we're willing to wait).
+    """
+    parse_mode = "HTML" if html else None
+    for attempt in range(1, attempts + 1):
+        try:
+            await message.answer(text, parse_mode=parse_mode)
+            return "sent"
+        except TelegramRetryAfter as e:
+            if attempt == attempts:
+                break
+            wait = min(float(e.retry_after or 5) + 0.5, FLOOD_MAX_WAIT)
+            logger.warning(
+                f"Flood control (attempt {attempt}/{attempts}): sleeping {wait:.1f}s"
+            )
+            await asyncio.sleep(wait)
+        except Exception as e:
+            logger.warning(
+                f"Telegram rejected a {parse_mode or 'plain'} message: {type(e).__name__}: {e}"
+            )
+            return "rejected"
+    logger.warning(f"Flood control: dropped a {len(text)}-char message after {attempts} attempt(s)")
+    return "flooded"
+
+
+async def send_notification(message: Message, text: str) -> bool:
+    """A cosmetic message (tool notification / progress line). Dropped rather than
+    waited out — losing one '🔧 ...' line costs nothing, and not queueing on a
+    throttled chat is what leaves room for the answer itself."""
+    status = await _deliver(message, text, html=True, attempts=1)
+    if status == "rejected":
+        status = await _deliver(message, text, html=False, attempts=1)
+    return status == "sent"
+
+
 async def send_long_message(message: Message, text: str):
+    """The actual answer — delivered stubbornly, and never allowed to raise."""
     for part in split_message(text):
         if not part.strip():
             continue
-        try:
-            await message.answer(part, parse_mode="HTML")
-        except Exception:
-            logger.exception("Failed to send with HTML, retrying plain")
-            await message.answer(part)
+        status = await _deliver(message, part, html=True, attempts=FLOOD_ATTEMPTS)
+        if status == "rejected":
+            logger.warning("Failed to send with HTML, retrying plain")
+            status = await _deliver(message, part, html=False, attempts=FLOOD_ATTEMPTS)
+        if status != "sent":
+            logger.error(f"Dropped a {len(part)}-char part of the answer ({status})")
 
 
 # ── Streaming Claude runner ───────────────────────────────────────────────────
@@ -1792,9 +1860,9 @@ async def run_claude_streaming(
                                 if now - last_notif_t > 0.3:
                                     try:
                                         html_chunk = markdown_to_telegram_html(text_chunk)
-                                        await reply_msg.answer(html_chunk, parse_mode="HTML")
                                     except Exception:
-                                        await reply_msg.answer(text_chunk)
+                                        html_chunk = text_chunk
+                                    await send_notification(reply_msg, html_chunk)
                                     last_notif_t = time.monotonic()
                                     _last_visible_t[0] = last_notif_t
                                     summary_sent_this_turn = True
@@ -1806,10 +1874,7 @@ async def run_claude_streaming(
                         if notif:
                             now = time.monotonic()
                             if now - last_notif_t > 0.3:
-                                try:
-                                    await reply_msg.answer(notif, parse_mode="HTML")
-                                except Exception:
-                                    await reply_msg.answer(notif)
+                                await send_notification(reply_msg, notif)
                                 last_notif_t = time.monotonic()
                                 _last_visible_t[0] = last_notif_t
                                 # Re-send typing after notification — Telegram resets it on each message
@@ -1999,13 +2064,10 @@ async def run_codex_streaming(
                 return False
 
             try:
-                if "<" in text and ">" in text:
-                    await reply_msg.answer(text, parse_mode="HTML")
-                else:
-                    html_chunk = markdown_to_telegram_html(text)
-                    await reply_msg.answer(html_chunk, parse_mode="HTML")
+                payload = text if ("<" in text and ">" in text) else markdown_to_telegram_html(text)
             except Exception:
-                await reply_msg.answer(text)
+                payload = text
+            await send_notification(reply_msg, payload)
 
             last_notif_t = time.monotonic()
             _last_visible_t[0] = last_notif_t

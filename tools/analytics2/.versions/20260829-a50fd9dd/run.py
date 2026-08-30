@@ -23,7 +23,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import re
 import shutil
 import sqlite3
@@ -84,91 +83,6 @@ def _own_dt(rec: dict) -> datetime | None:
         return None
 
 
-# ── The corpus: the collector's OWN database, and nothing else ────────────────────────────────────
-# Reporting reads `messages.db` — the SQLite file `wa-monitor` writes as it takes the group off
-# WhatsApp. That file IS the source; every other copy downstream is derived from it.
-#
-# It used to read Postgres instead (`docker exec upstream_db psql`), which made the daily report a
-# dependent of upstream's infrastructure. On 2026-08-30 that dependency bit: upstream's database moved to
-# the host cluster and the container we were querying froze at 04:15 while the air kept running.
-# The report would have been built from an eleven-hour-old copy and said nothing about it. Reading
-# the collector's file removes the whole class of failure: no container, no cluster, no schema, no
-# second party's migration. upstream can be down, moved or rebuilt and the report is unaffected.
-# (It is also FRESHER — a message reaches this file seconds before any downstream copy has it.)
-CORPUS_DB = Path(os.environ.get("UPSTREAM_MESSAGES_DB", "~/wa-monitor/messages.db"))
-CORPUS_GROUP = os.environ.get("UPSTREAM_CORPUS_GROUP", "PATAGONIA_GP")
-
-
-def corpus_rows(where: str, params: tuple) -> list[tuple[str, str]]:
-    """(wa message id, text) for this group, oldest first. READ-ONLY, always.
-
-    Opened `mode=ro` on purpose: the collector is writing to this file at the same moment, and a
-    reporting run must never be able to touch the only copy of the corpus.
-    """
-    if not CORPUS_DB.exists():
-        sys.exit(f"немає бази перехоплень: {CORPUS_DB}")
-    con = sqlite3.connect(f"file:{CORPUS_DB}?mode=ro", uri=True)
-    try:
-        return con.execute(
-            f"SELECT id, coalesce(text,'') FROM messages "
-            f"WHERE group_name = ? AND {where} ORDER BY timestamp, id",
-            (CORPUS_GROUP, *params)).fetchall()
-    finally:
-        con.close()
-
-
-def corpus_latest_ms() -> int | None:
-    """Posting time of the newest message in the corpus, epoch ms — the coverage check's evidence."""
-    if not CORPUS_DB.exists():
-        return None
-    con = sqlite3.connect(f"file:{CORPUS_DB}?mode=ro", uri=True)
-    try:
-        return con.execute("SELECT max(timestamp) FROM messages WHERE group_name = ?",
-                           (CORPUS_GROUP,)).fetchone()[0]
-    finally:
-        con.close()
-
-
-def _ms(dt: datetime) -> int:
-    """A naive Kyiv wall-clock time -> epoch ms, the way the collector stamps it.
-
-    The zone is applied per timestamp rather than as a fixed offset: Kyiv is +03 from April to
-    October and +02 the rest of the year, and a hardcoded offset puts every boundary an hour out
-    for half the year.
-    """
-    return int(dt.replace(tzinfo=KYIV).timestamp() * 1000)
-
-
-# How far the corpus may lag behind the end of the reported window before the run refuses to build.
-# Measured, not guessed: over the 14 days to 30.08.2026 the largest single gap in this group was
-# 27m53s (20.08) and the usual daily maximum is 9-21 min, so 40 minutes never fires on real silence.
-# The failure this guards against is not a crash — it is a report that quietly covers half a day and
-# says nothing about the other half (30.08: the database it read froze at 04:15 and no one was told).
-CORPUS_LAG_MAX_MIN = int(os.environ.get("UPSTREAM_CORPUS_LAG_MAX_MIN", "40"))
-
-
-def check_coverage(dt_to: str, allow_stale: bool = False) -> None:
-    """Refuse to build a report the corpus cannot actually cover."""
-    latest = corpus_latest_ms()
-    if latest is None:
-        msg = f"корпус порожній або недоступний: {CORPUS_DB}"
-        sys.exit(msg) if not allow_stale else print(f"УВАГА: {msg}", file=sys.stderr)
-        return
-    seen = datetime.fromtimestamp(latest / 1000, KYIV)
-    hi = datetime.strptime(dt_to, "%Y-%m-%d %H:%M").replace(tzinfo=KYIV)
-    lag_min = (hi - seen).total_seconds() / 60
-    print(f"корпус: {CORPUS_DB.name}, останнє повідомлення {seen:%d.%m %H:%M:%S}", file=sys.stderr)
-    if lag_min > CORPUS_LAG_MAX_MIN:
-        line = (f"корпус не покриває вікно: останнє повідомлення {seen:%d.%m %H:%M}, "
-                f"а вікно закінчується {hi:%d.%m %H:%M} — розрив {lag_min/60:.1f} год. "
-                f"Збирач стоїть або файл не той.")
-        if allow_stale:
-            print(f"УВАГА: {line} Продовжую, бо задано --allow-stale.", file=sys.stderr)
-        else:
-            sys.exit(f"{line}\nПеревір: systemctl status upstream-collector. "
-                     f"Свідомо зібрати попри це: --allow-stale")
-
-
 def fetch(dt_from: str, dt_to: str) -> list[dict]:
     """Pull the window by INTERCEPT time, not posting time.
 
@@ -179,10 +93,25 @@ def fetch(dt_from: str, dt_to: str) -> list[dict]:
     lo = datetime.strptime(dt_from, "%Y-%m-%d %H:%M")
     hi = datetime.strptime(dt_to, "%Y-%m-%d %H:%M")
     q_lo, q_hi = lo - timedelta(hours=MARGIN_HOURS), hi + timedelta(hours=MARGIN_HOURS)
+    # The window is given in the analyst's own clock — Kyiv. The database stores UTC. The offset used
+    # to be hardcoded `+03`, which is right only from April to October: after the autumn change Kyiv
+    # is EET/+02 and every boundary would have been an hour out. Derived from the zone per timestamp
+    # instead, so the switch passes unnoticed.
+    def _pg(dt: datetime) -> str:
+        return dt.replace(tzinfo=KYIV).strftime("%Y-%m-%d %H:%M%z")
 
+    sql = (f"SELECT id || E'\\x01' || replace(coalesce(text,''), E'\\n', E'\\x02') "
+           f"FROM source_messages WHERE group_name='PATAGONIA_GP' "
+           f"AND occurred_ts >= '{_pg(q_lo)}' AND occurred_ts < '{_pg(q_hi)}' "
+           f"ORDER BY occurred_ts, id")
+    raw = subprocess.run(["docker", "exec", "upstream_db", "psql", "-U", "upstream", "-d", "upstream",
+                          "-At", "-c", sql], capture_output=True, text=True, timeout=300).stdout
     out, undated = [], 0
-    for mid, body in corpus_rows("timestamp >= ? AND timestamp < ?", (_ms(q_lo), _ms(q_hi))):
-        for rec in parse_message(body):
+    for line in raw.split("\n"):
+        if "\x01" not in line:
+            continue
+        mid, body = line.split("\x01", 1)
+        for rec in parse_message(body.replace("\x02", "\n")):
             rec["msg_id"] = mid
             rec["_dt"] = _own_dt(rec)
             if rec["_dt"] is None:
@@ -364,20 +293,6 @@ def extract_json(s: str) -> list[dict]:
         return json.loads(m.group(0))
     except json.JSONDecodeError:
         return []
-
-
-# A TYPE of obstacle/kit written in caps reads as a callsign, and some of these words ARE callsigns
-# on our own nets (ЕЖИК). The model is told this in rules.md; this is the mechanical backstop, kept
-# deliberately narrow — it only fires when the word stands right after the noun that makes it a
-# type, so a real man named ЕЖИК moving past something is never touched.
-_TYPE_WORDS = r"їжак|ежик|єгоза|егоза|спіраль|спираль|мзп|колючк\w*|дріт|проволок\w*"
-_TYPE_IN_CAPS = re.compile(
-    rf"(загородженн\w*|дріт\w*|колюч\w*|перешкод\w*)(\s+)«({_TYPE_WORDS})»", re.I)
-
-
-def lower_type_names(text: str) -> str:
-    """`загородження «ЕЖИК»` -> `загородження «ежик»` — a type is not a name."""
-    return _TYPE_IN_CAPS.sub(lambda m: f"{m.group(1)}{m.group(2)}«{m.group(3).lower()}»", str(text or ""))
 
 
 # ─── union across passes ───────────────────────────────────────────────────────────────────────
@@ -751,7 +666,7 @@ def assign_registers(freqs_of: dict[str, list[str]]) -> dict[str, tuple[list, li
     return out
 
 
-def _pull_register(con, ids: list[int]) -> tuple[list[tuple[str, str, bool]], list[tuple[str, str]], list[str]]:
+def _pull_register(con, ids: list[int]) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     """Roster and legend for one network of this report, from the archived analyst reports.
 
     The roster comes back in two parts, CORE FIRST: the list as the analyst last wrote it for this
@@ -837,24 +752,9 @@ def _pull_register(con, ids: list[int]) -> tuple[list[tuple[str, str, bool]], li
     legend = [(c, m) for c, m in legend if m]
     known = known_codes()
     legend = [(c, m) for c, m in legend if not (_variants(c) & known)]
-    # A remark the analyst wrote on its own line under the register — it belongs to the NETWORK, not
-    # to any callsign or code, and it used to be swallowed as the tail of whatever legend entry stood
-    # above it (`«платье» - «пончо, халат» Відмічено за ідентичні татуювання для о\с 60 мсбр`).
-    # Deduped on the text: the same remark repeats across his reports for the same net.
-    notes, seen_notes = [], set()
-    try:
-        rows = con.execute(f"SELECT text FROM notes WHERE network_id IN ({marks}) ORDER BY id",
-                           ids).fetchall()
-    except sqlite3.Error:
-        rows = []          # a base imported before notes existed — the register still prints
-    for (t,) in rows:
-        t = " ".join(str(t or "").split())
-        if t and t.lower() not in seen_notes:
-            seen_notes.add(t.lower())
-            notes.append(t)
     # (callsign, role, is_older) — is_older marks a name the analyst had on this net BEFORE his last
     # report; those are the only ones the activity check may drop.
-    return ([(c, r, False) for c, r in core] + [(c, r, True) for c, r in older], legend, notes)
+    return [(c, r, False) for c, r in core] + [(c, r, True) for c, r in older], legend
 
 
 def archive_records(callsign: str) -> list[tuple[str, str, str, str]]:
@@ -899,7 +799,7 @@ def build_dupes_file(registers: dict, nets: list[str], dt_from: str, dt_to: str)
     """
     where: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for net in nets:
-        roster, _, _ = registers.get(net, ([], [], []))
+        roster, _ = registers.get(net, ([], []))
         for cs, role, _older in roster:
             where[cs.upper()].append((net, role))
     dupes = {c: v for c, v in where.items() if len(v) > 1}
@@ -984,7 +884,7 @@ def build_register_file(registers: dict, nets: list[str], freqs_of: dict[str, li
            f"у звіт друкуються ті, кого чути за {ROSTER_ACTIVE_DAYS} доби; решта — тут",
            f"давність рахується за {REGISTER_FILE_DAYS} діб назад", ""]
     for net in nets:
-        roster, _legend, _notes = registers.get(net, ([], [], []))
+        roster, _legend = registers.get(net, ([], []))
         if not roster:
             continue
         fr = freqs_of.get(net) or []
@@ -1150,18 +1050,8 @@ def unattended_networks(units: list[dict], events: list[dict]) -> list[tuple]:
     return rows
 
 
-def unattributed_nets(events: list[dict]) -> dict[str, list[dict]]:
-    """Events whose network header names no formation — kept out of the report, filed separately."""
-    out: dict[str, list[dict]] = defaultdict(list)
-    for e in events:
-        net = e.get("_net") or ""
-        if net and not unit_tags(net):
-            out[net].append(e)
-    return dict(out)
-
-
 def build_quiet_file(silent: list[tuple[str, int, datetime, str]], unattended: list[tuple],
-                     dt_from: str, dt_to: str, unattributed: dict | None = None) -> str:
+                     dt_from: str, dt_to: str) -> str:
     """A SEPARATE file, deliberately not part of the report (owner, 2026-08-25).
 
     It answers a different question from the report — not what happened, but where nothing did. Two
@@ -1182,14 +1072,6 @@ def build_quiet_file(silent: list[tuple[str, int, datetime, str]], unattended: l
                    f"останній {last:%d.%m.%Y %H:%M}")
 
     out += ["", "", "=== 2. ПРАЦЮВАЛИ, АЛЕ ЖОДНОЇ ПОДІЇ У ЗВІТІ", ""]
-    if unattributed:
-        out += ["", "=== 3. БЕЗ ПРИВ'ЯЗКИ (шапка не називає частину — у звіт не йде)", ""]
-        for net, evs in unattributed.items():
-            out.append(f"{net}  ({len(evs)} подій)")
-            for e in sorted(evs, key=lambda x: str(x.get("time"))):
-                out.append(f"    {e.get('time')} {e.get('text')}")
-            out.append("")
-
     if not unattended:
         out.append("(немає)")
     for net, n, chars, first, last, freqs in unattended:
@@ -1229,16 +1111,6 @@ def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
     styled += [(f"на {dt_to[11:16]} {datetime.strptime(dt_to, '%Y-%m-%d %H:%M'):%d.%m.%Y}",
                 False, True), ("", False, False)]
 
-    # Owner's rule (29.08): «Частоти без прив'язки не кидати в звіт». A header that names no
-    # formation — `УКХ р/м НВ підрозділу 141.500 МГц` — is a frequency we hear and have not yet
-    # attributed. A block under it says somebody moved somewhere and nothing about whose movement it
-    # was, which is the one thing the report is for. Set aside, not deleted: the events go to the
-    # companion _silent.txt so the net can be attributed and enter the next report properly.
-    unattributed = {n: evs for n, evs in by_net.items() if not unit_tags(n)}
-    for n, evs in list(unattributed.items()):
-        print(f"без прив'язки, не йде у звіт: {n[:60]} ({len(evs)} подій)", file=sys.stderr)
-        by_net.pop(n, None)
-
     registers = assign_registers(freqs_of)
     for i, net in enumerate(order_networks(by_net)):
         evs = sorted(by_net[net], key=lambda e: stamp(e.get("time")) or 0)
@@ -1250,7 +1122,7 @@ def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
         styled.append((net, True, False))
 
         # The register goes between the header and the events, exactly where the analyst keeps it.
-        roster, legend, notes = registers.get(net, ([], [], []))
+        roster, legend = registers.get(net, ([], []))
         # Every name has to prove it is still on the air, the analyst's last list included. What the
         # filter removes is not lost — it stands in `<out>_reestr.txt` with the date it was last
         # heard, so a man who comes back is printed again the same day.
@@ -1274,11 +1146,7 @@ def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
             styled.append((f"{cs} - {role}" if role else cs, False, False))
         for code, meaning in legend:
             styled.append((f"«{code}» - {meaning}" if meaning else f"«{code}»", False, False))
-        # The analyst's own network-level remarks close the block, on their own lines — which is
-        # exactly where he wrote them, under the legend and above the events.
-        for note in notes:
-            styled.append((note, False, False))
-        if roster or legend or notes:
+        if roster or legend:
             styled.append(("", False, False))
 
         groups: dict[str, list[dict]] = defaultdict(list)
@@ -1288,9 +1156,6 @@ def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
             if k not in groups:
                 order.append(k)
             groups[k].append(e)
-        for e in evs:
-            if e.get("text"):
-                e["text"] = lower_type_names(e["text"])
         for k in order:
             for n, e in enumerate(groups[k]):
                 line = f"{e.get('time','')} {e.get('text','')}".strip()
@@ -1344,8 +1209,6 @@ def main() -> None:
     # of model time, and re-running would also silently produce DIFFERENT events (the model is not
     # deterministic), which makes a rendering change impossible to judge. This replays the saved
     # events instead: same facts, new presentation.
-    ap.add_argument("--allow-stale", action="store_true",
-                    help="зібрати звіт, навіть якщо корпус не покриває вікно (за замовчуванням - відмова)")
     ap.add_argument("--render-only", action="store_true",
                     help="rebuild the files from an existing <out>_events.json, no model calls")
     # The collector lags 25-30 minutes behind the group, so the last half hour of a window closing at
@@ -1382,7 +1245,6 @@ def main() -> None:
     if a.lead_in:
         print(f"вікно {a.dt_from} - {a.dt_to}, читаємо з {read_from} "
               f"(перекриття {a.lead_in} хв на затримку колектора)", file=sys.stderr)
-    check_coverage(a.dt_to, allow_stale=a.allow_stale or a.render_only)
     recs = fetch(read_from, a.dt_to)
     units = units_of_work(recs)
     nets = {u["net"] for u in units}
@@ -1499,12 +1361,8 @@ def finish(a, recs: list[dict], units: list[dict], events: list[dict],
 
     quiet = silent_networks(recs, a.dt_from)
     idle = unattended_networks(units, events)
-    unattr = unattributed_nets(events)
     (OUT_DIR / f"{a.out}_silent.txt").write_text(
-        build_quiet_file(quiet, idle, a.dt_from, a.dt_to, unattr))
-    if unattr:
-        print(f"без прив'язки: {len(unattr)} мереж, "
-              f"{sum(len(v) for v in unattr.values())} подій — у {a.out}_silent.txt", file=sys.stderr)
+        build_quiet_file(quiet, idle, a.dt_from, a.dt_to))
     print(f"замовкли: {len(quiet)}   працювали без жодної події: {len(idle)}", file=sys.stderr)
     (OUT_DIR / f"{a.out}_events.json").write_text(json.dumps(events, ensure_ascii=False, indent=2))
     docx = out.with_suffix(".docx")
@@ -1514,8 +1372,7 @@ def finish(a, recs: list[dict], units: list[dict], events: list[dict],
     except Exception as e:                      # a failed export must not lose the run
         print(f"docx не вийшов: {e!r}", file=sys.stderr)
         docx = None
-    print(f"\nподій: {len(events)}   мереж у звіті: "
-          f"{len({e.get('_net') for e in events} - set(unattr))}   "
+    print(f"\nподій: {len(events)}   мереж у звіті: {len({e.get('_net') for e in events})}   "
           f"час моделі: {spent:.0f}s\nзвіт: {out}" + (f"\ndocx: {docx}" if docx else ""),
           file=sys.stderr)
 
