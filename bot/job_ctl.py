@@ -150,11 +150,18 @@ def reap_all() -> list[str]:
 
 def origin_key(spec: dict) -> str:
     """Which conversation a job reports back to. The launch gate is scoped by THIS, not global:
-    rooms now run in parallel, so a swarm from one room must not block a swarm from another."""
+    rooms now run in parallel, so a swarm from one room must not block a swarm from another.
+
+    The Telegram key carries the INSTANCE as well as the user (2026-08-31). Two Telegram bots of
+    mine — the main one and `twin` — are the same owner uid, so keying on the uid alone made them
+    one origin: a report running in the twin blocked a swarm launched here, and whichever poller
+    ticked first delivered the other's result into the wrong chat. Specs written before this key
+    existed have no `instance` and fall back to the original instance, which is what they were.
+    """
     rt = spec.get("reply_to") or {}
     if rt.get("door") == "matrix":
         return f"matrix:{rt.get('room_id', '')}"
-    return f"telegram:{rt.get('uid', spec.get('owner_uid', ''))}"
+    return f"telegram:{rt.get('instance', 'lil_worker')}:{rt.get('uid', spec.get('owner_uid', ''))}"
 
 
 def _active_jobs() -> list[Path]:
@@ -176,7 +183,10 @@ def cmd_launch(args: argparse.Namespace) -> None:
     if _door == "matrix":
         reply_to = {"door": "matrix", "room_id": os.environ.get("KREVETKA_ROOM", "")}
     else:
-        reply_to = {"door": "telegram", "uid": owner}
+        # Which Telegram bot launched this — the env var instance.sh sets, defaulting to the
+        # original instance for the main bot (which sets nothing).
+        reply_to = {"door": "telegram", "uid": owner,
+                    "instance": os.environ.get("LIL_WORKER_INSTANCE", "lil_worker")}
     my_origin = origin_key({"reply_to": reply_to, "owner_uid": owner})
 
     if not args.force:

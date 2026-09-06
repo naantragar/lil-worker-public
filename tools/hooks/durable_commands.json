@@ -1,43 +1,53 @@
 {
-  "_readme": [
-    "Commands that must ALWAYS run as a durable job, even in the foreground — read by",
-    "tools/hooks/durable_bash.py. Anything with run_in_background:true is converted regardless of",
-    "this list; this file exists for the long runners that get started in the foreground and would",
-    "otherwise die with the turn.",
-    "",
-    "Add an entry the moment a command turns out to be long-running and worth surviving. `pattern`",
-    "is a Python regex searched against the whole command string. It no longer has to defend itself",
-    "against being MENTIONED: the hook now also requires the match to sit in command position,",
-    "right behind an interpreter (python3/bash/sh/./), and refuses to convert when the segment's",
-    "verb only inspects things (ls, grep, cat, git, diff...). `ls tools/analytics_pipeline.sh` was",
-    "launched as a durable job on 30.08.2026 before that existed.",
-    "",
-    "Optional `not_if`: a regex that VETOES the entry — for a flag that makes the same script fast,",
-    "like `--render-only`, which rebuilds a report from saved events in about a second.",
-    "",
-    "Skipped conversions and launch failures are logged to bot/jobs/durable_bash_hook.log."
-  ],
-  "commands": [
-    {
-      "pattern": "tools/analytics2/run\\.py\\s+--(day|from)\\b",
-      "not_if": "--render-only\\b",
-      "label": "аналитика: отчёт",
-      "why": "прогон отчёта по перехватам идёт десятки минут"
-    },
-    {
-      "pattern": "tools/analytics_run\\.py\\s+--from|tools/analytics_pipeline\\.sh",
-      "label": "аналитика v1",
-      "why": "старый конвейер аналитики идёт десятки минут"
-    },
-    {
-      "pattern": "tools/analytics_sense\\.py\\s+--from",
-      "label": "аналитика: смысловой проход",
-      "why": "проход по всему окну идёт долго"
-    },
-    {
-      "pattern": "analytics2/movement_count\\.py[^|;]*--freq",
-      "label": "аналітика: підрахунок переміщень о/с",
-      "why": "один виклик моделі на добу на частоту — десятки хвилин, і 28.08 такий прогон загинув разом із рестартом бота; шаблон вимагає --freq, щоб згадка шляху не конвертувалась"
-    }
-  ]
+ "_readme": [
+  "Commands that must ALWAYS run as a durable job, even in the foreground — read by",
+  "tools/hooks/durable_bash.py. Anything with run_in_background:true is converted regardless of",
+  "this list; this file exists for the long runners that get started in the foreground and would",
+  "otherwise die with the turn.",
+  "",
+  "Add an entry the moment a command turns out to be long-running and worth surviving. `pattern`",
+  "is a Python regex searched against the whole command string. It no longer has to defend itself",
+  "against being MENTIONED: the hook now also requires the match to sit in command position,",
+  "right behind an interpreter (python3/bash/sh/./), and refuses to convert when the segment's",
+  "verb only inspects things (ls, grep, cat, git, diff...). `ls tools/analytics_pipeline.sh` was",
+  "launched as a durable job on 30.08.2026 before that existed.",
+  "",
+  "Optional `not_if`: a regex that VETOES the entry — for a flag that makes the same script fast,",
+  "like `--render-only`, which rebuilds a report from saved events in about a second.",
+  "",
+  "Skipped conversions and launch failures are logged to bot/jobs/durable_bash_hook.log."
+ ],
+ "commands": [
+  {
+   "pattern": "tools/analytics2/run\\.py\\s+--(day|from)\\b",
+   "not_if": "--render-only\\b",
+   "label": "аналитика: отчёт",
+   "why": "прогон отчёта по перехватам идёт десятки минут"
+  },
+  {
+   "pattern": "tools/analytics_run\\.py\\s+--from|tools/analytics_pipeline\\.sh",
+   "label": "аналитика v1",
+   "why": "старый конвейер аналитики идёт десятки минут"
+  },
+  {
+   "pattern": "tools/analytics_sense\\.py\\s+--from",
+   "label": "аналитика: смысловой проход",
+   "why": "проход по всему окну идёт долго"
+  },
+  {
+   "pattern": "analytics2/movement_count\\.py[^|;]*--freq",
+   "label": "аналітика: підрахунок переміщень о/с",
+   "why": "один виклик моделі на добу на частоту — десятки хвилин, і 28.08 такий прогон загинув разом із рестартом бота; шаблон вимагає --freq, щоб згадка шляху не конвертувалась"
+  },
+  {
+   "pattern": "callsign_roles/(infer_role|calibrate)\\.py",
+   "label": "ролі позивних: вивід/калібрування",
+   "why": "один виклик моделі на позивного, 164 позивних - години"
+  },
+  {
+   "pattern": "callsign_roles/(daily\\.sh|dossier\\.py)",
+   "label": "досьє позивних: згортання",
+   "why": "лічильник ефіру читає весь корпус, це хвилини"
+  }
+ ]
 }

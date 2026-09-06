@@ -45,11 +45,14 @@ inst_log()  { echo "$INSTANCES_DIR/$1/lil_worker.log"; }
 
 resolve_model() {
   # Короткие алиасы → полные id; иначе как есть; пусто → sonnet
+  # Keep these in step with CLAUDE.md's model list. They drifted a whole generation behind once
+  # (opus still meant 4-8 after opus 5 shipped), and the failure is silent: the instance is simply
+  # created on an older model and nobody notices.
   case "$1" in
-    opus)   echo "claude-opus-4-8" ;;
-    sonnet) echo "claude-sonnet-4-6" ;;
+    opus)   echo "claude-opus-5" ;;
+    sonnet) echo "claude-sonnet-5" ;;
     haiku)  echo "claude-haiku-4-5" ;;
-    "")     echo "claude-sonnet-4-6" ;;
+    "")     echo "claude-sonnet-5" ;;
     *)      echo "$1" ;;
   esac
 }

@@ -35,7 +35,15 @@ SYSTEM_PROMPT = (
     "Markdown is rendered to Matrix HTML, so use it normally. Media works like on Telegram: to send a "
     "file use a line `[FILE /absolute/path]`; to send a voice note use `[VOICE lang=\"ru\"]текст[/VOICE]` "
     "at the END of the reply — ONLY when the user explicitly asks for a voice message. Do not send "
-    "files unless asked."
+    "files unless asked.\n\n"
+    "MODEL — this room has its OWN dial, and you may throw it yourself. The room id is in the env as "
+    "$KREVETKA_ROOM and `tools/room_model.py` defaults to it, so no arguments are needed: "
+    "`python3 tools/room_model.py show` · `... set claude-sonnet-5 [--effort medium]` · `... clear` "
+    "(back to the global bot/model_config.json). It applies to the NEXT message in THIS room only — "
+    "no restart, and neither Telegram nor the other rooms move. So in Matrix a bare `opus` / "
+    "`sonnet` / `haiku` message switches THIS room, NOT the global config; edit bot/model_config.json "
+    "only when the user clearly means everywhere. Switch yourself too when the work calls for it "
+    "(a long grind is cheaper on sonnet; hard reasoning wants opus) — say in one line that you did."
 )
 
 _MEDIA = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp"}

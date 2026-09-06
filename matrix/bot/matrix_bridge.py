@@ -643,7 +643,16 @@ async def _turn_audio(room_id: str, event: RoomMessageAudio) -> None:
             text = await media.transcribe(str(p))
         except Exception as e:
             _log(f"voice: transcription FAILED after {_since(t1)}", repr(e))
-            await _send_text(room_id, f"⚠️ ошибка транскрипции: {e}")
+            # Keep the audio when we could not read it. Deleting it here destroyed the only copy of
+            # a note the sender may not be able to resend cheaply — this door exists precisely
+            # because the big ones do not fit through Telegram.
+            try:
+                INBOX.mkdir(parents=True, exist_ok=True)
+                kept = INBOX / f"voice_{int(time.time())}.ogg"
+                p.rename(kept)
+                await _send_text(room_id, f"⚠️ ошибка транскрипции: {e}\nаудио сохранил: {kept}")
+            except OSError:
+                await _send_text(room_id, f"⚠️ ошибка транскрипции: {e}")
             return
         finally:
             try: p.unlink()

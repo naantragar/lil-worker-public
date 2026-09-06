@@ -49,6 +49,52 @@ def _client() -> openai.AsyncOpenAI:
     return openai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 
+# OpenAI's audio endpoint refuses anything over 25 MB. Matrix accepts uploads up to 100 MiB, so
+# this door lets through notes Telegram's 20 MB bot cap never could — the first 28 MB one would
+# have died with a 413 and taken the audio with it (the caller unlinks the temp file either way).
+# Fix in two steps, cheapest first: re-encode to 16 kHz mono Opus (speech loses nothing, a 28 MB
+# note lands in single-digit MB), and only if that still does not fit, cut it into pieces and
+# stitch the transcripts back together.
+_API_LIMIT = 24 * 1024 * 1024
+_SEGMENT_S = 900
+
+
+def _ffmpeg(*args: str) -> bool:
+    import subprocess
+    try:
+        r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *args],
+                           capture_output=True, timeout=900)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _fit_for_api(path: str) -> list[str]:
+    """The chunk(s) to actually send: [path] if it already fits, else a shrunk copy, else segments."""
+    try:
+        if os.path.getsize(path) <= _API_LIMIT:
+            return [path]
+    except OSError:
+        return [path]
+    stem = path.rsplit(".", 1)[0]
+    small = f"{stem}_16k.ogg"
+    opus = ("-vn", "-ac", "1", "-ar", "16000", "-c:a", "libopus", "-b:a", "24k")
+    if _ffmpeg("-i", path, *opus, small):
+        try:
+            if 0 < os.path.getsize(small) <= _API_LIMIT:
+                return [small]
+        except OSError:
+            pass
+    src = small if os.path.exists(small) and os.path.getsize(small) > 0 else path
+    if _ffmpeg("-i", src, *opus, "-f", "segment", "-segment_time", str(_SEGMENT_S),
+               f"{stem}_part_%03d.ogg"):
+        import glob
+        parts = sorted(glob.glob(f"{stem}_part_*.ogg"))
+        if parts:
+            return parts
+    return [src]
+
+
 async def transcribe(path: str) -> str:
     """Voice → text via OpenAI (same model as the Telegram bot, same language config)."""
     tcfg = {}
@@ -65,24 +111,40 @@ async def transcribe(path: str) -> str:
     )
     if tcfg.get("language"):
         kwargs["language"] = tcfg["language"]
-    async def _run(model_name: str) -> str:
+    async def _run_one(model_name: str, src: str) -> str:
         kw = dict(kwargs, model=model_name)
-        with open(path, "rb") as f:
+        with open(src, "rb") as f:
             kw["file"] = f
             return ((await _client().audio.transcriptions.create(**kw)).text or "").strip()
 
-    text = await _run(kwargs["model"])
-    # Silent-truncation guard, same as the Telegram door: these models stop early on long audio and
-    # still return 200. Russian speech is ~10-14 chars/s, so anything under 5 c/s did not finish.
-    min_cps = float(os.environ.get("MIN_CHARS_PER_SECOND", "5"))
-    if _dur_s > 60 and len(text) < _dur_s * min_cps:
-        try:
-            alt = await _run(os.environ.get("FALLBACK_VOICE_MODEL", "whisper-1"))
-            if len(alt) > len(text):
-                text = alt
-        except Exception:
-            pass
-    return text
+    chunks = _fit_for_api(path)
+
+    async def _run(model_name: str) -> str:
+        out = []
+        for c in chunks:
+            out.append(await _run_one(model_name, c))
+        return " ".join(t for t in out if t).strip()
+
+    try:
+        text = await _run(kwargs["model"])
+        # Silent-truncation guard, same as the Telegram door: these models stop early on long audio
+        # and still return 200. Russian speech is ~10-14 chars/s, so under 5 c/s did not finish.
+        min_cps = float(os.environ.get("MIN_CHARS_PER_SECOND", "5"))
+        if _dur_s > 60 and len(text) < _dur_s * min_cps:
+            try:
+                alt = await _run(os.environ.get("FALLBACK_VOICE_MODEL", "whisper-1"))
+                if len(alt) > len(text):
+                    text = alt
+            except Exception:
+                pass
+        return text
+    finally:
+        for c in chunks:
+            if c != path:
+                try:
+                    os.unlink(c)
+                except OSError:
+                    pass
 
 
 async def synthesize(text: str, speed: float = 1.0) -> Path | None:

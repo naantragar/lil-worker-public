@@ -93,20 +93,44 @@ INBOX_ALLOWED_SUFFIXES = {
 }
 # Office documents: text inside a zip, so they belong in the inbox — but they carry embedded images
 # and easily pass the 512 KB meant for scripts, while the TEXT in them is small. Own, larger cap.
-# Read them with `python3 tools/docx_text.py <path>` (stdlib only; images ignored).
+# Read them with `python3 tools/docx_text.py <path>` (stdlib only; images ignored) — the Read tool
+# sees only zip bytes.
 # .docm is a .docx with a macro blob inside; we unzip and read word/document.xml and never
 # execute anything, so it is exactly as safe to accept and needs no conversion by the sender.
-INBOX_DOC_SUFFIXES = {".docx", ".docm", ".odt"}
+# Spreadsheets belong here too (2026-09-03): same zipped-XML shape, same reason for the larger cap,
+# and nothing in them is ever executed — a .xlsm macro blob is read past exactly like a .docm one.
+# docx_text.py reads them through the same door (their text lives in xl/sharedStrings.xml, so
+# unzipping a sheet by hand gives rows of empty cells); to EDIT a sheet, use openpyxl.
+INBOX_DOC_SUFFIXES = {".docx", ".docm", ".odt", ".xlsx", ".xlsm", ".ods", ".csv"}
 INBOX_DOC_MAX_BYTES = 20 * 1024 * 1024   # Telegram's own bot-API download ceiling
+# Images sent as an uncompressed FILE. Telegram calls them documents, but the useful thing about an
+# image is that the model can SEE it, so they go to the vision path instead of the inbox reader —
+# and a copy is kept in .inbox so a path exists for later work. This is the only way to hand over a
+# picture Telegram has not recompressed (a `photo` is always a re-encoded jpeg).
+INBOX_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+# Anthropic's per-image ceiling for a base64 block, and the long edge above which it downscales
+# anyway — so shrinking an oversized file here costs no detail the model would have seen.
+IMAGE_API_MAX_BYTES = 5 * 1024 * 1024
+IMAGE_LONG_EDGE = 1568
+DEFAULT_IMAGE_CAPTION = "Describe this image."
 # The same ceiling, named for what it actually is: getFile refuses anything larger, for documents
 # and voice alike. A local telegram-bot-api server would raise it to 2 GB.
 TG_GETFILE_LIMIT = 20 * 1024 * 1024
 
-# Self-modification is allowed ONLY from the privileged (default) instance.
+# Self-modification is allowed ONLY from a privileged instance.
 # Secondary instances get a PreToolUse guard (selfmod_guard.py) that blocks edits to
 # krevetka's own code/persona, while staying full-power for their own project work.
-PRIVILEGED_INSTANCE = "lil_worker"
-ALLOW_SELF_MODIFICATION = INSTANCE_NAME == PRIVILEGED_INSTANCE
+#
+# A SET, not one name (2026-08-31): `twin` is a deliberate second door into the SAME brain — same
+# repo, same knowledge, same right to change my code — and differs only by chat, session and the
+# reminder line it prints. The guard's baseline forbids ALL writes inside the repo, which would
+# stop the twin from doing the very work it exists for (the daily report writes into
+# knowledge/upstream/reports_out, and report work regularly means editing tools/analytics2). A cap
+# wide enough for that is just full rights with extra failure modes, so the twin is privileged and
+# the separation of duties is the owner's discipline, not a lock.
+PRIVILEGED_INSTANCES = {"lil_worker", "twin", "twin2"}
+PRIVILEGED_INSTANCE = "lil_worker"          # the default/original one, kept for messages
+ALLOW_SELF_MODIFICATION = INSTANCE_NAME in PRIVILEGED_INSTANCES
 SELFMOD_GUARD_PATH = CODE_DIR / "selfmod_guard.py"
 
 # Optional per-instance reasoning effort (set in instance.env as LIL_WORKER_EFFORT).
@@ -215,11 +239,22 @@ at a fraction of the tokens of raw HTML, and its browser method renders JS/SPA p
 WebFetch and WebSearch cover one-off lookups and search; the deep-research skill covers multi-source
 research reports.
 
-There is NO local headless-browser bridge installed on this machine, so browser AUTOMATION is not
-available: clicking, typing, scrolling, running JS inside a page, and staying logged in across steps
-cannot be done. Do not go looking for one and do not try to start one. If a task genuinely requires
-driving an authenticated web UI (e.g. clicking through a dashboard with no API to trigger an export),
-say so plainly and let the user decide whether to install a browser bridge — never improvise one.
+To SEE a page rather than read it — my own frontend after a deploy, a layout I just changed, an SPA
+that renders nothing without JS — there IS a headless browser on this box (Playwright + Chromium),
+and it can log in and hold the session:
+
+    node ~/.krevetka-browser/page_view.mjs '<URL>' [--only desktop|mobile] [--full]
+
+It prints JSON with the screenshot paths (open them with Read), console errors and mobile overflow.
+For a site with credentials in /root/.krevetka-secrets/ it authenticates through that site's ordinary
+login and caches the session, so no help is needed to look at a page behind a login. Sibling script
+render_check.mjs does the same for a local HTML file. Details: knowledge/browser-runtime.md.
+
+Do not ship a layout I only reasoned about: if a width, a position or a wrap is a guess, LOOK first.
+
+What is still absent is a long interactive drive of a third-party UI (many dependent clicks through
+someone else's dashboard). Fetching, rendering, screenshotting and simple navigation are covered; a
+multi-step click-through of an external product is not — say so plainly rather than improvising one.
 
 Only public HTTPS URLs. Never place tokens, keys, or secrets in a URL you fetch.
 """.strip()
@@ -266,11 +301,29 @@ def provider_unavailable_message(provider: str, details: str) -> str:
     )
 
 
+def _instance_prompt() -> str:
+    """Extra system prompt for THIS instance, read fresh on every turn.
+
+    Instances are otherwise identical — same repo, same CLAUDE.md, same tools — and differ only by
+    chat and session. This is the one place an instance can carry its own standing behaviour:
+    `<data dir>/prompt.md`. Read every turn on purpose, so tuning it means editing the file and
+    sending the next message — no restart, no turn lost. Mirrors the Matrix door's room profiles.
+
+    Any error is swallowed: a broken file must degrade to the plain krevetka, never to a dead bot.
+    """
+    try:
+        return (DATA_DIR / "prompt.md").read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
 def build_provider_system_prompt(lang: str) -> str:
+    extra = _instance_prompt()
     return (
         f"IMPORTANT: The user's message is in {lang}. You MUST reply in {lang}.\n\n"
         f"{RUNTIME_IDENTITY_PROMPT}\n\n"
         f"{WEB_ACCESS_SYSTEM_PROMPT}"
+        + (f"\n\n{extra}" if extra else "")
     )
 
 
@@ -1487,6 +1540,45 @@ def _get_media_type(path: str) -> str:
             "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/jpeg")
 
 
+def _shrink_image_if_needed(path: str) -> str:
+    """Return a path safe to send as a base64 image block — the original when it already is.
+
+    A picture sent as an uncompressed FILE is routinely a 6-12 MB camera shot, well over the API's
+    5 MB per-image ceiling, and the whole request would fail with nothing to show for the upload.
+    Anything wider than ~1568 px is downscaled by the API regardless, so re-encoding here loses no
+    detail the model would have seen. The original is left untouched (it may be the .inbox copy the
+    user asked us to keep); the shrunk twin is a temp file the caller deletes.
+    """
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    if ext == "gif":
+        return path                     # re-encoding would flatten an animation; leave it alone
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return path
+    try:
+        from PIL import Image
+    except ImportError:
+        return path                     # no Pillow: let an oversized image fail loudly upstream
+    try:
+        with Image.open(path) as im:
+            if size <= IMAGE_API_MAX_BYTES and max(im.size) <= IMAGE_LONG_EDGE:
+                return path
+            scale = min(1.0, IMAGE_LONG_EDGE / max(im.size))
+            if scale < 1.0:
+                im = im.resize((max(1, round(im.width * scale)), max(1, round(im.height * scale))),
+                               Image.LANCZOS)
+            im = im.convert("RGB")
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as out:
+                im.save(out.name, "JPEG", quality=88)
+                logger.info(f"IMAGE shrunk {path} ({size} B) -> {out.name} "
+                            f"({os.path.getsize(out.name)} B)")
+                return out.name
+    except Exception:
+        logger.exception(f"Failed to shrink image {path}")
+        return path
+
+
 def _build_image_stdin(prompt: str, files: list[str]) -> bytes:
     """Build a stream-json stdin message with base64-encoded images + text prompt.
 
@@ -2301,9 +2393,14 @@ async def cmd_status(message: Message):
     )
 
 
-async def _flush_photo_buffer(user_id: int, bot: Bot):
-    """Called after PHOTO_DEBOUNCE_DELAY — downloads all buffered photos and sends to Claude."""
-    await asyncio.sleep(PHOTO_DEBOUNCE_DELAY)
+async def _flush_photo_buffer(user_id: int, bot: Bot, delay: float = PHOTO_DEBOUNCE_DELAY):
+    """Called after the debounce delay — downloads all buffered images and sends them to Claude.
+
+    The delay is a parameter because uncompressed image FILES are slow to upload: a Telegram photo
+    album lands within ~1s, but two 8 MB files can be four seconds apart, and a too-short window
+    would split one gesture into two turns.
+    """
+    await asyncio.sleep(delay)
 
     buf = _photo_buffer.pop(user_id, None)
     if not buf:
@@ -2311,30 +2408,45 @@ async def _flush_photo_buffer(user_id: int, bot: Bot):
 
     reply_msg: Message = buf["reply_msg"]
     caption = buf["caption"]
-    photo_ids: list[str] = buf["photos"]
-    tmp_paths: list[str] = []
+    # (file_id, suffix, keep_path|None) — keep_path is set for an image sent as a FILE, which we
+    # save under .inbox instead of a temp file so the agent can still reach it after the turn.
+    items: list[tuple[str, str, Path | None]] = buf["photos"]
+    paths: list[str] = []        # what the model actually sees
+    to_delete: list[str] = []    # temps we own and must clean up
+    saved: list[str] = []        # .inbox copies that stay on disk
 
-    # Download all photos
-    for file_id in photo_ids:
+    # Download everything in the buffer
+    for file_id, suffix, keep_path in items:
         try:
             file = await bot.get_file(file_id)
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-                await bot.download_file(file.file_path, tmp.name)
-                tmp_paths.append(tmp.name)
+            if keep_path is not None:
+                keep_path.parent.mkdir(parents=True, exist_ok=True)
+                await bot.download_file(file.file_path, destination=str(keep_path))
+                src = str(keep_path)
+                saved.append(src)
+            else:
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                    await bot.download_file(file.file_path, tmp.name)
+                src = tmp.name
+                to_delete.append(src)
+            shrunk = _shrink_image_if_needed(src)
+            if shrunk != src:
+                to_delete.append(shrunk)
+            paths.append(shrunk)
         except Exception:
-            logger.exception(f"Failed to download photo {file_id}")
+            logger.exception(f"Failed to download image {file_id}")
 
-    if not tmp_paths:
+    if not paths:
         await reply_msg.answer("❌ Не вдалося завантажити фото.")
         return
 
+    tmp_paths = paths
     count = len(tmp_paths)
     logger.info(f"PHOTO BATCH uid={user_id}, count={count}, caption={caption[:60]!r}")
 
-    if count == 1:
-        await reply_msg.answer("📷 Отримав фото, обробляю...")
-    else:
-        await reply_msg.answer(f"📷 Отримав {count} фото, обробляю...")
+    icon, word = ("🖼", "зображення") if saved else ("📷", "фото")
+    await reply_msg.answer(f"{icon} Отримав {word}, обробляю..." if count == 1
+                           else f"{icon} Отримав {count} {word}, обробляю...")
 
     provider = get_active_provider(user_id)
     session_id = get_session_id(user_id, provider)
@@ -2344,14 +2456,20 @@ async def _flush_photo_buffer(user_id: int, bot: Bot):
     else:
         prompt = f"I'm sending you {count} images at once. {caption}"
 
-    lang = detect_language(caption) if caption != "Describe this image." else "Russian"
+    if saved:
+        listing = "\n".join(f"  {p}" for p in saved)
+        prompt += ("\n\nIt was sent as an uncompressed FILE and the original is kept on disk at:\n"
+                   f"{listing}\nUse that path if the work needs the file itself; you can see the "
+                   "image above either way.")
+
+    lang = detect_language(caption) if caption != DEFAULT_IMAGE_CAPTION else "Russian"
 
     response, new_session_id, streamed_files = await run_provider_streaming(
         provider, prompt, session_id, reply_msg, bot, files=tmp_paths, lang=lang
     )
 
-    # Cleanup temp files
-    for p in tmp_paths:
+    # Cleanup temp files — only the ones we created. An .inbox copy is deliberately kept.
+    for p in to_delete:
         try:
             os.unlink(p)
         except OSError:
@@ -2386,15 +2504,15 @@ async def handle_photo(message: Message, bot: Bot):
     if user_id in _photo_buffer:
         # Add to existing buffer
         _photo_buffer[user_id]["task"].cancel()
-        _photo_buffer[user_id]["photos"].append(photo.file_id)
+        _photo_buffer[user_id]["photos"].append((photo.file_id, ".jpg", None))
         # Caption from first photo with a caption wins
-        if message.caption and _photo_buffer[user_id]["caption"] == "Describe this image.":
+        if message.caption and _photo_buffer[user_id]["caption"] == DEFAULT_IMAGE_CAPTION:
             _photo_buffer[user_id]["caption"] = message.caption
         logger.info(f"PHOTO uid={user_id} buffered #{len(_photo_buffer[user_id]['photos'])}")
     else:
         _photo_buffer[user_id] = {
-            "photos": [photo.file_id],
-            "caption": message.caption or "Describe this image.",
+            "photos": [(photo.file_id, ".jpg", None)],
+            "caption": message.caption or DEFAULT_IMAGE_CAPTION,
             "reply_msg": message,
         }
         logger.info(f"PHOTO uid={user_id} first in buffer")
@@ -2631,7 +2749,10 @@ async def _run_doc_turn(user_id: int, batch: dict, bot: Bot):
         head
         + "Read them, then act. If it is a spec/TZ, work through it; if it is a script, review "
           "it and explain or run it only when that is clearly what was asked. Never execute an "
-          "attached script blindly.\n\n"
+          "attached script blindly.\n"
+          "An office file (.docx .docm .odt .xlsx .xlsm .ods) is a zip — the Read tool sees only "
+          "bytes. Read it with `python3 tools/docx_text.py <path>`; edit a spreadsheet with "
+          "openpyxl.\n\n"
         + (f"The user's instruction with the files:\n{caption}" if caption else no_caption)
     )
 
@@ -2656,21 +2777,60 @@ async def _run_doc_turn(user_id: int, batch: dict, bot: Bot):
     await send_files(message, streamed_files + file_paths)
 
 
+async def _accept_image_document(message: Message, bot: Bot, doc, name: str, suffix: str):
+    """Route an image sent as an uncompressed file into the vision pipeline.
+
+    It shares the photo buffer, so a picture dropped next to a photo (or a whole album of files)
+    arrives as one turn with everything visible at once. The download itself happens in the flush,
+    into .inbox rather than a temp file: sending an image as a file usually means the file matters,
+    and a path that survives the turn is what lets the work continue on it.
+    """
+    user_id = message.from_user.id
+    if (doc.file_size or 0) > TG_GETFILE_LIMIT:
+        await message.answer(f"❌ Картинка больше {TG_GETFILE_LIMIT // 1024 // 1024} МБ — "
+                             f"столько Telegram не отдаёт ботам. Кинь её как фото.")
+        return
+
+    dest = INBOX_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}_{name}"
+    logger.info(f"IMAGE DOC uid={user_id} {name} ({doc.file_size} bytes) -> {dest}")
+
+    buf = _photo_buffer.get(user_id)
+    if buf is not None:
+        buf["task"].cancel()
+        buf["photos"].append((doc.file_id, suffix, dest))
+        if message.caption and buf["caption"] == DEFAULT_IMAGE_CAPTION:
+            buf["caption"] = message.caption
+    else:
+        buf = _photo_buffer[user_id] = {
+            "photos": [(doc.file_id, suffix, dest)],
+            "caption": message.caption or DEFAULT_IMAGE_CAPTION,
+        }
+    buf["reply_msg"] = message                  # answer under the LAST image of the burst
+    buf["task"] = asyncio.create_task(_flush_photo_buffer(user_id, bot, delay=DOC_BATCH_WAIT))
+
+
 @router.message(F.document)
 async def handle_document(message: Message, bot: Bot):
     """Accept a text/spec/script file, save it into the project's .inbox/ and hand the PATH to
     the agent. The file is never executed — the agent reads it and decides what to do."""
     user_id = message.from_user.id
     if not is_allowed(user_id):
-        await message.answer("Not authorized.")
+        # Silent, like every other handler. Answering "Not authorized." confirmed to a stranger
+        # that a live bot is behind this token; the rest of the bot has always just returned.
         return
 
     doc = message.document
     name = _safe_inbox_name(doc.file_name)
     suffix = Path(name).suffix.lower()
 
+    # An image sent as a FILE is not inbox material — the model should SEE it, so it joins the
+    # same buffer photos use (an album of files therefore stays ONE turn).
+    if suffix in INBOX_IMAGE_SUFFIXES:
+        await _accept_image_document(message, bot, doc, name, suffix)
+        return
+
     if suffix not in INBOX_ALLOWED_SUFFIXES and suffix not in INBOX_DOC_SUFFIXES:
-        allowed = " ".join(sorted(INBOX_ALLOWED_SUFFIXES | INBOX_DOC_SUFFIXES))
+        allowed = " ".join(sorted(INBOX_ALLOWED_SUFFIXES | INBOX_DOC_SUFFIXES | INBOX_IMAGE_SUFFIXES))
         await message.answer(f"❌ Не принимаю файлы <code>{suffix or 'без расширения'}</code>.\n"
                              f"Можно: {allowed}")
         return
@@ -2908,7 +3068,14 @@ async def _notify_finished_jobs(bot: Bot) -> None:
             spec = {}
         # A job launched from a Matrix room reports back THERE (the bridge's own poller delivers it).
         # Leave it untouched — don't mark notified — so the Matrix side can pick it up.
-        if (spec.get("reply_to") or {}).get("door") == "matrix":
+        _reply_to = spec.get("reply_to") or {}
+        if _reply_to.get("door") == "matrix":
+            continue
+        # Same partitioning between the Telegram bots: several instances share one owner uid and
+        # one jobs dir, so without this the first poller to tick delivers everybody's results into
+        # its own chat. Each bot takes only what it launched; specs older than the key are the
+        # original instance's.
+        if _reply_to.get("instance", PRIVILEGED_INSTANCE) != INSTANCE_NAME:
             continue
         owner = spec.get("owner_uid")
         if owner not in ALLOWED_USERS:
@@ -3041,9 +3208,16 @@ async def main():
             pass
     for uid in ALLOWED_USERS:
         try:
-            await bot.send_message(uid, startup_msg)
-        except Exception:
-            pass
+            # parse_mode=None: this text is whatever I wrote into restart_reason.txt, and I write it
+            # as plain prose. The Bot's default is HTML, so one file path with `<n>` in it made
+            # Telegram reject the whole message as an unsupported start tag — and the except below
+            # ate it, so the ONE message that confirms a restart worked vanished with no trace
+            # (2026-08-31: the twin restart looked like a bot that never came back).
+            await bot.send_message(uid, startup_msg, parse_mode=None)
+        except Exception as e:
+            # Still never fatal — a failed notification must not stop the bot from starting — but it
+            # is logged now. A silent pass here is indistinguishable from a dead bot.
+            logger.warning(f"startup notification to {uid} failed: {type(e).__name__}: {e}")
 
     # PRIMARY liveness: load-immune OS-thread heartbeat (stamps HEARTBEAT_FILE). Started before the
     # first heavy work and kept alive for the whole run; run.sh trusts this for "process alive".
