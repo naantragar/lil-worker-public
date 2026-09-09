@@ -37,7 +37,7 @@ from aiogram.types import Message, FSInputFile
 from aiogram.filters import Command
 from aiogram.enums import ChatAction
 from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramRetryAfter, TelegramNetworkError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -781,7 +781,23 @@ class TelegramRenderer(mistune.HTMLRenderer):
         return f"• {text}\n"
 
     def block_code(self, code, info=None, **attrs):
-        return f"<pre>{html.escape(code.strip())}</pre>\n\n"
+        # `<pre><code class="language-X">`, NOT a bare `<pre>`. The nested tag with a language class
+        # is what makes Telegram render the block with a native COPY BUTTON — and on the MOBILE
+        # clients it is the only thing that does. A bare `<pre>` looks identical on desktop (which
+        # is why this went unnoticed for months) but on the phone it is dead: tapping it does
+        # nothing, and selecting text grabs the whole message instead of the block. Reported by the
+        # owner 08.09.2026, when he could not copy an admin command out of his own phone.
+        # The whole point of the copy-block convention — one intercept, one message, one tap — was
+        # therefore only ever working on half his devices.
+        # Default `plaintext`, NOT `text`. Measured on the owner's Android client 09.09.2026:
+        # `text` renders the header and NO copy button — the one dead word among the candidates.
+        # `plaintext`, `txt`, `bash`, `ini`, `yaml` all showed COPY CODE. Of those, `bash` tints
+        # numbers, which mangles exactly what matters in an intercept block (time, frequency, grid
+        # coordinates); the rest render clean. So: `plaintext` — button, no highlighting, readable
+        # header. Never fall back to `text` again.
+        lang = re.sub(r"[^a-zA-Z0-9+#._-]", "",
+                      str(info or "").split()[0] if info else "") or "plaintext"
+        return f'<pre><code class="language-{lang}">{html.escape(code.strip())}</code></pre>\n\n'
 
     def codespan(self, text):
         return f"<code>{html.escape(text)}</code>"
@@ -858,10 +874,18 @@ def split_message(text: str, limit: int = TG_MSG_LIMIT) -> list[str]:
         if cut < limit // 4:
             cut = limit
         chunk = text[:cut]
+        # Code blocks are now `<pre><code class="language-X">…</code></pre>` (the nested tag is what
+        # gives Telegram its copy button). A split inside one must therefore close BOTH tags and
+        # reopen BOTH, and the reopened half has to carry the same language — closing only `</pre>`
+        # left an orphan `<code>` and Telegram rejects the whole message as bad HTML.
         open_pre = chunk.count("<pre>") - chunk.count("</pre>")
         if open_pre > 0:
-            chunk += "</pre>"
-            text = "<pre>" + text[cut:].lstrip("\n")
+            opens = re.findall(r'<pre><code class="language-([^"]*)">', chunk)
+            lang = opens[-1] if opens else "text"
+            nested = chunk.count("<code") - chunk.count("</code>") > 0
+            chunk += ("</code></pre>" if nested else "</pre>")
+            head = f'<pre><code class="language-{lang}">' if nested else "<pre>"
+            text = head + text[cut:].lstrip("\n")
         else:
             text = text[cut:].lstrip("\n")
         parts.append(chunk)
@@ -884,9 +908,20 @@ FLOOD_ATTEMPTS = 3
 async def _deliver(message: Message, text: str, *, html: bool, attempts: int) -> str:
     """Send ONE Telegram message. Never raises.
 
-    Returns "sent"; "rejected" (Telegram refused the content itself, e.g. broken
-    HTML — the caller may retry it as plain text); or "flooded" (rate-limited
+    Returns "sent"; "rejected" (Telegram refused the CONTENT, e.g. broken HTML — the caller may
+    retry it as plain text); "network" (the transport broke — see below); or "flooded" (rate-limited
     longer than we're willing to wait).
+
+    **"network" is NOT "rejected", and the difference is the whole point of this function.** A
+    transport failure means the send may have SUCCEEDED ANYWAY — the message left, the connection
+    died before the confirmation came back. Retrying it in another format therefore duplicates it,
+    and the duplicate is the ugly one, because the fallback strips the markup.
+
+    That is not hypothetical. 09.09.2026, 15:25: the watchdog restarted the bot mid-send, the
+    connection dropped (`TelegramNetworkError: ServerDisconnectedError`), the old bare `except`
+    called it "rejected", and the caller re-sent the whole answer as plain text. The owner received
+    it twice — once rendered correctly, once as a wall of raw `<b>` and `&quot;`. The first copy had
+    arrived perfectly.
     """
     parse_mode = "HTML" if html else None
     for attempt in range(1, attempts + 1):
@@ -901,6 +936,17 @@ async def _deliver(message: Message, text: str, *, html: bool, attempts: int) ->
                 f"Flood control (attempt {attempt}/{attempts}): sleeping {wait:.1f}s"
             )
             await asyncio.sleep(wait)
+        except TelegramNetworkError as e:
+            # Transport, not content. Retry the SAME format under the remaining budget; never hand
+            # this back as "rejected", or the caller will reformat and duplicate it.
+            if attempt == attempts:
+                logger.warning(f"Network error, giving up after {attempts}: {type(e).__name__}: {e}")
+                return "network"
+            logger.warning(
+                f"Network error (attempt {attempt}/{attempts}), retrying same format: "
+                f"{type(e).__name__}: {e}"
+            )
+            await asyncio.sleep(min(2.0 * attempt, FLOOD_MAX_WAIT))
         except Exception as e:
             logger.warning(
                 f"Telegram rejected a {parse_mode or 'plain'} message: {type(e).__name__}: {e}"
@@ -926,6 +972,9 @@ async def send_long_message(message: Message, text: str):
         if not part.strip():
             continue
         status = await _deliver(message, part, html=True, attempts=FLOOD_ATTEMPTS)
+        # ONLY on "rejected". A "network" result may mean the part already arrived, so reformatting
+        # and re-sending it produces a raw-HTML duplicate of a message the owner already has.
+        # Losing a part is the lesser harm, and the log line below says which one.
         if status == "rejected":
             logger.warning("Failed to send with HTML, retrying plain")
             status = await _deliver(message, part, html=False, attempts=FLOOD_ATTEMPTS)
@@ -1627,6 +1676,18 @@ async def run_claude_streaming(
     """
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
+    # Both of these are PER-COMMAND markers for tools/hooks/durable_bash.py, and neither may ever be
+    # ambient. If one leaks into the bot's own environment every claude -p inherits it, the hook
+    # passes through on EVERY command, and the durable-job protection is silently off for the whole
+    # life of the process — no error, no log line, nothing to notice.
+    #
+    # That is not hypothetical: it happened on 09.09.2026. A `bot/run.sh restart` was typed from a
+    # shell that had `KREVETKA_INLINE_BASH=1` in front of it (the habit this file already warns
+    # about), the bot inherited it, and from then on the daily report ran as an ordinary foreground
+    # command instead of a durable job. It was found only because the report went 120 s and the
+    # harness backgrounded it — the safety net was gone and nothing said so.
+    for _leak in ("KREVETKA_INLINE_BASH", "KREVETKA_JOB_ID"):
+        env.pop(_leak, None)
 
     _current_model = load_claude_model()
     logger.info(f"Model config: {_current_model}")

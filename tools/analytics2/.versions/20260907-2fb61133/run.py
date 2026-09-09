@@ -565,20 +565,6 @@ def merge_by_source(events: list[dict]) -> tuple[list[dict], list[tuple[dict, di
 # with an empty station list on every intercept.
 SIBLING_MIN_NAMES = 4
 
-# The overlap is measured over THIS many days, not over the report's own window. Measured 08.09 on
-# the two pairs we care about, the one-day number is not noisy - it is biased LOW, structurally:
-#
-#                  1 день   7 днів   18 днів
-#     70 мсп        33%      60%      60%
-#     1198 мсп      40%      80%      71%
-#
-# Both cross the "probably one net" line at seven days and stay there; at one day both read
-# "невизначено". A daily note built on one window would therefore accumulate thirty low readings and
-# converge on the wrong answer - the opposite of why it was written. Seven days is where both
-# stabilise; the report already reads REGISTER_FILE_DAYS (14) for the register file, so this costs
-# less than something we do already.
-SIBLING_WINDOW_DAYS = 7
-
 MOVEMENT = re.compile(r"переміщенн|маршрут|прибутт|виїха|вийшов|рухаєт|відійш", re.I)
 
 MARCH_SYSTEM = """Ти зводиш РОЗІРВАНИЙ МАРШ в один рядок звіту.
@@ -1056,13 +1042,13 @@ def assign_registers(freqs_of: dict[str, list[str]]) -> dict[str, tuple[list, li
 
     out: dict[str, tuple[list, list]] = {}
     for net, ids in owned.items():
-        out[net] = apply_external_notes(net, _pull_register(con, ids), freqs_of.get(net))
+        out[net] = apply_external_notes(net, _pull_register(con, ids))
     # A net that owns no archive network still deserves the notes: `1 шр "V"` may be in this
     # report while the archive has nothing to hand it, and the analyst's own description of its
     # commander must not fall through that gap.
     for net in freqs_of:
         if net not in out:
-            reg = apply_external_notes(net, ([], [], []), freqs_of.get(net))
+            reg = apply_external_notes(net, ([], [], []))
             if reg[0]:
                 out[net] = reg
     return out
@@ -1099,7 +1085,7 @@ def _formation_matches(formation: str, header: str) -> bool:
     return all(t in h for t in re.split(r"\s+", str(formation or "").casefold()) if t)
 
 
-def apply_external_notes(net: str, reg: tuple, freqs: list[str] | None = None) -> tuple:
+def apply_external_notes(net: str, reg: tuple) -> tuple:
     """Overlay the live-analyst notes onto one report block's roster.
 
     A man who ALREADY stands in this block's roster has his role REPLACED - the note outranks the
@@ -1124,15 +1110,6 @@ def apply_external_notes(net: str, reg: tuple, freqs: list[str] | None = None) -
     for rec in notes:
         if not _formation_matches(rec.get("formation", ""), net):
             continue
-        # A formation is too coarse an anchor for a man who has to be INSERTED. `ША` scoped to
-        # `70 мсп` landed in four of its nets at once - the same spread that `add_to_net` was
-        # invented to stop for `БОРЕЦ`. `freqs` pins a note to the block that actually carries his
-        # channel; without it the note stays formation-wide, which is right for a correction.
-        if want := rec.get("freqs"):
-            mine = [float(x) for x in (freqs or []) if _is_float(x)]
-            if not any(abs(float(w) - m) * 1000 <= FREQ_TOL_KHZ
-                       for w in want if _is_float(w) for m in mine):
-                continue
         names = [rec.get("callsign", "")] + list(rec.get("aliases") or [])
         role = " ".join(str(rec.get("role") or "").split())
         hit = next((idx[n.upper()] for n in names if n.upper() in idx), None)
@@ -1142,14 +1119,10 @@ def apply_external_notes(net: str, reg: tuple, freqs: list[str] | None = None) -
             roster.append((rec.get("callsign", ""), role, False))
             _log_note(f"{rec.get('callsign')} ДОДАНО до {netlabel(net, 40)} - {role}")
         else:
-            was = str(roster[hit][1] or "")
-            # An empty role in a note is deliberate - it says "this man exists, we do NOT know his
-            # job" (ША). It must never wipe a role the archive does have.
-            if not role:
-                continue
+            was = str(roster[hit][1] or "—")
             roster[hit] = (roster[hit][0], role, roster[hit][2])
             if was.casefold() != role.casefold():
-                _log_note(f"{roster[hit][0]} у {netlabel(net, 40)} «{was or '—'}» -> «{role}»")
+                _log_note(f"{roster[hit][0]} у {netlabel(net, 40)} «{was}» -> «{role}»")
     return roster, legend, remarks
 
 
@@ -1500,9 +1473,7 @@ def build_sibling_nets_section(events: list[dict], freqs_of: dict[str, list[str]
             split[f] = (group, pairs)
     head = ["", "", "Блоки цього звіту, що називають ОДНУ частину, але друкуються окремо",
             "довідка для нас, у звіт НЕ йде; нічого не зливається",
-            "спільні кореспонденти - єдина ознака, що це справді одна мережа",
-            f"ефір рахується за {SIBLING_WINDOW_DAYS} діб назад, не за вікно звіту: за одну добу "
-            f"перетин занижений структурно (70 мсп: 33% за добу проти 60% за тиждень)", ""]
+            "спільні кореспонденти - єдина ознака, що це справді одна мережа", ""]
     if not split:
         return "\n".join(head + ["Таких блоків немає."]) + "\n"
 
@@ -1519,21 +1490,22 @@ def build_sibling_nets_section(events: list[dict], freqs_of: dict[str, list[str]
             out.append(f"    {'/'.join(freqs_of.get(net, [])) or '?'} - імен {len(sets[net])} "
                        f"(у реєстрі {len(roster)}, чути в цьому вікні {len(air)}) | шапка: {depth}")
         for a, b in pairs:
-            A, B = sets[a], sets[b]
-            inter = A & B
-            small = min(len(A), len(B))
-            fa, fb = "/".join(freqs_of.get(a, [])), "/".join(freqs_of.get(b, []))
-            if small < SIBLING_MIN_NAMES:
-                out.append(f"    {fa} ∩ {fb}: ВИСНОВКУ НЕМАЄ - імен лише {small}, "
-                           f"нуль спільних тут означає брак даних, а не різні мережі")
-                continue
-            pct = 100 * len(inter) / small
-            verdict = ("ІМОВІРНО ОДНА МЕРЕЖА" if pct >= 50 and len(inter) >= 3
-                       else "різні мережі однієї частини" if pct < 15
-                       else "невизначено")
-            out.append(f"    {fa} ∩ {fb}: спільних {len(inter)} з {small} ({pct:.0f}%) - {verdict}")
-            if inter:
-                out.append(f"        {', '.join(sorted(inter))[:100]}")
+            if True:
+                A, B = sets[a], sets[b]
+                inter = A & B
+                small = min(len(A), len(B))
+                fa, fb = "/".join(freqs_of.get(a, [])), "/".join(freqs_of.get(b, []))
+                if small < SIBLING_MIN_NAMES:
+                    out.append(f"    {fa} ∩ {fb}: ВИСНОВКУ НЕМАЄ - імен лише {small}, "
+                               f"нуль спільних тут означає брак даних, а не різні мережі")
+                    continue
+                pct = 100 * len(inter) / small
+                verdict = ("ІМОВІРНО ОДНА МЕРЕЖА" if pct >= 50 and len(inter) >= 3
+                           else "різні мережі однієї частини" if pct < 15
+                           else "невизначено")
+                out.append(f"    {fa} ∩ {fb}: спільних {len(inter)} з {small} ({pct:.0f}%) - {verdict}")
+                if inter:
+                    out.append(f"        {', '.join(sorted(inter))[:100]}")
         out.append("")
     return "\n".join(out) + "\n"
 
@@ -2567,9 +2539,7 @@ def finish(a, recs: list[dict], units: list[dict], events: list[dict],
     except Exception as e:                      # noqa: BLE001 — a reference file must not lose a run
         print(f"звірка з учорашнім звітом не вийшла: {e!r}", file=sys.stderr)
     try:
-        hi_dt = datetime.strptime(a.dt_to, "%Y-%m-%d %H:%M")
-        wide = fetch(f"{hi_dt - timedelta(days=SIBLING_WINDOW_DAYS):%Y-%m-%d %H:%M}", a.dt_to)
-        sib = build_sibling_nets_section(report_events, report_freqs, titles, wide or recs,
+        sib = build_sibling_nets_section(report_events, report_freqs, titles, recs,
                                          assign_registers(freqs_of))
         dupes_txt += sib
         n_sib = sum(1 for l in sib.splitlines() if " - " in l and "блоки" in l)

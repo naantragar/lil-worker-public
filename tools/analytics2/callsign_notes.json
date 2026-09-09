@@ -1,0 +1,78 @@
+{
+  "_note": [
+    "Descriptions of callsigns that came from a LIVE ANALYST outside this pipeline - never inferred",
+    "by us and never derived from the corpus. They outrank the archived roster when both speak about",
+    "the same man, because they carry rank and post, which the archive's role column does not.",
+    "",
+    "Each entry is scoped by `formation`: EVERY token of it must appear in the report block's header",
+    "before the note is applied. This is the whole safety of the file. МАРС is the case that proves",
+    "it - the name also stands on 141.2500 under `2 мсб 71 мсп 42 мсд 58 А`, a different division",
+    "entirely, and an unscoped note would have labelled that man a medic of 38 омсбр.",
+    "",
+    "`aliases` exists because the same man is written in Russian and Ukrainian spelling in different",
+    "places (`Лысый` from the analyst, `ЛИСИЙ` in our archive).",
+    "",
+    "Never put a guess in this file. If we inferred it, it belongs in tools/callsign_roles, which is",
+    "measured against the analyst rather than treated as truth.",
+    "`add_to_net` lets a note INSERT a man who is not in the archive roster of that block. Only for notes scoped to his OWN net - never for a brigade-wide one."
+  ],
+  "notes": [
+    {
+      "callsign": "БОРЕЦ",
+      "formation": "38 омсбр",
+      "role": "підполковник, командир 38 омсбр",
+      "source": "живий аналітик",
+      "date": "2026-09-06",
+      "archive_said": "кр 2мср; ком склад"
+    },
+    {
+      "callsign": "САДУЛЯ",
+      "formation": "1 шр 38 омсбр",
+      "role": "командир 1 шр \"V\"",
+      "source": "живий аналітик",
+      "date": "2026-09-06",
+      "archive_said": "кр"
+    },
+    {
+      "callsign": "ГРИНЧ",
+      "formation": "1 шр 38 омсбр",
+      "role": "лейтенант, заступник командира 1 шр \"V\"",
+      "source": "живий аналітик",
+      "date": "2026-09-06",
+      "archive_said": "ком склад (на мережах БпЛА 38 омсбр)",
+      "add_to_net": true
+    },
+    {
+      "callsign": "ЛЫСЫЙ",
+      "aliases": [
+        "ЛИСИЙ"
+      ],
+      "formation": "1 шр 38 омсбр",
+      "role": "офіцер, заступник командира 1 шр \"V\"",
+      "source": "живий аналітик",
+      "date": "2026-09-06",
+      "archive_said": "ком склад"
+    },
+    {
+      "callsign": "МАРС",
+      "formation": "1 шр 38 омсбр",
+      "role": "офіцер, головний медик 1 шр \"V\"",
+      "source": "живий аналітик",
+      "date": "2026-09-06",
+      "archive_said": "немає в архіві",
+      "add_to_net": true
+    },
+    {
+      "callsign": "ША",
+      "aliases": ["ЩА"],
+      "formation": "70 мсп",
+      "freqs": ["147.0000"],
+      "role": "",
+      "source": "корпус, не аналітик",
+      "date": "2026-09-07",
+      "archive_said": "немає в архіві (як і вся ця мережа)",
+      "add_to_net": true,
+      "why": "Постійний кореспондент 147.0000 щонайменше з 02.09: оператор сам ставить його у список станцій ('1- БЕК 2- КИС 3- ША 4- КАСПЕР', '1- ША 2- АНГЕЛ'). ЩА - описка транскрайбера: Ш і Щ сусідні, і російське 'ща' = 'сейчас', тож почути слово замість імені легко; в одному перехопленні він записаний обома способами. Ролі НЕМАЄ навмисно - ми її не знаємо, а вигадувати сюди заборонено. Запис існує лише щоб одна людина не стояла у звіті двома іменами."
+    }
+  ]
+}
