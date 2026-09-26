@@ -44,14 +44,18 @@ SECT = ('<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
         ' w:header="708" w:footer="708" w:gutter="0"/></w:sectPr>')
 
 
-def _rpr(bold: bool, size: int = SIZE) -> str:
+def _rpr(bold: bool, size: int = SIZE, italic: bool = False) -> str:
     b = "<w:b/><w:bCs/>" if bold else ""
-    return (f'<w:rPr><w:rFonts w:ascii="{FONT}" w:hAnsi="{FONT}" w:cs="{FONT}"/>{b}'
+    # Italic is a per-document choice, not a decoration: the analyst's callsign file is italic
+    # throughout (measured in his `позивні 05.08.2026.docx`), while his intercept report is upright.
+    i = "<w:i/><w:iCs/>" if italic else ""
+    return (f'<w:rPr><w:rFonts w:ascii="{FONT}" w:hAnsi="{FONT}" w:cs="{FONT}"/>{b}{i}'
             f'<w:sz w:val="{size}"/><w:szCs w:val="{size}"/></w:rPr>')
 
 
-def _para(text: str, bold: bool = False, size: int = SIZE, center: bool = False) -> str:
-    rpr = _rpr(bold, size)
+def _para(text: str, bold: bool = False, size: int = SIZE, center: bool = False,
+          italic: bool = False) -> str:
+    rpr = _rpr(bold, size, italic)
     jc = '<w:jc w:val="center"/>' if center else ""
     ppr = f"<w:pPr>{jc}{SPACING}{rpr}</w:pPr>"
     if not text.strip():
@@ -75,8 +79,10 @@ def build(content, title: str | None = None) -> bytes:
                          or line.strip().startswith("###"))
             body.append(_para(line.rstrip(), bold=is_header))
     else:
-        for text, bold, center in content:
-            body.append(_para(str(text).rstrip(), bold=bold, center=center))
+        for row in content:
+            text, bold, center, *rest = row      # 4th element = italic, optional
+            body.append(_para(str(text).rstrip(), bold=bold, center=center,
+                              italic=bool(rest[0]) if rest else False))
     doc = (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
            f"<w:document {W}><w:body>{''.join(body)}{SECT}</w:body></w:document>")
     return doc.encode()

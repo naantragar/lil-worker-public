@@ -20,6 +20,13 @@ WHAT GETS CONVERTED — no judgement is involved, both triggers are mechanical:
   2. A command matching an entry in `durable_commands.json` — the growable list of known long
      runners, converted even in the foreground. It starts with the analytics report run.
 
+WHAT IS NEVER CONVERTED — the `never` list in the same file, and it outranks BOTH triggers above,
+including `run_in_background: true`. A durable job is a task: it finishes and reports. A dev server
+is a service: it never finishes, so the job sits at `running` forever, holds its room's launch gate,
+and can only be ended by hand — which is then delivered as "задача скасована". Three of those piled
+up in one evening (16.09.2026) from `npm run dev`. Inline in the background is the RIGHT place for a
+service: it lives as long as the turn that needs it, and the turn's teardown cleans it up.
+
 The honest limit, stated so nobody expects more: an unknown slow script run in the FOREGROUND is not
 covered until it is added to the list. There is no way to know in advance that a command will take
 forty minutes. What is covered is every background command, always, plus everything we have learned.
@@ -103,13 +110,37 @@ def _strip_timeout(command: str) -> tuple[str, bool]:
     return stripped, stripped != command
 
 
-def _registry() -> list[dict]:
+def _registry(key: str = "commands") -> list[dict]:
     try:
         data = json.loads(REGISTRY.read_text())
-        return [e for e in data.get("commands", []) if e.get("pattern")]
+        return [e for e in data.get(key, []) if e.get("pattern")]
     except Exception as e:
         _log(f"registry unreadable ({e!r}) — background rule still applies")
         return []
+
+
+def _never(command: str) -> dict | None:
+    """Is this a SERVICE rather than a task? Then it must stay inline, background or not.
+
+    A durable job is defined by finishing: it runs, exits, and its result is delivered. A dev server
+    never exits, so converting one yields a job pinned at `running` forever — it holds its room's
+    launch gate and its report can never come. The only exit is a manual cancel, which then arrives
+    as "задача скасована". On 16.09.2026 that happened three times in one evening with `npm run dev`.
+
+    Left inline in the background the same server behaves exactly right: it lives as long as the turn
+    that wanted to look at the page, and the turn's teardown disposes of it.
+
+    Checked BEFORE both triggers, so it outranks `run_in_background: true` as well. A plain search is
+    enough here — the worst a false positive can do is leave a command inline, which is the default
+    for almost every command anyway; the patterns are kept tight so it cannot disarm a real runner.
+    """
+    for entry in _registry("never"):
+        try:
+            if re.search(entry["pattern"], command):
+                return entry
+        except re.error as e:
+            _log(f"bad never-pattern {entry['pattern']!r}: {e}")
+    return None
 
 
 # A registry pattern is a PATH, and a path in a command string is not necessarily a command: on
@@ -233,6 +264,12 @@ def main() -> None:
     if RE_INLINE_PREFIX.search(command):
         _allow()
 
+    # A service is not a task. This outranks the background rule on purpose — see _never().
+    service = _never(command)
+    if service:
+        _log(f"not converted, {service.get('why') or 'служба, а не задача'}: {command[:160]}")
+        _allow()
+
     entry = None
     if ti.get("run_in_background"):
         why = "запущена в фоне — фоновая задача умирает вместе с ходом"
@@ -257,11 +294,18 @@ def main() -> None:
     if not (cwd and Path(str(cwd)).is_dir()):
         cwd = str(REPO)
 
+    # A registry entry may carry a `followup`: text injected into the owner's LIVE chat once the
+    # job's report has landed, as if he had typed it. That is how the report's self-check runs
+    # without him asking for it every day — and it goes into the live session, not the isolated
+    # wake turn, because the check is only as good as the context behind it.
+    argv = [sys.executable, str(JOB_CTL), "launch", "--cmd", command,
+            "--label", label[:40], "--cwd", str(cwd), "--wake"]
+    followup = ((entry or {}).get("followup") or "").strip()
+    if followup:
+        argv += ["--followup", followup]
     try:
         res = subprocess.run(
-            [sys.executable, str(JOB_CTL), "launch", "--cmd", command,
-             "--label", label[:40], "--cwd", str(cwd), "--wake"],
-            cwd=str(REPO), capture_output=True, text=True, timeout=LAUNCH_TIMEOUT_S)
+            argv, cwd=str(REPO), capture_output=True, text=True, timeout=LAUNCH_TIMEOUT_S)
     except Exception as e:
         _log(f"conversion crashed ({e!r}) — allowing inline so work is not blocked")
         _allow()

@@ -231,12 +231,18 @@ def neutralize_leading_slash(prompt: str) -> str:
 
 
 async def run(prompt: str, session_id: str | None, images: list[str] | None = None,
-              room_id: str | None = None) -> tuple[str, str | None, bool]:
+              room_id: str | None = None, on_progress=None) -> tuple[str, str | None, bool]:
     """Returns (reply_text, new_session_id, ok). `ok` is False when the turn was DEGRADED — killed on
     a deadline, or finished with no text at all — so the caller can fall back instead of publishing a
     placeholder as if it were the answer. With images, feeds them via stream-json stdin. Raises on
     hard failure. `room_id` (the originating Matrix room) is tagged into the child env so any durable
-    job launched during this turn records its origin and reports BACK to this room, not to Telegram."""
+    job launched during this turn records its origin and reports BACK to this room, not to Telegram.
+
+    `on_progress(tool_name, hint, tools_done)` is called for every tool the turn uses, as it happens.
+    It exists because this reader ALREADY knew what the turn was doing — it just wrote it to the log
+    file instead of anywhere the owner could see, so a 25-minute turn looked identical to a hang
+    (16.09.2026). It must be CHEAP and must not raise: it runs inside the stdout read loop, so
+    anything slow there stalls the reader. The caller does the posting on its own clock."""
     cmd = [
         os.environ.get("CLAUDE_BIN", "claude"), "-p",
         "--output-format", "stream-json", "--verbose",
@@ -363,6 +369,12 @@ async def run(prompt: str, session_id: str | None, images: list[str] | None = No
                              f" ends unless it was launched as a durable job", _clip(hint, 60))
                     else:
                         _log(f"claude: tool {name}", _clip(hint, 70))
+                    if on_progress is not None:
+                        # A progress line must never be able to break the turn it reports on.
+                        try:
+                            on_progress(name, str(hint or ""), stats["tools"])
+                        except Exception as e:
+                            _log("progress callback failed (ignored)", repr(e))
         elif etype == "result":
             text = evt.get("result", "") or text
             new_sid = evt.get("session_id", new_sid)

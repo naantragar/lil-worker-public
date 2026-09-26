@@ -176,6 +176,136 @@ async def _send_text(room_id: str, text: str) -> None:
             raise RuntimeError(f"room_send refused for {room_id}: {getattr(resp, 'message', resp)}")
 
 
+# ── live progress line ────────────────────────────────────────────────────────────────────────────
+# Element shows nothing at all until a turn ENDS: the bridge waits for the whole reply and posts it
+# in one go. On 16.09.2026 a 25-minute turn (110 tool calls) therefore looked exactly like a hang,
+# and the only way to tell them apart was to go and read the log file on the server.
+#
+# The fix is NOT one message per action — that turn would have produced 110 messages, which is a
+# flood, not progress. Instead: ONE message, EDITED in place (`m.replace`, rendered by Element at its
+# original position). Same lesson the survey bot taught on 14.09 — an inline flow must edit the
+# message it is driving, or "working" is indistinguishable from "stuck".
+#
+# Two rules keep it quiet: nothing is posted for the first 20 seconds (a short turn stays as clean as
+# it is today), and the line is repainted at most every 15 seconds and only when it actually changed
+# — every edit is a real event in the room.
+_PROGRESS_FIRST_S = 20      # don't announce a turn that is about to finish anyway
+_PROGRESS_EVERY_S = 15      # repaint no faster than this
+
+_VERB = {"Read": "читаю", "Edit": "правлю", "Write": "пишу", "NotebookEdit": "правлю",
+         "Bash": "запускаю", "Grep": "ищу", "Glob": "ищу файлы", "WebFetch": "смотрю страницу",
+         "WebSearch": "ищу в сети", "Task": "рой", "Agent": "рой", "Workflow": "рой",
+         "Skill": "скилл"}
+
+
+def _describe(tool: str, hint: str) -> str:
+    """One short human line for one tool call. A full shell command is noise; its head is enough."""
+    hint = " ".join((hint or "").split())
+    if tool in ("Read", "Edit", "Write", "NotebookEdit") and "/" in hint:
+        hint = hint.rsplit("/", 1)[-1]
+    if len(hint) > 58:
+        hint = hint[:57] + "…"
+    return f"{_VERB.get(tool, tool)} {hint}".strip()
+
+
+async def _send_line(room_id: str, text: str) -> str | None:
+    """Post one short line and return its event id (None if the server refused it)."""
+    resp = await _client.room_send(room_id, "m.room.message", {
+        "msgtype": "m.text", "body": text,
+        "format": "org.matrix.custom.html", "formatted_body": render.to_html(text),
+    })
+    if isinstance(resp, RoomSendError):
+        return None
+    return getattr(resp, "event_id", None)
+
+
+async def _edit_line(room_id: str, event_id: str, text: str) -> bool:
+    html = render.to_html(text)
+    new = {"msgtype": "m.text", "body": text,
+           "format": "org.matrix.custom.html", "formatted_body": html}
+    resp = await _client.room_send(room_id, "m.room.message", {
+        **new, "body": "* " + text,          # fallback body for clients that ignore the relation
+        "m.new_content": new,
+        "m.relates_to": {"rel_type": "m.replace", "event_id": event_id},
+    })
+    return not isinstance(resp, RoomSendError)
+
+
+class _Progress:
+    """A single self-editing status message for one turn. Fails silently, never breaks the turn."""
+
+    def __init__(self, room_id: str) -> None:
+        self.room = room_id
+        self.t0 = time.monotonic()
+        self.tools = 0
+        self.last = ""
+        self.event_id: str | None = None
+        self.shown = ""
+        self.done = False
+        self.task: asyncio.Task | None = None
+
+    # called from claude_bridge's stdout reader — must stay cheap and synchronous
+    def note(self, tool: str, hint: str, tools_done: int) -> None:
+        self.tools = tools_done
+        self.last = _describe(tool, hint)
+
+    def _line(self) -> str:
+        mins = int((time.monotonic() - self.t0) // 60)
+        head = f"⏳ {mins} мин · {self.tools} действий" if mins else f"⏳ {self.tools} действий"
+        return f"{head} · {self.last}" if self.last else head
+
+    async def _paint(self) -> None:
+        text = self._line()
+        if text == self.shown:
+            return
+        if self.event_id is None:
+            self.event_id = await _send_line(self.room, text)
+            if self.event_id is None:
+                raise RuntimeError("room refused the progress line")
+        elif not await _edit_line(self.room, self.event_id, text):
+            raise RuntimeError("room refused a progress edit")
+        self.shown = text
+
+    async def _loop(self) -> None:
+        await asyncio.sleep(_PROGRESS_FIRST_S)
+        while True:
+            await self._paint()
+            await asyncio.sleep(_PROGRESS_EVERY_S)
+
+    def start(self) -> None:
+        self.task = asyncio.create_task(self._guarded())
+
+    async def _guarded(self) -> None:
+        try:
+            await self._loop()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # A progress line is a convenience. If the room will not take it, drop it and say so in
+            # the log — never let it surface as a failed turn.
+            _log("progress: giving up on the status line", repr(e))
+
+    async def finish(self, ok: bool = True) -> None:
+        if self.done:
+            return                    # the outer `finally` is a safety net, not a second ending
+        self.done = True
+        if self.task:
+            self.task.cancel()
+            try:
+                await self.task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if not self.event_id:
+            return       # turn was short enough that nothing was ever posted
+        mins = int((time.monotonic() - self.t0) // 60)
+        mark = "✅" if ok else "⚠️"
+        dur = f"{mins} мин" if mins else "меньше минуты"
+        try:
+            await _edit_line(self.room, self.event_id, f"{mark} готово за {dur} · {self.tools} действий")
+        except Exception as e:
+            _log("progress: final edit failed (ignored)", repr(e))
+
+
 async def _send_file(room_id: str, path: str) -> None:
     p = Path(path)
     if not p.is_file():
@@ -270,14 +400,18 @@ async def _answer(room_id: str, prompt: str, images: list[str] | None = None) ->
          f" {'resuming ' + sid[:8] if sid else 'FRESH session'}"
          f"{f', {len(images)} image(s)' if images else ''}", _clip(prompt, 60))
     t_run = time.monotonic()
+    progress = _Progress(room_id)
+    progress.start()
     try:
         try:
             reply, new_sid, _ok = await claude_bridge.run(
-                prompt, sid, images=images, room_id=room_id)
+                prompt, sid, images=images, room_id=room_id, on_progress=progress.note)
             _log(f"answer: model finished in {_since(t_run)} → {len(reply)} chars"
                  f"{'' if _ok else ' (DEGRADED — timeout or empty result)'}")
+            await progress.finish(ok=_ok)
         except Exception as e:
             _log(f"answer: model FAILED after {_since(t_run)}", repr(e))
+            await progress.finish(ok=False)
             reply = f"⚠️ сбой: {e}"
         else:
             # Persisting the session must never be able to eat the answer. It used to sit inside the
@@ -315,6 +449,7 @@ async def _answer(room_id: str, prompt: str, images: list[str] | None = None) ->
             await _send_file(room_id, fp)
             _log(f"answer: sent file {_clip(fp, 60)} in {_since(t_f)}")
     finally:
+        await progress.finish(ok=False)   # no-op if the turn already closed it
         await _typing_off(room_id)
 
 
@@ -804,14 +939,23 @@ async def _deliver_job_to_room(job_dir: Path, spec: dict, status: str, room_id: 
         "і що варто зробити далі. Відповідай мовою користувача (типово російською), стисло, без "
         "зайвих преамбул. Не вигадуй того, чого немає в результаті."
     )
+    # The wake-up turn gets the same status line as any other. It announces itself above ("дивлюсь
+    # результат…"), but a report over a big result can itself run for minutes, and then that line is
+    # just as silent as a normal turn used to be. Every claude turn in every room, one rule.
+    progress = _Progress(room_id)
+    progress.start()
+    reply, ok = "", False
     try:
         # room_id is passed so that a durable job launched DURING this report is tagged with this
         # room and reports back here — without it the report turn carried no door/room env and any
         # such job silently defaulted to the Telegram door.
-        reply, _sid, ok = await claude_bridge.run(prompt, None, room_id=room_id)  # isolated session
+        reply, _sid, ok = await claude_bridge.run(prompt, None, room_id=room_id,
+                                                  on_progress=progress.note)  # isolated session
     except Exception as e:
         reply, ok = "", False
         _log("job report reasoning failed", job_dir.name, e)
+    finally:
+        await progress.finish(ok=ok)
     # `ok` is what makes the v0 fallback below reachable at all. claude_bridge.run NEVER returns an
     # empty string — a deadline kill yields "⚠️ Ход прерван…" and an empty result yields
     # "(пустой ответ)", both truthy — so the old `if reply.strip()` check always won and a degraded

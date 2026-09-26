@@ -190,6 +190,9 @@ JOBS_DELIVER_RETRY_SEC = 900        # a "delivering:" marker older than this = t
 # Same chat destination (the lead-in Message), separate compute identity.
 WAKE_RESULT_FEED = 8000             # chars of result fed into the wake reasoning prompt
 _wake_lock = asyncio.Lock()         # serialize wake reports (one at a time)
+# A job may carry `followup`: text injected into the owner's LIVE session after the report lands.
+# How long a follow-up waits for a busy chat before giving up (see _run_turn).
+FOLLOWUP_WAIT_SEC = 300
 
 
 def load_claude_model() -> str:
@@ -593,7 +596,18 @@ async def _flush_buffer(user_id: int, bot: Bot):
     reply_msg: Message = buf["reply_msg"]
 
     logger.info(f"MSG uid={user_id} (merged {len(buf['parts'])} parts): {full_text[:120]!r}")
+    await _run_turn(user_id, full_text, reply_msg, bot, preempt=True)
 
+
+async def _run_turn(user_id: int, full_text: str, reply_msg: Message, bot: Bot,
+                    preempt: bool = True) -> None:
+    """One turn in the user's REAL session: run the model, persist the session, post the result.
+
+    Split out of _flush_buffer so a turn can also be raised by something other than an incoming
+    Telegram message — see _followup_turn(). `preempt` is what tells the two apart: a real message
+    from the owner kills whatever is running (he changed his mind, that is the point), while a
+    synthetic follow-up must never do that — it waits its turn instead.
+    """
     provider = get_active_provider(user_id)
     session_id = get_session_id(user_id, provider)
     lang = detect_language(full_text)
@@ -602,11 +616,25 @@ async def _flush_buffer(user_id: int, bot: Bot):
     # Kill any in-progress request for this user — new message preempts the old one
     prev_proc = _active_procs.get(user_id)
     if prev_proc and prev_proc.returncode is None:
-        logger.info(f"Killing previous request for uid={user_id}")
-        try:
-            prev_proc.kill()
-        except Exception:
-            pass
+        if not preempt:
+            # A synthetic follow-up arriving mid-conversation must not cut the owner off. Wait for
+            # the live turn to finish; if it runs longer than this, drop the follow-up rather than
+            # queue it forever — a stale "перепроверь" landing an hour later is worse than none.
+            for _ in range(FOLLOWUP_WAIT_SEC):
+                await asyncio.sleep(1)
+                p = _active_procs.get(user_id)
+                if not p or p.returncode is not None:
+                    break
+            else:
+                logger.warning(f"followup for uid={user_id} dropped — chat busy "
+                               f"{FOLLOWUP_WAIT_SEC}s")
+                return
+        else:
+            logger.info(f"Killing previous request for uid={user_id}")
+            try:
+                prev_proc.kill()
+            except Exception:
+                pass
 
     response, new_session_id, streamed_files = await run_provider_streaming(
         provider, full_text, session_id, reply_msg, bot, lang=lang, user_id=user_id
@@ -3042,7 +3070,28 @@ async def _wake_and_report(bot: Bot, job_dir: Path, spec: dict, status: str) -> 
             "Ты — креветка. Это не интерактивный чат, а автономное пробуждение, чтобы кратко "
             "доложить пользователю о завершённой фоновой задаче: что сделано, главное из "
             "результата, всё ли в порядке и что стоит сделать дальше. Отвечай по-русски, сжато, "
-            "без лишних преамбул. Не выдумывай того, чего нет в результате."
+            "без лишних преамбул. Не выдумывай того, чего нет в результате.\n\n"
+            # This turn is ISOLATED: it has its own session and cannot see the interactive chat.
+            # So it does not know what was already checked today, or which standards the owner and
+            # I have agreed on — and it was proposing the same follow-up («глянь 42 мсд») for four
+            # days running, including the day after that very block came back clean. He noticed the
+            # repetition and asked whether it was hardcoded. It was not: it was a turn with nothing
+            # to remember. The cure is to point it at what IS written down.
+            "ЧТО У ТЕБЯ ЕСТЬ, А ЧЕГО НЕТ. Выше — только вывод команды: счётчики, пути, ошибки. "
+            "Для прогона отчёта это НЕ содержимое отчёта: там нет ни одной строки события и ни "
+            "одного перехвата. Значит разобрать отчёт по качеству ты отсюда НЕ МОЖЕШЬ — не делай "
+            "вид, что можешь, и не выноси вердиктов о том, хорошо ли он написан.\n"
+            "Докладывай то, что ВИДНО в выводе: дошло ли до конца, сколько событий и сетей, "
+            "сколько времени, и главное — были ли ошибки, пустые файлы, нули там, где их быть не "
+            "должно. Вот это и есть твоя работа.\n"
+            "Ты в репозитории lil_worker и можешь читать файлы, если чего-то не хватает для "
+            "понимания самого вывода. Разбирать отчёт по строкам не надо — это делается в "
+            "интерактивном ходе, глядя на исходные перехваты.\n"
+            "НЕ ПРИДУМЫВАЙ следующий шаг ради того, чтобы он был. Ты не видишь этот чат и не "
+            "знаешь, что уже проверено сегодня, поэтому не проси перепроверок «на всякий случай» "
+            "и не предлагай одно и то же изо дня в день. Прогон, дошедший до конца без ошибок, — "
+            "это ХОРОШИЙ прогон: так и скажи, и на этом закончи. Планка у нас — удовлетворительно, "
+            "а не идеально (knowledge/upstream/report-quality-bar.md, читать по надобности)."
         )
         session_id = get_session_id(wake_uid, PROVIDER_CLAUDE)
         try:
@@ -3064,6 +3113,35 @@ async def _wake_and_report(bot: Bot, job_dir: Path, spec: dict, status: str) -> 
         # reasoning result used to still report success, so the raw-dump fallback never fired and
         # the owner got only the lead-in line for a job that ran for an hour.
         return bool(cleaned or streamed_files or file_paths)
+
+
+async def _followup_turn(bot: Bot, spec: dict) -> None:
+    """Raise a turn in the owner's REAL chat, as if he had typed the job's `followup` text.
+
+    Why this exists at all. The wake report (above) runs in an ISOLATED session on purpose: it sees
+    only the command's stdout and must not drag counters into the conversation. But the thing the
+    owner actually asks for after a report — «перепроверь его» — is worth exactly as much as the
+    context behind it: which rules we changed today, what he rejected yesterday, where the §13
+    boundary sits. An isolated turn has none of that and would guess. So a follow-up goes into the
+    LIVE session instead, and reads as a normal message in the chat.
+
+    It is echoed visibly first. A turn the owner did not type must never be indistinguishable from
+    one he did — he has to be able to see, later, who asked.
+    """
+    text = (spec.get("followup") or "").strip()
+    owner = spec.get("owner_uid")
+    if not text or owner not in ALLOWED_USERS:
+        return
+    try:
+        echo = await bot.send_message(owner, f"🔁 {text}", parse_mode=None)
+    except Exception as e:
+        logger.warning(f"followup echo failed for job {spec.get('id')}: {e}")
+        return
+    logger.info(f"followup uid={owner} job={spec.get('id')}: {text[:120]!r}")
+    try:
+        await _run_turn(owner, text, echo, bot, preempt=False)
+    except Exception as e:
+        logger.warning(f"followup turn failed for job {spec.get('id')}: {e}")
 
 
 def _reap_stuck_jobs() -> None:
@@ -3172,6 +3250,11 @@ async def _notify_finished_jobs(bot: Bot) -> None:
                     continue  # marker stays "delivering:" → retried, not lost
             notified.write_text(time.strftime("%Y-%m-%dT%H:%M:%S%z"))
             logger.info(f"job {job_dir.name}: wake-report done (ok={ok}) owner={owner}")
+            # Only AFTER the job is marked delivered. A follow-up is a convenience; if it crashes or
+            # the bot restarts mid-way, the report itself must still count as delivered rather than
+            # be re-sent on the next tick.
+            if status == "done":
+                await _followup_turn(bot, spec)
             continue
 
         # v0: plain raw-dump notification, retry-safe (notified written only after a good send)

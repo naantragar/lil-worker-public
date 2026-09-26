@@ -15,14 +15,53 @@
   "Optional `not_if`: a regex that VETOES the entry — for a flag that makes the same script fast,",
   "like `--render-only`, which rebuilds a report from saved events in about a second.",
   "",
+  "`never` is the OPPOSITE list and it outranks everything, including run_in_background:true.",
+  "A durable job is a TASK: it runs, finishes, and reports. A dev server is a SERVICE: it never",
+  "finishes by design, so converting it produces a job stuck at `running` forever, holding its",
+  "room's launch gate, whose report can never arrive — and the only way out is a manual cancel,",
+  "which is then delivered as a 'задача скасована' message. That happened three times in one",
+  "evening on 16.09.2026 with `npm run dev` before this list existed. Left inline in the",
+  "background a dev server behaves CORRECTLY: it lives as long as the turn that needs it to look",
+  "at the page, and the turn's teardown cleans it up.",
+  "Keep these patterns TIGHT — an over-broad one here silently disarms the protection for a real",
+  "long runner. A match is a plain regex search: the worst a false positive can do is leave a",
+  "command inline, which is the default for almost everything anyway.",
+  "",
   "Skipped conversions and launch failures are logged to bot/jobs/durable_bash_hook.log."
+ ],
+ "never": [
+  {
+   "pattern": "\\b(npm|pnpm|yarn|bun)\\s+(run\\s+)?(dev|start|serve|preview|watch)\\b",
+   "why": "дев-сервер пакетного менеджера — служба, не задача"
+  },
+  {
+   "pattern": "\\bvite\\b(?!\\s+build)",
+   "why": "vite в режиме сервера не завершается (vite build — завершается, поэтому исключён)"
+  },
+  {
+   "pattern": "\\b(next|nuxt|astro|remix)\\s+(dev|start)\\b",
+   "why": "дев-сервер фреймворка — служба"
+  },
+  {
+   "pattern": "\\b(nodemon|webpack-dev-server)\\b|\\bwebpack\\s+serve\\b",
+   "why": "наблюдатель за файлами — работает бесконечно"
+  },
+  {
+   "pattern": "\\b(uvicorn|gunicorn|hypercorn|daphne)\\b|\\bflask\\s+run\\b|-m\\s+http\\.server\\b",
+   "why": "питоновский веб-сервер — служба"
+  },
+  {
+   "pattern": "\\btail\\s+-\\w*f\\b|\\bjournalctl\\b[^|;]*\\s-f\\b|^\\s*watch\\s+",
+   "why": "бесконечный поток вывода, завершения нет"
+  }
  ],
  "commands": [
   {
    "pattern": "tools/analytics2/run\\.py\\s+--(day|from)\\b",
    "not_if": "--render-only\\b",
    "label": "аналитика: отчёт",
-   "why": "прогон отчёта по перехватам идёт десятки минут"
+   "why": "прогон отчёта по перехватам идёт десятки минут",
+   "followup": "Отчёт посчитался. Перепроверь его, как я обычно прошу — строки против речи (_src_ref ведёт в <out>_sources.json).\n\n- A (выдумка, не тот человек или сторона, обратный смысл, опасный пропуск) — по пунктам: строка и что в речи на самом деле\n- B (формулировка, потерянная деталь) — одним списком\n- C (разброс модели) — не перечисляй\n\nПЕРЕД тем как объявить класс A — ПОДНИМИ перехваты этой строки и прочитай речь целиком. Счётчик по словам ошибается: 23.09 он выдал «хохол» как выдумку, а в речи человек отзывался «я Хохол на связи» — это был их боец. Класс A объявляется только после чтения речи.\n\nПо каждому A — чем чинится: правка события в _events.json плюс --render-only (секунда, без модели) или полный перегон (десятки минут, все формулировки станут другими). Решаю я.\n\nКласса A нет — скажи одной строкой, и всё."
   },
   {
    "pattern": "tools/analytics_run\\.py\\s+--from|tools/analytics_pipeline\\.sh",
@@ -48,6 +87,21 @@
    "pattern": "callsign_roles/(daily\\.sh|dossier\\.py)",
    "label": "досьє позивних: згортання",
    "why": "лічильник ефіру читає весь корпус, це хвилини"
+  },
+  {
+   "pattern": "identity/extract_observations\\.py",
+   "label": "спостереження з мови",
+   "why": "виклик моделі на кожну розмову, ~1с моделі на перехоплення; 13.09 такий прогон у фоні був убитий разом із процесом сесії і результат втрачено"
+  },
+  {
+   "pattern": "identity/(guide_layer|answer_key|callsign_file|unit_binding)\\.py",
+   "label": "шар ведення / файл позивних",
+   "why": "читають корпус за 14-90 діб (до 99 тис. перехоплень) - хвилини без жодної моделі"
+  },
+  {
+   "pattern": "glossary/ingest\\.py\\s+run",
+   "label": "трансфер: читання документів у базу",
+   "why": "модель читає кожен документ шматками - десятки хвилин на пачку з 20 файлів"
   }
  ]
 }

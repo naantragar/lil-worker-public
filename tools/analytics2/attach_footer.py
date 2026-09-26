@@ -85,6 +85,29 @@ def _tighten(frag: str) -> str:
     return RE_P_OPEN.sub(add, frag)
 
 
+def _drop_stray_number(frag: str) -> str:
+    """Drop a paragraph that is nothing but a bare number, above the table.
+
+    The owner's footer carries a stray `1` between the "за перiод …" line and the table — a leftover
+    of whatever produces the block, not something he types. He asked for it gone (12.09.2026), and it
+    arrives with every footer, so it is removed here rather than by hand each day.
+
+    Deliberately narrow: only paragraphs whose ENTIRE text is 1-3 digits, and only ABOVE the first
+    table. A number standing alone on its own line there carries no meaning; inside the table the
+    same digits are the statistics themselves and are never touched.
+    """
+    cut = frag.find("<w:tbl")
+    if cut < 0:
+        return frag
+    head, tail = frag[:cut], frag[cut:]
+
+    def strip(m: re.Match) -> str:
+        text = "".join(re.findall(r"<w:t[^>]*>(.*?)</w:t>", m.group(0), re.S)).strip()
+        return "" if re.fullmatch(r"\d{1,3}", text) else m.group(0)
+
+    return re.sub(r"<w:p\b.*?</w:p>", strip, head, flags=re.S) + tail
+
+
 def _prepare(frag: str) -> str:
     """Make the block stand on its own, changing nothing about how it looks.
 
@@ -97,6 +120,7 @@ def _prepare(frag: str) -> str:
     styles.xml and would leave the table borderless here; explicit borders draw the same frame.
     """
     frag = _tighten(_sanitize(frag))
+    frag = _drop_stray_number(frag)
     frag = re.sub(r'<w:tblStyle[^/]*/>', "", frag)
     frag = frag.replace("<w:tblPr>", "<w:tblPr>" + BORDERS, 1)
     # One blank line between the "Статистика…" heading and the table. The source block runs them

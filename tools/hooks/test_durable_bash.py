@@ -37,6 +37,28 @@ MUST_NOT_CONVERT = [
     "bot/run.sh restart",
 ]
 
+# Services, not tasks. These must stay inline even when asked for in the background: a durable job
+# that never finishes holds its room's gate forever and can only be killed by hand. See _never().
+MUST_BE_SERVICE = [
+    "cd ~/upstream-system/web && npm run dev -- --port 5178 --strictPort",
+    "npm run dev",
+    "pnpm dev",
+    "yarn start",
+    "npx vite --port 5178",
+    "next dev -p 3000",
+    "nodemon server.js",
+    "uvicorn api.app.main:app --reload",
+    "python3 -m http.server 8080",
+    "tail -f bot/lil_worker.log",
+]
+# ...while the FINITE sibling of a service must not be caught by an over-broad never-pattern.
+NOT_A_SERVICE = [
+    "npm run build",
+    "npm ci",
+    "vite build",
+    "python3 tools/analytics2/run.py --day 2026-09-16",
+]
+
 fails = []
 print("=== ДОЛЖНЫ конвертироваться ===")
 for c in MUST_CONVERT:
@@ -54,8 +76,23 @@ for c in MUST_NOT_CONVERT:
     if not ok:
         fails.append(("ложное срабатывание", c))
 
+print("\n=== СЛУЖБЫ: никогда не в джобу, даже в фоне ===")
+for c in MUST_BE_SERVICE:
+    ok = H._never(c) is not None
+    print(f"  {'OK ' if ok else 'FAIL'}  {c[:78]}")
+    if not ok:
+        fails.append(("служба ушла бы в джобу", c))
+
+print("\n=== ...а конечный сосед службы — не служба ===")
+for c in NOT_A_SERVICE:
+    ok = H._never(c) is None
+    print(f"  {'OK ' if ok else 'FAIL'}  {c[:78]}")
+    if not ok:
+        fails.append(("never-шаблон слишком широкий", c))
+
+total = len(MUST_CONVERT) + len(MUST_NOT_CONVERT) + len(MUST_BE_SERVICE) + len(NOT_A_SERVICE)
 print()
-print("ВСЕ 25 СЛУЧАЕВ ПРОШЛИ" if not fails else f"ПРОВАЛОВ: {len(fails)}")
+print(f"ВСЕ {total} СЛУЧАЕВ ПРОШЛИ" if not fails else f"ПРОВАЛОВ: {len(fails)}")
 for why, c in fails:
     print(f"   {why}: {c}")
 sys.exit(1 if fails else 0)

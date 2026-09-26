@@ -222,6 +222,12 @@ def cmd_launch(args: argparse.Namespace) -> None:
         # wake=True → on completion the bot wakes an isolated claude turn to REPORT the result in
         # its own voice (v1); wake=False → plain raw-output notification (v0).
         "wake": bool(args.wake),
+        # followup → after the report lands, this text is injected into the owner's REAL chat
+        # session as if he had typed it. The wake report is isolated on purpose (counters only, no
+        # chat context); a follow-up like "перепроверь отчёт" is worthless without that context —
+        # the whole value of the owner typing it by hand is that I remember what we changed today.
+        # So this one runs in the live session instead. Empty = nothing happens (the default).
+        "followup": (args.followup or "").strip() or None,
     }
     # spec.json + status MUST exist before the runner starts — run_job.sh reads the command out of
     # spec.json as its first action.
@@ -345,6 +351,8 @@ def main() -> None:
     p.add_argument("--cwd", help="working directory for the command")
     p.add_argument("--owner", type=int, help="Telegram user id to notify (default: first ALLOWED_USERS)")
     p.add_argument("--force", action="store_true", help="launch even if another job is active")
+    p.add_argument("--followup", help="text injected into the owner's LIVE chat session once the "
+                                      "job's report has landed (as if he had typed it)")
     p.add_argument("--wake", action="store_true",
                    help="on completion, wake an isolated claude turn to REPORT the result (v1)")
     p.set_defaults(func=cmd_launch)
