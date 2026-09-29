@@ -46,14 +46,35 @@ def _is_subagent(session, child) -> bool:
     return len(c) >= 8 and c != (session or "")
 
 
+def _resolved() -> dict:
+    """Model / door / instance as the RUNTIME sees them.
+
+    `$CLAUDE_MODEL` alone used to fill the `model` field, and it is the STATIC value from
+    instance.env — while the supported way to switch a model is to edit model_config.json, which
+    takes effect with no restart. So the ledger recorded the model the bot STARTED on, not the one
+    that did the work. tools/current_model.py mirrors the real resolution; if it is missing or
+    broken we fall back to the old behaviour rather than lose the entry.
+    """
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from current_model import resolve  # noqa: PLC0415 — optional, must not be a hard import
+        return resolve()
+    except Exception:
+        return {"door": None, "who": None, "model": os.environ.get("CLAUDE_MODEL"), "effort": None}
+
+
 def _env_provenance() -> dict:
     session = os.environ.get("CLAUDE_CODE_SESSION_ID")
     child = os.environ.get("CLAUDE_CODE_CHILD_SESSION")
+    r = _resolved()
     return {
         "session": session,
         "child_session": child,
         "from_subagent": _is_subagent(session, child),
-        "model": os.environ.get("CLAUDE_MODEL"),
+        "model": r.get("model") or os.environ.get("CLAUDE_MODEL"),
+        "effort": r.get("effort") or None,
+        "door": r.get("door"),
+        "instance": r.get("who") or None,
         "ai_agent": os.environ.get("AI_AGENT"),
     }
 
