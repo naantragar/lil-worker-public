@@ -1,0 +1,2672 @@
+#!/usr/bin/env python3
+"""Intercept analytics v2 — a window of intercepts → the daily report, in one pass.
+
+    python3 tools/analytics2/run.py --from '2026-08-23 15:00' --to '2026-08-24 15:00' \
+        --band 'ЗАЛІЗНИЧНЕ-ЗАГІРНЕ' --out ZVIT_24.08
+
+Deliberately a clean rewrite; v1 lives on in tools/analytics_*.py and its rules are archived under
+knowledge/upstream/archive/. The concept this implements is knowledge/upstream/intercept-analytics-v2-concept.md
+— read that before changing anything here, especially §0: when the output is wrong, SUBTRACT from
+rules.md. Do not add a stage.
+
+What v2 drops from v1, on the owner's decision:
+  * the A2 selection pass — one stage that describes what we take cannot lose material unseen;
+  * the roster and code legend (pass C) — not the product, and 45% of the old wall clock.
+
+What it keeps, because each was measured rather than assumed:
+  * windowing oversized units of work (yield falls 6.25 → 3.85 events per 10k chars as they grow);
+  * several extraction passes unioned (one pass silently loses ~25% of the facts);
+  * retries around the model call (one transient failure used to abort a nine-minute run).
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+from functools import lru_cache
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+# Every time in this pipeline — the window arguments, the intercept headers, the report stamp — is
+# the analyst's local clock, which is Kyiv. Nothing here is ever server-local or UTC.
+KYIV = ZoneInfo("Europe/Kyiv")
+
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parent.parent
+sys.path.insert(0, str(REPO / "tools"))
+from intercept_parse import parse_message  # noqa: E402
+
+RULES = HERE / "rules.md"
+GLOSSARY = REPO / "matrix" / "bot" / "prompts" / "refraz" / "10_glossary.md"
+OUT_DIR = REPO / "knowledge" / "upstream" / "reports_out"
+VERSIONS = HERE / ".versions"
+
+MARGIN_HOURS = 6          # how far past the window to look for late POSTINGS
+# The window starts this much earlier than it is declared — see main(). Raised 30 → 60 on
+# 2026-08-27 after measuring the collector's real lag over 8 days: mean 30 min, p95 ~66, max 131.
+# What that costs at each setting, counted as intercepts that missed their own report AND fell
+# outside the next window's lead-in, i.e. lost from every report: 30 min → 6 of 12 798; 60 min → 0;
+# 120 min → 0. An hour closes the hole completely, so there is no reason to pay for two.
+WINDOW_LEAD_IN_MIN = 60
+# "A report FOR the 20th" is the 24 hours ending at 15:00 on the 20th. The hour is the analyst's
+# reporting cut, not a preference, and the band has been the same on every run we have made.
+REPORT_HOUR = "15:00"
+DEFAULT_BAND = "ЗАЛІЗНИЧНЕ-ЗАГІРНЕ"
+MAX_CHUNK_CHARS = 16000   # estimated body; renders to ~19k, the size band with the best yield
+OVERLAP = 3               # intercepts repeated across a seam so a straddling event stays whole
+FREQ_TOL_KHZ = 5.0        # channel spacing is 12.5 kHz; closer than this is one channel
+UNION_TOL_MIN = 20        # the same event is timed 06:04 by one pass and 06:07 by another
+CALL_RETRIES = 3
+RETRY_BACKOFF_S = 20
+
+BARE_CWD = Path("/tmp/upstream_analytics2_cwd")
+NO_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebFetch", "WebSearch",
+            "Task", "Agent", "Workflow", "Skill", "NotebookEdit"]
+
+
+# ─── window ────────────────────────────────────────────────────────────────────────────────────
+
+def _own_dt(rec: dict) -> datetime | None:
+    """When the exchange was HEARD, from the intercept's own header."""
+    try:
+        fmt = "%d.%m.%Y %H:%M:%S" if rec["time"].count(":") == 2 else "%d.%m.%Y %H:%M"
+        return datetime.strptime(f"{rec['date']} {rec['time']}", fmt)
+    except (KeyError, ValueError):
+        return None
+
+
+# ── The corpus: the collector's OWN database, and nothing else ────────────────────────────────────
+# Reporting reads `messages.db` — the SQLite file `wa-monitor` writes as it takes the group off
+# WhatsApp. That file IS the source; every other copy downstream is derived from it.
+#
+# It used to read Postgres instead (`docker exec upstream_db psql`), which made the daily report a
+# dependent of upstream's infrastructure. On 2026-08-30 that dependency bit: upstream's database moved to
+# the host cluster and the container we were querying froze at 04:15 while the air kept running.
+# The report would have been built from an eleven-hour-old copy and said nothing about it. Reading
+# the collector's file removes the whole class of failure: no container, no cluster, no schema, no
+# second party's migration. upstream can be down, moved or rebuilt and the report is unaffected.
+# (It is also FRESHER — a message reaches this file seconds before any downstream copy has it.)
+CORPUS_DB = Path(os.environ.get("UPSTREAM_MESSAGES_DB", "~/wa-monitor/messages.db"))
+CORPUS_GROUP = os.environ.get("UPSTREAM_CORPUS_GROUP", "PATAGONIA_GP")
+
+
+def corpus_rows(where: str, params: tuple) -> list[tuple[str, str]]:
+    """(wa message id, text) for this group, oldest first. READ-ONLY, always.
+
+    Opened `mode=ro` on purpose: the collector is writing to this file at the same moment, and a
+    reporting run must never be able to touch the only copy of the corpus.
+    """
+    if not CORPUS_DB.exists():
+        sys.exit(f"немає бази перехоплень: {CORPUS_DB}")
+    con = sqlite3.connect(f"file:{CORPUS_DB}?mode=ro", uri=True)
+    try:
+        return con.execute(
+            f"SELECT id, coalesce(text,'') FROM messages "
+            f"WHERE group_name = ? AND {where} ORDER BY timestamp, id",
+            (CORPUS_GROUP, *params)).fetchall()
+    finally:
+        con.close()
+
+
+def corpus_latest_ms() -> int | None:
+    """Posting time of the newest message in the corpus, epoch ms — the coverage check's evidence."""
+    if not CORPUS_DB.exists():
+        return None
+    con = sqlite3.connect(f"file:{CORPUS_DB}?mode=ro", uri=True)
+    try:
+        return con.execute("SELECT max(timestamp) FROM messages WHERE group_name = ?",
+                           (CORPUS_GROUP,)).fetchone()[0]
+    finally:
+        con.close()
+
+
+def _ms(dt: datetime) -> int:
+    """A naive Kyiv wall-clock time -> epoch ms, the way the collector stamps it.
+
+    The zone is applied per timestamp rather than as a fixed offset: Kyiv is +03 from April to
+    October and +02 the rest of the year, and a hardcoded offset puts every boundary an hour out
+    for half the year.
+    """
+    return int(dt.replace(tzinfo=KYIV).timestamp() * 1000)
+
+
+# How far the corpus may lag behind the end of the reported window before the run refuses to build.
+# Measured, not guessed: over the 14 days to 30.08.2026 the largest single gap in this group was
+# 27m53s (20.08) and the usual daily maximum is 9-21 min, so 40 minutes never fires on real silence.
+# The failure this guards against is not a crash — it is a report that quietly covers half a day and
+# says nothing about the other half (30.08: the database it read froze at 04:15 and no one was told).
+CORPUS_LAG_MAX_MIN = int(os.environ.get("UPSTREAM_CORPUS_LAG_MAX_MIN", "40"))
+
+
+def check_coverage(dt_to: str, allow_stale: bool = False) -> None:
+    """Refuse to build a report the corpus cannot actually cover."""
+    latest = corpus_latest_ms()
+    if latest is None:
+        msg = f"корпус порожній або недоступний: {CORPUS_DB}"
+        sys.exit(msg) if not allow_stale else print(f"УВАГА: {msg}", file=sys.stderr)
+        return
+    seen = datetime.fromtimestamp(latest / 1000, KYIV)
+    hi = datetime.strptime(dt_to, "%Y-%m-%d %H:%M").replace(tzinfo=KYIV)
+    lag_min = (hi - seen).total_seconds() / 60
+    print(f"корпус: {CORPUS_DB.name}, останнє повідомлення {seen:%d.%m %H:%M:%S}", file=sys.stderr)
+    if lag_min > CORPUS_LAG_MAX_MIN:
+        line = (f"корпус не покриває вікно: останнє повідомлення {seen:%d.%m %H:%M}, "
+                f"а вікно закінчується {hi:%d.%m %H:%M} — розрив {lag_min/60:.1f} год. "
+                f"Збирач стоїть або файл не той.")
+        if allow_stale:
+            print(f"УВАГА: {line} Продовжую, бо задано --allow-stale.", file=sys.stderr)
+        else:
+            sys.exit(f"{line}\nПеревір: systemctl status upstream-collector. "
+                     f"Свідомо зібрати попри це: --allow-stale")
+
+
+def fetch(dt_from: str, dt_to: str) -> list[dict]:
+    """Pull the window by INTERCEPT time, not posting time.
+
+    An exchange heard at 14:57 can be posted at 16:00 and still belongs to the earlier day, so the
+    query reaches MARGIN_HOURS beyond the window on both sides and the real cut is made on each
+    intercept's own header after parsing.
+    """
+    lo = datetime.strptime(dt_from, "%Y-%m-%d %H:%M")
+    hi = datetime.strptime(dt_to, "%Y-%m-%d %H:%M")
+    q_lo, q_hi = lo - timedelta(hours=MARGIN_HOURS), hi + timedelta(hours=MARGIN_HOURS)
+
+    out, undated = [], 0
+    for mid, body in corpus_rows("timestamp >= ? AND timestamp < ?", (_ms(q_lo), _ms(q_hi))):
+        for rec in parse_message(body):
+            rec["msg_id"] = mid
+            rec["_dt"] = _own_dt(rec)
+            if rec["_dt"] is None:
+                undated += 1
+                continue
+            if lo <= rec["_dt"] < hi:
+                out.append(rec)
+    if undated:
+        print(f"без розбірливого часу в шапці, пропущено: {undated}", file=sys.stderr)
+    return out
+
+
+# ─── networks ──────────────────────────────────────────────────────────────────────────────────
+
+def norm_net(header: str | None) -> str:
+    if not header:
+        return "(без шапки)"
+    h = re.sub(r"\s+", " ", header).strip().rstrip(".").lower()
+    h = re.sub(r"\bйм\.?|\bім\.?", "", h)              # "ймовірно" is not part of the identity
+    return re.sub(r"\s+", " ", h).strip()
+
+
+def _freq_buckets(freqs: set[str]) -> dict[str, str]:
+    """Near-identical frequency readings are one channel — 411.9630 and 411.9650 are 2 kHz apart."""
+    vals = sorted((float(f), f) for f in freqs if _is_float(f))
+    out, head = {}, None
+    for v, s in vals:
+        if head is None or (v - head[0]) * 1000 > FREQ_TOL_KHZ:
+            head = (v, s)
+        out[s] = head[1]
+    return out
+
+
+def _is_float(s) -> bool:
+    try:
+        float(s)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+_COMPANY = re.compile(r"\b(\d+)\s*(мср|шр|мсв)\b", re.I)
+
+
+def compose_name(members: list[str], raw_of: dict[str, dict[str, int]], seen: dict[str, int]) -> str:
+    """One name for a merged network, in the analyst's own form.
+
+    His register writes `8, 9 мср 3 мсб 60 омсбр` — and he explained why: the frequencies had been
+    signed as different companies, and when the frequencies were merged the header named both. Our
+    clustering already merges exactly those frequencies; this composes the NAME that was missing.
+    """
+    top = max(members, key=lambda x: (seen[x], len(x)))
+    name = max(raw_of[top].items(), key=lambda kv: kv[1])[0]
+    nums, kind = [], None
+    for h in members:
+        for n, k in _COMPANY.findall(h):
+            if n not in nums:
+                nums.append(n)
+                kind = kind or k
+    if len(nums) > 1 and kind:
+        nums.sort(key=int)
+        name = _COMPANY.sub(lambda m: f"{', '.join(nums)} {kind}", name, count=1)
+    return name
+
+
+def cluster(recs: list[dict]) -> dict[str, str]:
+    """Headers sharing a frequency are one network. Frequency is a vestige for identification, but
+    it IS the mechanism by which the analyst merged units, so we follow it and then name the result."""
+    freqs_of: dict[str, set[str]] = defaultdict(set)
+    seen: dict[str, int] = defaultdict(int)
+    raw_of: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for r in recs:
+        h = norm_net(r.get("network"))
+        seen[h] += 1
+        raw_of[h][r.get("network") or "(без шапки)"] += 1
+        if r.get("freq"):
+            freqs_of[h].add(r["freq"])
+
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        while parent.setdefault(x, x) != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    bucket = _freq_buckets({f for fs in freqs_of.values() for f in fs})
+    owner: dict[str, str] = {}
+    for h, fs in freqs_of.items():
+        for f in fs:
+            f = bucket.get(f, f)
+            if f in owner:
+                a, b = find(h), find(owner[f])
+                if a != b:
+                    parent[a] = b
+            else:
+                owner[f] = h
+
+    members: dict[str, list[str]] = defaultdict(list)
+    for h in seen:
+        members[find(h)].append(h)
+    return {h: compose_name(ms, raw_of, seen) for ms in members.values() for h in ms}
+
+
+def units_of_work(records: list[dict]) -> list[dict]:
+    """One network's whole day is one unit of work; only oversized ones are windowed by time.
+
+    Slicing by network FIRST matters: a plain six-hour slice of the day would put thirty unrelated
+    conversations into one call and make the model disentangle them before it can read anything.
+    """
+    canon = cluster([r for r in records if r.get("speech")])
+    by_net: dict[str, list[dict]] = defaultdict(list)
+    for r in records:
+        if not r.get("speech") or r.get("_dt") is None:
+            continue
+        by_net[canon.get(norm_net(r.get("network")), norm_net(r.get("network")))].append(r)
+
+    def weight(r):
+        return sum(len(s) for s in r["speech"]) + 80
+
+    out = []
+    for net, items in by_net.items():
+        items.sort(key=lambda x: x["_dt"])
+        if sum(weight(r) for r in items) <= MAX_CHUNK_CHARS:
+            out.append({"net": net, "items": items})
+            continue
+        cur, size, parts = [], 0, []
+        for r in items:
+            if cur and size + weight(r) > MAX_CHUNK_CHARS:
+                parts.append(cur)
+                cur = cur[-OVERLAP:]
+                size = sum(weight(x) for x in cur)
+            cur.append(r)
+            size += weight(r)
+        if cur:
+            parts.append(cur)
+        for k, p in enumerate(parts, 1):
+            out.append({"net": net, "items": p, "part": (k, len(parts))})
+    out.sort(key=lambda t: t["items"][0]["_dt"])
+    return out
+
+
+def ref_of(rec: dict) -> str:
+    """The stable address of ONE intercept: day, air time to the second, channel.
+
+    The model answers with `src: [1, 15, 17]` — positions inside the chunk it was handed. Those
+    numbers are worthless the moment the chunk changes: the SAME intercept is item 34 of part 3 and
+    item 1 of part 4 (chunks overlap by OVERLAP records on purpose), and a re-run with a different
+    window renumbers everything. So nothing downstream could tell that two events rest on one
+    intercept, and answering "which intercepts is this line from" meant rebuilding the whole window
+    by hand to make the numbering line up again.
+
+    The indices are resolved to THIS string the instant an answer comes back, while the unit that
+    produced it is still in hand. Deliberately human-readable rather than a hash — it is the same
+    stamp I quote back to the owner, so a report line can be traced by eye.
+    """
+    return (f"{str(rec.get('date') or '')[:5]} {rec.get('time') or ''} "
+            f"{rec.get('freq') or '-'}").strip()
+
+
+def refs_for(u: dict, src) -> list[str]:
+    """Chunk-local indices → stable refs, in order, without repeats. Out-of-range indices (the model
+    occasionally invents one) are dropped rather than guessed at."""
+    items, out = u.get("items") or [], []
+    for i in (src or []):
+        if isinstance(i, int) and 0 <= i < len(items):
+            r = ref_of(items[i])
+            if r not in out:
+                out.append(r)
+    return out
+
+
+def render_unit(u: dict) -> str:
+    head = u["net"] or "(мережа без шапки)"
+    if u.get("part"):
+        head += f"  [частина {u['part'][0]}/{u['part'][1]} довгої розмови]"
+    freqs = sorted({r["freq"] for r in u["items"] if r.get("freq")})
+    lines = [f"### МЕРЕЖА — {head}", f"частоти: {', '.join(freqs)}"]
+    for n, r in enumerate(u["items"]):
+        who = " / ".join(r["stations"]) if r["stations"] else "НВ"
+        lines.append(f"[{n}] {r['date']}, {r['time'][:5]} — {who}")
+        for tag in ("comment_above", "comment_below"):
+            if r.get(tag):
+                lines.append(f"    (позначка аналітика: {r[tag]})")
+        lines += [f"    {s}" for s in r["speech"]]
+    return "\n".join(lines)
+
+
+# ─── model ─────────────────────────────────────────────────────────────────────────────────────
+
+def call_model(system: str, material: str, model: str, effort: str) -> tuple[str, float]:
+    BARE_CWD.mkdir(parents=True, exist_ok=True)
+    cmd = ["claude", "-p", "--model", model, "--system-prompt", system,
+           "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+           "--disallowedTools", *NO_TOOLS, "--effort", effort]
+    t0 = time.monotonic()
+    p = subprocess.run(cmd, input=material, capture_output=True, text=True,
+                       timeout=3600, cwd=str(BARE_CWD))
+    if p.returncode != 0:
+        raise RuntimeError(f"claude exited {p.returncode}: {p.stderr[-300:]}")
+    return p.stdout.strip(), time.monotonic() - t0
+
+
+def extract_json(s: str) -> list[dict]:
+    m = re.search(r"\[.*\]", s, re.S)
+    if not m:
+        return []
+    try:
+        return json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return []
+
+
+# A TYPE of obstacle/kit written in caps reads as a callsign, and some of these words ARE callsigns
+# on our own nets (ЕЖИК). The model is told this in rules.md; this is the mechanical backstop, kept
+# deliberately narrow — it only fires when the word stands right after the noun that makes it a
+# type, so a real man named ЕЖИК moving past something is never touched.
+_TYPE_WORDS = r"їжак|ежик|єгоза|егоза|спіраль|спираль|мзп|колючк\w*|дріт|проволок\w*"
+_TYPE_IN_CAPS = re.compile(
+    rf"(загородженн\w*|дріт\w*|колюч\w*|перешкод\w*)(\s+)«({_TYPE_WORDS})»", re.I)
+
+
+def lower_type_names(text: str) -> str:
+    """`загородження «ЕЖИК»` -> `загородження «ежик»` — a type is not a name."""
+    return _TYPE_IN_CAPS.sub(lambda m: f"{m.group(1)}{m.group(2)}«{m.group(3).lower()}»", str(text or ""))
+
+
+# ─── union across passes ───────────────────────────────────────────────────────────────────────
+
+_NAME = re.compile(r"[А-ЯЁЇІЄҐ][А-ЯЁЇІЄҐ\-]{2,}")
+_STOP = {"ВУ", "СОУ", "РОВ", "БПЛА", "МТЗ", "ФПВ", "ДРГ", "БК", "ДМР", "УКХ"}
+
+
+def names(t) -> set[str]:
+    return {n for n in _NAME.findall(str(t or "")) if n not in _STOP}
+
+
+def stamp(s) -> int | None:
+    hm = re.search(r"(\d{1,2}):(\d{2})", str(s or ""))
+    if not hm:
+        return None
+    out = int(hm.group(1)) * 60 + int(hm.group(2))
+    d = re.search(r"(\d{2})\.(\d{2})", str(s or ""))
+    if d:
+        out += (int(d.group(1)) + int(d.group(2)) * 31) * 1440
+    return out
+
+
+def _dup_key(e: dict) -> tuple[str, str, str]:
+    def n(v) -> str:
+        return re.sub(r"\s+", " ", str(v or "")).strip().casefold().rstrip(".")
+    return n(e.get("_net")), n(e.get("time")), n(e.get("text"))
+
+
+def drop_exact_duplicates(events: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
+    """Drop events that repeat another one EXACTLY, and events with no text at all.
+
+    The model sometimes writes the same fact twice inside ONE answer - 26.08 shipped with
+    "26.08.2026, 09:07 в\\с ЛЕЛИК - 300" printed on two consecutive lines. Nothing upstream catches
+    that: with --passes 1 union() never runs, and even with several passes it cannot help, because
+    it deliberately lets an accumulated event absorb at most one event per pass (so that two
+    genuinely distinct events written minutes apart are never collapsed) - which is exactly what
+    lets an identical pair inside one pass survive as two.
+
+    Only an EXACT repeat is dropped: same network, same timestamp, same text after collapsing
+    whitespace and case. Two events that differ by a single word are two events, and this function
+    must never be the place where material quietly disappears - that is why what it removes is
+    printed rather than swallowed.
+    """
+    seen: dict[tuple[str, str, str], dict] = {}
+    kept, dups, empty = [], [], []
+    for e in events:
+        if not str(e.get("text") or "").strip():
+            empty.append(e)
+            continue
+        k = _dup_key(e)
+        if k in seen:
+            dups.append(e)
+            # a repeat is not a confirmation: it is one fact stated twice, so _passes is left alone
+            continue
+        seen[k] = e
+        kept.append(e)
+    return kept, dups, empty
+
+
+def _stems(text: str) -> set[str]:
+    """Words cut to their first four letters. Crude, and exactly enough here: the seam duplicates we
+    are hunting are the same sentence written twice by two model calls, so they differ by inflection
+    (`гілками`/`гілок`, `маскує`/`маскування`) far more than by meaning. A real stemmer would buy
+    nothing at this threshold."""
+    return {w[:4] for w in re.findall(r"[\wЀ-ӿ]+", str(text or "").casefold())
+            if len(w) >= 4}
+
+
+SEAM_SIMILARITY = 0.6
+SEAM_MIN_STEMS = 3
+
+
+def merge_by_source(events: list[dict]) -> tuple[list[dict], list[tuple[dict, dict]]]:
+    """Merge events that rest on the SAME intercept and say the same thing.
+
+    Chunks overlap by OVERLAP records so a conversation lying on the seam keeps its beginning. The
+    price is that the overlapping intercepts are read TWICE, in two independent model calls, and the
+    same fact comes back worded slightly differently — `drop_exact_duplicates` only catches a
+    character-for-character repeat, so both lines shipped. On 30.08 that printed the МУК shelter
+    twice, at the same timestamp, from one intercept at 20:00:25 (item 34 of part 3, item 1 of
+    part 4).
+
+    FOUR gates, all required, because events sharing a source are usually NOT duplicates — the same
+    intercept legitimately carries several facts (that 20:00:25 also started СОВА's movement, a
+    genuinely different event that must survive):
+      1. same network AND at least one shared source ref;
+      2. the SAME printed timestamp — a duplicate is one fact written twice, and both copies stamp
+         it identically;
+      3. the same subject: `who` equal after normalising, or absent on both;
+      4. stem overlap at or above SEAM_SIMILARITY, measured against the SHORTER of the two texts.
+
+    Containment, not Jaccard, on purpose: a seam duplicate is typically the same fact stated more
+    briefly, and Jaccard punishes it for being shorter — the real pair scored 0.44 that way and
+    would have survived. Against the shorter text they score 0.8.
+
+    Gates 2 and 3 are not decoration; the text metric ALONE is dangerous and was measured to be so
+    on the 31.08 report before this was written. `переміщення в\\с ЛЕВ у супроводі БпЛА ГУСЕЙН` and
+    `переміщення в\\с ТЕРМИТ у супроводі БпЛА ГУСЕЙН` score 1.00 against each other (short callsigns
+    fall out of the stems), and `переміщення в\\с МУК ...` against `переміщення в\\с СОВА у бік МУК`
+    scores 0.80 while genuinely sharing an intercept — two different men's movements, one line away
+    from being silently collapsed into one.
+
+    The survivor is the one resting on more intercepts (ties: the longer text), and it inherits the
+    union of both source lists. Every merge is returned so the caller can PRINT it — this must never
+    be the place where material quietly disappears.
+    """
+    kept: list[dict] = []
+    merged: list[tuple[dict, dict]] = []
+    for e in events:
+        refs = set(e.get("_src_ref") or [])
+        if not refs:
+            kept.append(e)
+            continue
+        def _who(x) -> str:
+            return re.sub(r"\s+", " ", str(x.get("who") or "")).strip().casefold()
+
+        def _t(x) -> str:
+            return re.sub(r"\s+", " ", str(x.get("time") or "")).strip()
+
+        hit = None
+        for o in kept:
+            if (o.get("_net") or "") != (e.get("_net") or ""):
+                continue
+            if not (refs & set(o.get("_src_ref") or [])):
+                continue
+            if _t(e) != _t(o) or _who(e) != _who(o):
+                continue
+            a, b = _stems(e.get("text")), _stems(o.get("text"))
+            small = min(len(a), len(b))
+            if small < SEAM_MIN_STEMS:      # a three-word line matches almost anything
+                continue
+            if len(a & b) / small >= SEAM_SIMILARITY:
+                hit = o
+                break
+        if hit is None:
+            kept.append(e)
+            continue
+        loser = e
+        if len(refs) > len(set(hit.get("_src_ref") or [])) or (
+                len(refs) == len(set(hit.get("_src_ref") or []))
+                and len(str(e.get("text") or "")) > len(str(hit.get("text") or ""))):
+            loser = dict(hit)
+            hit.update({k: v for k, v in e.items() if k != "_src_ref"})
+        allrefs = list(hit.get("_src_ref") or [])
+        allrefs += [r for r in (e.get("_src_ref") or []) if r not in allrefs]
+        hit["_src_ref"] = allrefs
+        merged.append((loser, hit))
+    return kept, merged
+
+
+# Below this many names on either side of a pair, the overlap is not evidence of anything and the
+# note says so instead of guessing. Set by the case that exposed the need: 147.0000 on 06.09 came in
+# with an empty station list on every intercept.
+SIBLING_MIN_NAMES = 4
+
+# The overlap is measured over THIS many days, not over the report's own window. Measured 08.09 on
+# the two pairs we care about, the one-day number is not noisy - it is biased LOW, structurally:
+#
+#                  1 день   7 днів   18 днів
+#     70 мсп        33%      60%      60%
+#     1198 мсп      40%      80%      71%
+#
+# Both cross the "probably one net" line at seven days and stay there; at one day both read
+# "невизначено". A daily note built on one window would therefore accumulate thirty low readings and
+# converge on the wrong answer - the opposite of why it was written. Seven days is where both
+# stabilise; the report already reads REGISTER_FILE_DAYS (14) for the register file, so this costs
+# less than something we do already.
+SIBLING_WINDOW_DAYS = 7
+
+MOVEMENT = re.compile(r"переміщенн|маршрут|прибутт|виїха|вийшов|рухаєт|відійш", re.I)
+
+MARCH_SYSTEM = """Ти зводиш РОЗІРВАНИЙ МАРШ в один рядок звіту.
+
+Тобі дають кілька рядків про переміщення ОДНІЄЇ людини, які спираються на СПІЛЬНІ перехоплення.
+За правилом звіту це не кілька подій, а один марш, розписаний по шматках: «один марш - один рядок».
+
+Напиши ОДИН рядок замість них:
+- **починай рядок словом `переміщення` і пиши `в\\с` перед позивним**, як у вихідних рядках:
+  `переміщення в\\с РАДАР ...`. Це стала форма реєстру, і зведення не має права її зламати.
+  Заборонено лише відкривати рядок парою «маршрут переміщення» - саме зайве слово «маршрут»,
+  а не «переміщення».
+- **реєстр ІМЕННИЙ, а не оповідний.** Ні `рухався`, ні `зайшов`, ні `пройшов` - дієслова минулого
+  часу перетворюють рядок на переказ. Точки перелічуються прийменниками: `через лс, повз т ТРУБА,
+  до укриття`.
+- перелічи названі точки в порядку руху, від початку до того місця, де марш завершився;
+- залиш супровід БпЛА, супутників, і чим марш скінчився (до укриття, зупинений наказом);
+- нічого не вигадуй: у зведеному рядку не може бути жодного слова, якого немає у вихідних;
+- **ОБИРАЙ ОДИН ВАРІАНТ, НЕ СКЛАДАЙ ОБИДВА.** Коли вихідні рядки називають те саме різними словами
+  (`по тропі` і `по стежці`, `до н\\п ШИРОКЕ` і `до ор ШИРОКЕ`), це один і той самий факт, записаний
+  двома проходами моделі, а не два факти. Візьми одне формулювання - те, що конкретніше, - і решту
+  викинь. Жодна точка не називається в рядку двічі.
+
+      ні:  переміщення в\\с КУДРЯВЫЙ на захід по тропі, стежці до н\\п ШИРОКЕ (ім), ор ШИРОКЕ (ім)
+      так: переміщення в\\с КУДРЯВЫЙ на захід стежкою до н\\п ШИРОКЕ (ім), курс скориговано
+           праворуч за командою ПСИХ
+
+- телеграфно, до ~90 знаків, позивні ВЕЛИКИМИ і невідмінювані, тире лише звичайний дефіс.
+
+    вихідні: переміщення в\\с БАРАКУДА та РАДАР через лс, поле, вздовж рову, у супроводі БпЛА ДЖЕК
+             переміщення в\\с БАРАКУДА у супроводі БпЛА ДЖЕК до укриття (трьохярусний бліндаж)
+    ні:      БАРАКУДА, РАДАР - лс, поле, вздовж рову, у супроводі БпЛА ДЖЕК, БАРАКУДА зайшов у укриття
+    так:     переміщення в\\с БАРАКУДА та РАДАР через лс, поле, вздовж рову до укриття
+             (трьохярусний бліндаж), супровід БпЛА ДЖЕК
+
+ВІДПОВІДАЙ ОДНИМ JSON-ОБ'ЄКТОМ, без тексту навколо: {"text": "..."}"""
+
+
+def merge_split_marches(events: list[dict], model: str, effort: str
+                        ) -> tuple[list[dict], list[tuple[list[dict], dict]]]:
+    """One march written twice, caught by the intercept the two lines SHARE.
+
+    `merge_by_source` cannot see this class: it requires the same printed timestamp, and a split
+    march by definition carries two different ones. On 06.09 it printed БАРАКУДА's walk as 19:56
+    "через лс, поле, вздовж рову" and 20:38 "через лс до укриття (трьохярусний бліндаж)" - the
+    second is the arrival of the first, and intercepts 20:38/20:39/20:41 fed both. Same for РАДАР
+    at 21:53 and 23:01. Four lines for two marches, and the reader counts four movements.
+
+    THREE gates, and all three are needed:
+      1. same network and at least one shared source ref;
+      2. the same `who` - a shared intercept alone means nothing, because one exchange legitimately
+         carries several different facts. That same 21:51 intercept produced BOTH the captured radio
+         and the underground shelter, two real lines that must survive;
+      3. both lines are about MOVEMENT. Without this a man's march and his 300 from the same
+         intercept would collapse into one line, and the 300 would vanish.
+
+    The merge itself is a model call, not a concatenation: the value of the second line is usually
+    the ARRIVAL ("до укриття", "зупинено наказом"), and dropping the shorter line would lose exactly
+    that. It is called before `finish()` on purpose - `--render-only` must stay model-free.
+
+    Fails safe: if the call breaks or comes back empty, both lines are kept and the cluster is
+    reported. Losing a march to a merge bug would be worse than printing it twice.
+    """
+    def _who(x) -> str:
+        return re.sub(r"\s+", " ", str(x.get("who") or "")).strip().casefold()
+
+    def _moves(x) -> bool:
+        return bool(MOVEMENT.search(str(x.get("text") or "")))
+
+    # cluster transitively: a three-leg march is three lines chained by shared intercepts
+    parent = list(range(len(events)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i, e in enumerate(events):
+        if not _who(e) or not _moves(e):
+            continue
+        refs = set(e.get("_src_ref") or [])
+        if not refs:
+            continue
+        for j in range(i + 1, len(events)):
+            o = events[j]
+            if (o.get("_net") or "") != (e.get("_net") or ""):
+                continue
+            if _who(o) != _who(e) or not _moves(o):
+                continue
+            if refs & set(o.get("_src_ref") or []):
+                parent[find(j)] = find(i)
+
+    groups: dict[int, list[int]] = {}
+    for i in range(len(events)):
+        groups.setdefault(find(i), []).append(i)
+
+    kept: list[dict] = []
+    merges: list[tuple[list[dict], dict]] = []
+    drop: set[int] = set()
+    for root, idx in groups.items():
+        if len(idx) < 2:
+            continue
+        parts = [events[i] for i in sorted(idx, key=lambda i: str(events[i].get("time") or ""))]
+        material = "\n".join(f"- {p.get('time')} {p.get('text')}" for p in parts)
+        text = ""
+        try:
+            raw, _dt = call_model(MARCH_SYSTEM, material, model, effort)
+            m = re.search(r"\{.*\}", raw or "", re.S)
+            if m:
+                text = " ".join(str(json.loads(m.group(0)).get("text") or "").split())
+        except Exception as e:                  # noqa: BLE001 — a merge must never lose a march
+            print(f"зведення маршу не вийшло ({e!r}), лишаю обидва рядки", file=sys.stderr)
+        if not text:
+            continue
+        winner = dict(parts[0])
+        winner["text"] = text
+        refs: list[str] = []
+        for p in parts:
+            refs += [r for r in (p.get("_src_ref") or []) if r not in refs]
+        winner["_src_ref"] = refs
+        winner["src"] = sorted({i for p in parts for i in (p.get("src") or [])})
+        winner["confidence"] = min(float(p.get("confidence") or 0) for p in parts)
+        winner["_merged_from"] = [f"{p.get('time')} {p.get('text')}" for p in parts]
+        drop.update(idx)
+        merges.append((parts, winner))
+        events[sorted(idx)[0]] = winner
+        drop.discard(sorted(idx)[0])
+
+    kept = [e for i, e in enumerate(events) if i not in drop]
+    return kept, merges
+
+
+def _evidence_weight(r: dict) -> tuple[int, int]:
+    """How much a copy of an intercept is worth as EVIDENCE, not as a report line.
+
+    The collector routinely carries the same intercept twice: the first post, and a repost minutes
+    later where the analyst refined the network and wrote a fuller «Коментар». The report reads
+    both, but this export used to keep whichever arrived FIRST — so the audit trail could point at
+    the poorer copy. On 24.09.2026 that made a correct line look invented: the coordinates of
+    орієнтир ЛІНКОЛЬН stood in the fuller comment, the exported copy had only a one-line remark,
+    and a re-check that trusts this file would have called it a fabrication.
+    """
+    comments = sum(len(r.get(t) or "") for t in ("comment_above", "comment_below"))
+    return comments, sum(len(s) for s in (r.get("speech") or []))
+
+
+def build_sources_file(recs: list[dict], events: list[dict]) -> tuple[str, int]:
+    """The intercepts every printed line rests on, keyed by the same ref the events carry.
+
+    Written next to the report so "which intercepts is this from" is a lookup, not an
+    investigation. Twice this week answering that meant re-fetching the whole window and rebuilding
+    the chunking so the model's indices lined up again — half an hour for a question the pipeline
+    already knew the answer to.
+    """
+    by_ref: dict[str, dict] = {}
+    for r in recs:
+        ref = ref_of(r)
+        prev = by_ref.get(ref)
+        if prev is None or _evidence_weight(r) > _evidence_weight(prev):
+            by_ref[ref] = r
+    out: dict[str, dict] = {}
+    for e in events:
+        for ref in (e.get("_src_ref") or []):
+            if ref in out:
+                continue
+            r = by_ref.get(ref)
+            if not r:
+                continue
+            out[ref] = {
+                "date": r.get("date"), "time": r.get("time"), "freq": r.get("freq"),
+                "net": r.get("network"),
+                "stations": r.get("stations") or [],
+                "marks": [r[t] for t in ("comment_above", "comment_below") if r.get(t)],
+                "speech": r.get("speech") or [],
+                "msg_id": r.get("msg_id"),
+            }
+    return json.dumps(out, ensure_ascii=False, indent=2), len(out)
+
+
+def union(passes: list[list[dict]]) -> list[dict]:
+    """Add the passes up; never vote. A fact seen by one pass of five is exactly the material this
+    exists to recover — three identical runs once gave 18/25/25 events with only ~75% in common, and
+    what floated included a 300, a fire impact and a planned movement.
+
+    An accumulated event absorbs at most ONE event per pass, so two genuinely distinct events written
+    minutes apart inside a single pass are never collapsed into each other.
+    """
+    acc: list[dict] = []
+    for e in (passes[0] if passes else []):
+        e["_passes"] = 1
+        acc.append(e)
+    for evs in passes[1:]:
+        taken: set[int] = set()
+        for e in evs:
+            t, ns = stamp(e.get("time")), names(e.get("text"))
+            best, best_d = None, None
+            for i, o in enumerate(acc):
+                if i in taken or (o.get("_net") or "") != (e.get("_net") or ""):
+                    continue
+                ot = stamp(o.get("time"))
+                if t is None or ot is None or abs(t - ot) > UNION_TOL_MIN:
+                    continue
+                if not (ns & names(o.get("text"))):
+                    continue
+                d = abs(t - ot)
+                if best_d is None or d < best_d:
+                    best, best_d = i, d
+            if best is None:
+                e["_passes"] = 1
+                acc.append(e)
+            else:
+                taken.add(best)
+                acc[best]["_passes"] = acc[best].get("_passes", 1) + 1
+                if len(str(e.get("text", ""))) > len(str(acc[best].get("text", ""))):
+                    acc[best]["text"] = e["text"]
+                # Keep every address the absorbed event brought: the sources are the evidence, and
+                # a merged event that cites fewer intercepts than it rests on is a worse record.
+                merged_refs = list(acc[best].get("_src_ref") or [])
+                merged_refs += [r for r in (e.get("_src_ref") or []) if r not in merged_refs]
+                acc[best]["_src_ref"] = merged_refs
+    return acc
+
+
+# ─── report ────────────────────────────────────────────────────────────────────────────────────
+
+_SUBJ = re.compile(r"(?:в\\с|шг|груп\w*|розрахунк\w*)\s+([А-ЯЁЇІЄҐ][А-ЯЁЇІЄҐ\-]{2,})")
+
+
+def subject(e: dict) -> str:
+    """Who the line is about. The model states it in `who`; fall back to the first callsign."""
+    w = str(e.get("who") or "").strip()
+    if w:
+        return w.upper()
+    m = _SUBJ.search(str(e.get("text", "")))
+    return m.group(1) if m else ""
+
+
+REPORTS_DB = REPO / "knowledge" / "upstream" / "reports.db"
+KNOWN_CODES = REPO / "knowledge" / "upstream" / "known_codes.md"
+
+
+# The printed register is cut to the men CONFIRMED ON THE AIR within this many days, and the rule
+# applies to EVERY name — the analyst's last list has no immunity (owner's decision, 27.08 evening).
+# Printing the whole accumulated register was 145 callsigns over 97 events, longer than the report
+# it heads. Two days brings that to ~58. Deliberately NOT done: a per-network cap (the owner sees no
+# reason for one) and a floor (if only one man was heard on a net, one man is the truth). Command
+# staff get no exemption either — `ком склад` stands against 41 of the 145 names, so exempting them
+# would not filter anything.
+# Nothing is lost by this: the FULL accumulated register, with each man's last time on the air, is
+# written to `<out>_reestr.txt` next to the report (see build_register_file).
+ROSTER_ACTIVE_DAYS = 2
+
+# How far back the companion file looks when dating a silent callsign. Only the file uses it; the
+# report itself never reads more than ROSTER_ACTIVE_DAYS.
+REGISTER_FILE_DAYS = 14
+
+# A network that barely spoke gives no evidence either way, and cutting its register on that silence
+# says "these men are gone" when the truth is "we heard almost nothing". On 28.08 that turned
+# 189 мсп (НОВОСЕЛІВКА) into 8 -> 2 off 14 intercepts and 141.500 into 1 -> 0 off SIX — a header
+# with nobody under it. Below this much speech in the activity window the register prints in full.
+# Deliberately NOT applied to nets that did talk: шг 38 омсбр had 144 intercepts and 21k characters
+# and still lost 7 of 8 names, and that cut is honest — those men really were not on the air.
+MIN_ACTIVITY_CHARS = 4000
+
+
+def activity_index(dt_to: str) -> dict[str, dict]:
+    """Who has actually been on the air lately, per frequency.
+
+    The register printed under a network header is the analyst's accumulated list, and it accumulates
+    forever: one network was printing 40 callsigns above 10 event lines. Most of them had not been
+    heard in weeks — a man who has gone silent for that long has changed callsign, moved, or is dead,
+    and reminding the reader of him costs more than it gives.
+
+    The window ends at the report's own `--to`, so a callsign that surfaced again TODAY is back in
+    immediately and stays for the next `ROSTER_ACTIVE_DAYS`.
+
+    This is pure rendering — it runs after the model is finished and cannot affect what was
+    extracted. The worst it can do is print too few names, so it fails OPEN: if the lookup comes back
+    empty (a bad query, a DB hiccup), the register is printed in full rather than blanked.
+    """
+    hi = datetime.strptime(dt_to, "%Y-%m-%d %H:%M")
+    recs = fetch(f"{hi - timedelta(days=ROSTER_ACTIVE_DAYS):%Y-%m-%d %H:%M}", dt_to)
+    out: dict[str, dict] = defaultdict(lambda: {"names": set(), "speech": []})
+    for r in recs:
+        f = r.get("freq")
+        if not _is_float(f):
+            continue
+        e = out[f]
+        for raw in r.get("stations", []):
+            for part in re.split(r"[,/]| та ", raw or ""):
+                p = part.strip().strip(".").upper()
+                if len(p) > 2:
+                    e["names"].add(p)
+        e["speech"].extend(r.get("speech", []))
+    return out
+
+
+def heard_on(index: dict[str, dict], freqs: list[str]) -> tuple[set[str], str]:
+    """Everything heard on this network's channels inside the activity window."""
+    names: set[str] = set()
+    speech: list[str] = []
+    mine = [float(x) for x in freqs if _is_float(x)]
+    for f, e in index.items():
+        if any(abs(float(f) - x) * 1000 <= FREQ_TOL_KHZ for x in mine):
+            names |= e["names"]
+            speech.extend(e["speech"])
+    return names, "\n".join(speech).lower()
+
+
+def still_active(name: str, names: set[str], blob: str) -> bool:
+    """A callsign counts as active if it keyed the mic OR was talked about.
+
+    Mentions count deliberately: a commander is discussed far more often than he transmits, and
+    dropping him because he does not press the button would be the wrong error. Matching is a prefix
+    match on the stem, so `Катану` and `Катаны` both hit — and a callsign that is also an ordinary
+    word (ЗЕМЛЯ, БЕЛЫЙ, КОРОЛЬ) will match loosely and be KEPT. That bias is on purpose: printing a
+    name too long is a small cost, dropping a live one is not.
+    """
+    key = name.strip().upper()
+    if key in names:
+        return True
+    for v in re.split(r"[,/]", key):
+        v = v.strip()
+        if len(v) < 3:
+            return True             # too short to match safely — never drop on this evidence
+        if re.search(rf"\b{re.escape(v.lower())}", blob):
+            return True
+    return False
+
+
+def _variants(word: str) -> set[str]:
+    """A code and its spoken forms. `«глаза, глазки»` is ONE entry holding two."""
+    return {v.strip().strip("«»\"'").lower()
+            for v in re.split(r"[,/]", word or "") if v.strip().strip("«»\"'")}
+
+
+def our_codes() -> list[tuple[str, str]]:
+    """Readings WE worked out — pushed INTO a network's legend when its lines use the word.
+
+    The mirror of known_codes(): that list hides what the desk already knows, this one prints what it
+    does not. Some enemy slang was never in the analyst's archive and is not common knowledge either
+    — `океан` (open ground) and `материя` (a treeline), worked out from the 18-19.09.2026 speech.
+    Translating such a word away loses the fact that they use it; printing it bare looks like a typo.
+    So the word stays in the line, quoted and lowercase, and the legend decodes it.
+
+    Only `## PRINT IN LEGEND` is read, so the file can carry its evidence as prose.
+    """
+    path = KNOWN_CODES.parent / "our_codes.md"
+    if not path.exists():
+        return []
+    out, take = [], False
+    for line in path.read_text().splitlines():
+        if line.startswith("## "):
+            take = "PRINT IN LEGEND" in line
+            continue
+        m = re.match(r"\s*-\s*`([^`]+)`\s*[—-]\s*(.+)", line)
+        if m and take:
+            out.append((m.group(1).strip(), m.group(2).strip()))
+    return out
+
+
+def _stem(word: str) -> str:
+    """`материя` -> `матери`, so every declension of it is caught; `океан` is left alone."""
+    return word.strip().strip("«»\"'").lower().rstrip("аяоеийюь") or word.lower()
+
+
+def known_codes() -> set[str]:
+    """Codes the desk already reads without thinking — kept OUT of the printed register block.
+
+    The legend exists to tell the reader something new. A word every analyst knows is noise there and
+    gets deleted by hand, so the owner curates this file and the block filters against it. Adding a
+    word is cheap and reversible: nothing leaves the database, only the print.
+
+    ONLY the `REGISTER BLOCK` section is read. The rest of the file filters readings our own RUN
+    produced, which is a different source with a different verdict — reusing the whole list here
+    would silently empty some networks' legends, and that is the owner's call, not a side effect.
+
+    Parsed by the markdown's own `- \\`word\\` — reading` shape, so the list stays editable as prose.
+
+    (v1 has the same parser in `tools/analytics_render.py`. Deliberately not imported: that module
+    pulls in the whole v1 pipeline at import time, and v2 does not depend on v1. The FILE is the
+    shared thing that matters, not the ten lines that read it.)
+    """
+    if not KNOWN_CODES.exists():
+        return set()
+    out, take = set(), False
+    for line in KNOWN_CODES.read_text().splitlines():
+        if line.startswith("## "):
+            take = "REGISTER BLOCK" in line
+            continue
+        m = re.match(r"\s*-\s*`([^`]+)`", line)
+        if m and take:
+            out |= _variants(m.group(1))
+    return out
+
+
+def _freq_set(raw: str | None) -> list[float]:
+    if not raw:
+        return []
+    try:
+        vals = json.loads(raw) if raw.strip().startswith("[") else raw.split("/")
+    except json.JSONDecodeError:
+        vals = raw.split("/")
+    out = []
+    for v in vals:
+        try:
+            out.append(float(str(v).strip()))
+        except ValueError:
+            pass
+    return out
+
+
+_UNIT = re.compile(r"(\d{1,4})\s*(омсбр|омбр|мсбр|мсп|мсд|пмп|дшб|мсб|мср|бр|полк|бат)", re.I)
+
+
+def unit_tags(text: str) -> set[str]:
+    """The formations named in a network header — `186 мсп`, `57 омсбр`, `3 мсб`.
+
+    Only the regiment/brigade level is used for matching (мсб/мср are sub-units and the analyst
+    writes them inconsistently), so a header that names only a battalion produces no tag and the
+    check falls open.
+    """
+    big = {"омсбр", "омбр", "мсбр", "мсп", "мсд", "пмп", "полк"}
+    return {f"{n} {k.lower()}" for n, k in _UNIT.findall(text or "") if k.lower() in big}
+
+
+_BIG_UNIT = re.compile(r"(\d{1,4})\s*(омсбр|омбр|мсбр|мсп|пмп|полк)", re.I)
+
+
+def net_group(net: str) -> str:
+    """The formation a network block belongs to — `38 омсбр`, `189 мсп`, `60 омсбр`.
+
+    Deliberately the regiment/brigade and NOT the division: `3 мсб 114 мсп 127 мсд` is the 114 мсп's
+    net to the analyst, and grouping it under 127 мсд would put it next to strangers. A header that
+    names no formation at all (`нв підрозділу (дорозвідка р-н НОВОСЕЛІВКА)`) gets an empty group and
+    sinks to the bottom — it belongs to nobody, so it cannot break anybody's run.
+    """
+    m = _BIG_UNIT.search(net or "")
+    return f"{m.group(1)} {m.group(2).lower()}" if m else ""
+
+
+def order_networks(by_net: dict[str, list]) -> list[str]:
+    """Print order: formations stay TOGETHER, biggest formation first.
+
+    Sorting purely by event count scattered one brigade across the whole report — 26.08 ran 60 омсбр
+    and then 454.0700 of the 38th, with the other five nets of the 38th spread below — and the desk
+    reads it formation by formation. So the primary key is the formation's total, the secondary is
+    the net's own; the analyst's own reports are grouped the same way.
+
+    Captured radios go last, as they do in his reports: they are somebody else's net that we happen
+    to hear, and they should not sit inside a formation's run.
+    """
+    tot: dict[str, int] = defaultdict(int)
+    for net, evs in by_net.items():
+        tot[net_group(net)] += len(evs)
+
+    def key(net: str):
+        g = net_group(net)
+        trophy = 1 if re.search(r"троф", net or "", re.I) else 0
+        # no formation named → after the named ones, before nothing else
+        return (trophy, 0 if g else 1, -tot[g], g, -len(by_net[net]), net)
+
+    return sorted(by_net, key=key)
+
+
+def same_unit(mine_header: str, archive_header: str) -> bool:
+    """May this archive network's register be printed under this report network?
+
+    Frequency overlap alone is not enough. A CAPTURED radio puts two different formations on one
+    channel: `57 омсбр 5А (трофей 11.08.26 Гірке)` shares a frequency with `186 мсп`, and on that
+    single hit the whole 57 омсбр roster was being printed under the 186 мсп header — other people's
+    men listed as if they were on this net. So when both headers name a formation and the two sets
+    do not intersect, the register does not travel.
+
+    Fails OPEN on purpose: if either header names no formation (plenty do not — `УКХ р/м нв
+    підрозділу (дорозвідка р-н НОВОСЕЛІВКА)`), the frequency evidence is all there is and it decides.
+    """
+    a, b = unit_tags(mine_header), unit_tags(archive_header)
+    return not (a and b) or bool(a & b)
+
+
+def assign_registers(freqs_of: dict[str, list[str]]) -> dict[str, tuple[list, list]]:
+    """Give every archive network to exactly ONE network of this report.
+
+    The first version asked each report network independently "which archive networks share a
+    frequency with me", and an archive network that matched three of them was printed under all
+    three. The result looked exactly like what it was: `СЕРБ, БАЗА, ГРОМ` and one identical legend
+    standing under `2 мсб 38 омсбр`, under `189 мсп (БАГАТЕ)` and under `189 мсп (НОВОСЕЛІВКА)` in
+    the same report. A register that names the same men on three different nets is worse than none.
+
+    So the assignment is made globally and is exclusive: each archive network goes to the report
+    network it overlaps most, measured first by how many of its frequencies match and then by what
+    share of that report network's own frequencies they cover — the more specific claim wins.
+    """
+    if not REPORTS_DB.exists():
+        return {}
+    try:
+        con = sqlite3.connect(f"file:{REPORTS_DB}?mode=ro", uri=True)
+        archive = [(nid, _freq_set(fr), hdr)
+                   for nid, fr, hdr in con.execute("SELECT id, freqs, header FROM networks")]
+    except sqlite3.Error:
+        return {}
+
+    mine_of = {net: [float(x) for x in fr if _is_float(x)] for net, fr in freqs_of.items()}
+    owned: dict[str, list[int]] = defaultdict(list)
+    for nid, afs, ahdr in archive:
+        best, best_score = None, (0, 0.0)
+        for net, mine in mine_of.items():
+            if not mine:
+                continue
+            hits = sum(1 for a in afs for b in mine if abs(a - b) * 1000 <= FREQ_TOL_KHZ)
+            if not hits:
+                continue
+            if not same_unit(net, ahdr):
+                continue
+            score = (hits, hits / len(mine))
+            if score > best_score:
+                best, best_score = net, score
+        if best:
+            owned[best].append(nid)
+
+    out: dict[str, tuple[list, list]] = {}
+    for net, ids in owned.items():
+        out[net] = apply_external_notes(net, _pull_register(con, ids), freqs_of.get(net))
+    # A net that owns no archive network still deserves the notes: `1 шр "V"` may be in this
+    # report while the archive has nothing to hand it, and the analyst's own description of its
+    # commander must not fall through that gap.
+    for net in freqs_of:
+        if net not in out:
+            reg = apply_external_notes(net, ([], [], []), freqs_of.get(net))
+            if reg[0]:
+                out[net] = reg
+    return out
+
+
+CALLSIGN_NOTES = Path(__file__).with_name("callsign_notes.json")
+
+
+@lru_cache(maxsize=1)
+def external_notes() -> tuple:
+    """Callsign descriptions handed to us by a LIVE ANALYST, outside this pipeline.
+
+    Kept apart from everything the module infers on purpose. The archive's `role` column is what one
+    analyst typed next to a name on one day; these carry rank and post, which the archive does not
+    have at all - `БОРЕЦ` stands in our archive as `кр 2мср` and is in fact the brigade commander,
+    a lieutenant colonel. Printing him as a company commander is not a cosmetic error: it changes
+    how the whole net reads.
+    """
+    if not CALLSIGN_NOTES.exists():
+        return ()
+    try:
+        data = json.loads(CALLSIGN_NOTES.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:      # noqa: BLE001 — never lose a run over a note
+        print(f"нотатки про позивних не прочитались: {e!r}", file=sys.stderr)
+        return ()
+    return tuple(data.get("notes") or [])
+
+
+def _formation_matches(formation: str, header: str) -> bool:
+    """EVERY token of the note's formation must be in the block header. The whole safety of the
+    file: `МАРС` also stands on 141.2500 under `2 мсб 71 мсп 42 мсд 58 А`, and a note scoped only by
+    callsign would label that man a medic of a brigade he has nothing to do with."""
+    h = re.sub(r"[\"'«»]", " ", str(header or "")).casefold()
+    return all(t in h for t in re.split(r"\s+", str(formation or "").casefold()) if t)
+
+
+def apply_external_notes(net: str, reg: tuple, freqs: list[str] | None = None) -> tuple:
+    """Overlay the live-analyst notes onto one report block's roster.
+
+    A man who ALREADY stands in this block's roster has his role REPLACED - the note outranks the
+    archive line. Adding a man who is not there is a different and much stronger claim, so it happens
+    only when the note says `add_to_net: true`.
+
+    That flag exists because the first version appended on any formation match, and `БОРЕЦ`, scoped
+    to `38 омсбр`, was inserted into ELEVEN nets of the brigade at once - управління, 1 мсб, 2 мсб,
+    шг, ППС, підрозділ "Шторм". A brigade commander does not sit in the register of every net his
+    brigade owns, and this file already knows why that is bad: `assign_registers` was rewritten
+    precisely because "a register that names the same men on three different nets is worse than
+    none". A brigade-wide note may therefore only CORRECT a man where he is already recorded.
+    """
+    notes = external_notes()
+    if not notes:
+        return reg
+    roster, legend, remarks = list(reg[0]), reg[1], reg[2]
+    idx = {}
+    for i, row in enumerate(roster):
+        for v in _variants(str(row[0])):
+            idx.setdefault(v.upper(), i)
+    for rec in notes:
+        if not _formation_matches(rec.get("formation", ""), net):
+            continue
+        # A formation is too coarse an anchor for a man who has to be INSERTED. `ША` scoped to
+        # `70 мсп` landed in four of its nets at once - the same spread that `add_to_net` was
+        # invented to stop for `БОРЕЦ`. `freqs` pins a note to the block that actually carries his
+        # channel; without it the note stays formation-wide, which is right for a correction.
+        if want := rec.get("freqs"):
+            mine = [float(x) for x in (freqs or []) if _is_float(x)]
+            if not any(abs(float(w) - m) * 1000 <= FREQ_TOL_KHZ
+                       for w in want if _is_float(w) for m in mine):
+                continue
+        names = [rec.get("callsign", "")] + list(rec.get("aliases") or [])
+        role = " ".join(str(rec.get("role") or "").split())
+        hit = next((idx[n.upper()] for n in names if n.upper() in idx), None)
+        if hit is None:
+            if not rec.get("add_to_net"):
+                continue
+            roster.append((rec.get("callsign", ""), role, False))
+            _log_note(f"{rec.get('callsign')} ДОДАНО до {netlabel(net, 40)} - {role}")
+        else:
+            was = str(roster[hit][1] or "")
+            # An empty role in a note is deliberate - it says "this man exists, we do NOT know his
+            # job" (ША). It must never wipe a role the archive does have.
+            if not role:
+                continue
+            roster[hit] = (roster[hit][0], role, roster[hit][2])
+            if was.casefold() != role.casefold():
+                _log_note(f"{roster[hit][0]} у {netlabel(net, 40)} «{was or '—'}» -> «{role}»")
+    return roster, legend, remarks
+
+
+_NOTE_LOGGED: set[str] = set()
+
+
+def _log_note(msg: str) -> None:
+    """Say it once. `assign_registers` runs several times per report (register file, dupes file,
+    the report itself) and the same overlay would otherwise be printed four times over."""
+    if msg not in _NOTE_LOGGED:
+        _NOTE_LOGGED.add(msg)
+        print(f"нотатка аналітика: {msg}", file=sys.stderr)
+
+
+def _pull_register(con, ids: list[int]) -> tuple[list[tuple[str, str, bool]], list[tuple[str, str]], list[str]]:
+    """Roster and legend for one network of this report, from the archived analyst reports.
+
+    The roster comes back in two parts, CORE FIRST: the list as the analyst last wrote it for this
+    network, then everyone he listed on it earlier. Aggregating all thirteen archived reports into
+    one flat list inflated a net to 15 names where his own last report carried 8 — different epochs
+    of the same net stacked on top of each other. The last report is the list a human was actually
+    keeping, so it leads; the older names are candidates, kept only if they have been heard lately
+    (see build_report).
+    """
+    core_ids = ids
+    if len(ids) > 1:
+        marks_all = ",".join("?" * len(ids))
+        rid = con.execute(f"SELECT max(report_id) FROM networks WHERE id IN ({marks_all})",
+                          ids).fetchone()[0]
+        core_ids = [i for (i,) in con.execute(
+            f"SELECT id FROM networks WHERE id IN ({marks_all}) AND report_id = ?", [*ids, rid])]
+
+    marks = ",".join("?" * len(ids))
+
+    def pull(sql: str) -> list[tuple[str, str]]:
+        # Deduped case-insensitively but printed as written: callsigns are uppercase, code words are
+        # not (`«платье»`), so upper-casing the key would mangle half the legend.
+        seen: dict[str, tuple[str, str]] = {}
+        for key, val in con.execute(sql.format(marks=marks), ids):
+            k = str(key or "").strip()
+            # A wrapped source line sometimes leaves the description opening on punctuation
+            # (`- , «прилетит в ворота» – …`); that is the seam, not content.
+            v = " ".join(str(val or "").split()).lstrip(",-–— ").strip()
+            if not k:
+                continue
+            if k.lower() not in seen or len(v) > len(seen[k.lower()][1]):
+                seen[k.lower()] = (k, v)
+        return list(seen.values())
+
+    def pull_roster(where_ids: list[int]) -> list[tuple[str, str]]:
+        # A callsign with no role IS printed. The analyst writes plenty of them — `ЛЕВША`, `ЗАЗА`,
+        # `КАЩЕЙ`, `МИХЕЙ` stand alone in his own 21.08 report — and dropping them cost us three of
+        # the five names on one net. Knowing a man is on this network is the point; his job is a
+        # bonus. (A LEGEND entry with no reading is different and still goes: an unexplained code
+        # word tells the reader nothing at all.)
+        m = ",".join("?" * len(where_ids))
+        seen: dict[str, tuple[str, str]] = {}
+        for key, val in con.execute(
+                f"SELECT callsign, role FROM roster WHERE network_id IN ({m}) ORDER BY id",
+                where_ids):
+            k = str(key or "").strip()
+            v = " ".join(str(val or "").split()).lstrip(",-–— ").strip()
+            # A frequency that slipped into the callsign column during the archive import is not a
+            # man: `473.1753` was standing in the register of 1198 мсп as if it were a person.
+            # Nothing made of digits, dots and slashes alone is a callsign.
+            if not k or len(k) < 2 or re.fullmatch(r"[\d.,/ +-]+", k):
+                continue
+            if k.lower() not in seen or len(v) > len(seen[k.lower()][1]):
+                seen[k.lower()] = (k, v)
+        return list(seen.values())
+
+    def fold_variants(rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """`СПАРТАК/ПАРТАК` and `СПАРТАК` are ONE man written twice — merge them.
+
+        The analyst records a callsign he has heard two ways as `A/B`, and on another day writes
+        just `A`. Both then stood in the register as separate people (186 мсп printed СПАРТАК and
+        СПАРТАК/ПАРТАК side by side). Rows whose variant sets intersect are folded into the one with
+        the most information: the widest spelling, and the longest role text of the group.
+        """
+        out: list[tuple[set, str, str]] = []
+        for name, role in rows:
+            vs = _variants(name)
+            for i, (seen, kept_name, kept_role) in enumerate(out):
+                if vs & seen:
+                    best_name = kept_name if len(kept_name) >= len(name) else name
+                    best_role = kept_role if len(kept_role) >= len(role) else role
+                    out[i] = (seen | vs, best_name, best_role)
+                    break
+            else:
+                out.append((vs, name, role))
+        return [(n, r) for _v, n, r in out]
+
+    core = fold_variants(pull_roster(core_ids))
+    core_vars = {v for c, _ in core for v in _variants(c)}
+    older = [(c, r) for c, r in fold_variants(pull_roster(ids))
+             if not (_variants(c) & core_vars)]
+    legend = pull("SELECT code, meaning FROM legend WHERE network_id IN ({marks}) ORDER BY id")
+    legend = [(c, m) for c, m in legend if m]
+    known = known_codes()
+    legend = [(c, m) for c, m in legend if not (_variants(c) & known)]
+    # A remark the analyst wrote on its own line under the register — it belongs to the NETWORK, not
+    # to any callsign or code, and it used to be swallowed as the tail of whatever legend entry stood
+    # above it (`«платье» - «пончо, халат» Відмічено за ідентичні татуювання для о\с 60 мсбр`).
+    # Deduped on the text: the same remark repeats across his reports for the same net.
+    notes, seen_notes = [], set()
+    try:
+        rows = con.execute(f"SELECT text FROM notes WHERE network_id IN ({marks}) ORDER BY id",
+                           ids).fetchall()
+    except sqlite3.Error:
+        rows = []          # a base imported before notes existed — the register still prints
+    for (t,) in rows:
+        t = " ".join(str(t or "").split())
+        if t and t.lower() not in seen_notes:
+            seen_notes.add(t.lower())
+            notes.append(t)
+    # (callsign, role, is_older) — is_older marks a name the analyst had on this net BEFORE his last
+    # report; those are the only ones the activity check may drop.
+    return ([(c, r, False) for c, r in core] + [(c, r, True) for c, r in older], legend, notes)
+
+
+def archive_records(callsign: str) -> list[tuple[str, str, str, str]]:
+    """Every archived line the analyst ever wrote for this callsign: (source, freqs, header, role)."""
+    if not REPORTS_DB.exists():
+        return []
+    try:
+        con = sqlite3.connect(f"file:{REPORTS_DB}?mode=ro", uri=True)
+        rows = con.execute(
+            "SELECT r.source, n.freqs, n.header, ro.role FROM roster ro "
+            "JOIN networks n ON n.id = ro.network_id JOIN reports r ON r.id = n.report_id "
+            "WHERE upper(ro.callsign) = ? ORDER BY r.source", (callsign.upper(),)).fetchall()
+    except sqlite3.Error:
+        return []
+    seen, out = set(), []
+    for src, fr, hdr, role in rows:
+        full = (" ".join(str(hdr or "").split()), " ".join(str(role or "").split()))
+        # Dedup on a shortened key, but STORE the full text. Storing `key` instead is what put
+        # "( Чарівне- Гуляйпі" into `_dubli.txt` — a network name cut mid-word, in the one file
+        # whose whole job is to show the analyst's own wording verbatim.
+        key = (full[0][:60], full[1][:60])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((str(src or ""), "/".join(_freq_str(fr)), full[0], full[1]))
+    return out
+
+
+_NET_LEAD = re.compile(r"^\s*(?:УКХ|КХ)\s+р/м\s*", re.I)
+
+
+def netlabel(net: str, width: int = 52) -> str:
+    """Short but UNAMBIGUOUS name of a network, for a log line.
+
+    Replaces the hard `net[:34]` cuts this file used to make. Those chopped off the TAIL, and the
+    tail is the district in brackets — the one part that tells two same-numbered units apart. A run
+    printed `реєстр УКХ р/м 1 мсб 60 омсбр (р-н ЗАЛІЗН` and `реєстр УКХ р/м йм. 2 мсб 38 омсбр
+    (р-н ЧА`: both unreadable, and neither could be pasted back into a query. So: drop the constant
+    "УКХ р/м" lead (it is on every net and distinguishes nothing), squeeze whitespace, and if it
+    still does not fit, elide the MIDDLE so the unit AND the district both survive.
+    """
+    s = _NET_LEAD.sub("", " ".join(str(net or "").split()))
+    if len(s) <= width:
+        return s
+    head = (width - 3) * 2 // 3
+    return s[:head] + "..." + s[-(width - 3 - head):]
+
+
+def _freq_str(raw) -> list[str]:
+    try:
+        vals = json.loads(raw) if str(raw).strip().startswith("[") else str(raw).split("/")
+    except Exception:                                   # noqa: BLE001
+        vals = [str(raw)]
+    return [str(v).strip() for v in vals if str(v).strip()]
+
+
+def build_dupes_file(registers: dict, nets: list[str], dt_from: str, dt_to: str) -> str:
+    """Callsigns standing in the register of MORE THAN ONE network of this report.
+
+    Deliberately a separate file and NOT part of the report: the same callsign in two formations is
+    usually two different men (`ФОКС` is documented as one commander in one net of 38 омсбр and an
+    accumulator in another), so merging them would be the worse error — but seeing the repeat with
+    no explanation is confusing, and the explanation is always in the analyst's own archive. Some of
+    it is HIS uncertainty rather than ours: 411.9630 is signed `2 мсб 38 омсбр` in one report and
+    `189 мсп` in another, which alone puts МАРК on two nets.
+    """
+    where: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for net in nets:
+        roster, _, _ = registers.get(net, ([], [], []))
+        for cs, role, _older in roster:
+            where[cs.upper()].append((net, role))
+    dupes = {c: v for c, v in where.items() if len(v) > 1}
+
+    out = ["Позивні, що стоять у реєстрі більш ніж однієї мережі цього звіту",
+           "довідка для нас, у звіт НЕ йде",
+           f"вікно {dt_from} - {dt_to}", ""]
+    if not dupes:
+        out.append("Таких позивних немає.")
+        return "\n".join(out) + "\n"
+
+    for cs in sorted(dupes):
+        out.append(f"{cs} - у {len(dupes[cs])} мережах цього звіту")
+        for net, role in dupes[cs]:
+            out.append(f"    {net}" + (f" - {role}" if role else ""))
+        arch = archive_records(cs)
+        if arch:
+            out.append("  як це записано в архіві аналітика:")
+            for src, freqs, hdr, role in arch:
+                out.append(f"    {src[:24]:24} {freqs[:30]:30} {hdr}" + (f" | {role}" if role else ""))
+        out.append("")
+    return "\n".join(out) + "\n"
+
+
+def build_carryover_section(events: list[dict], dt_from: str) -> str:
+    """Lines resting ONLY on intercepts yesterday's report already read. Shown, never dropped.
+
+    The window reads `WINDOW_LEAD_IN_MIN` before its own start because the collector lags, so that
+    hour is analysed twice - once as yesterday's tail, once as today's lead-in. The obvious fix is a
+    filter, and MEASURING it is what stopped us building one. Over 02.09-06.09 the overlap produced
+    seven such lines, and only three were duplicates:
+
+      * 05.09 14:46 `наказ СИБИРЯК ... винести лише 200 РОВ, тіла СОУ не забирати` and 04.09 14:22
+        `переміщення в\\с АРМЯН, ШАБА повз позицію в\\с КОРОП` were MISSED by the earlier report and
+        printed only by the later one. A filter would have deleted them outright.
+      * 05.09 14:53 printed as `ВУ по укритттю - бліндаж знищено, ім видано положення в\\с` in the
+        05.09 report and as `знищено бліндаж (о\\с 1 мсб 60 омсбр)` in the 06.09 one - the second
+        pass CORRECTED it. A filter keyed on "yesterday saw these intercepts" would have kept the
+        wrong version and dropped the right one.
+
+    So the second pass is worth more than it costs, and the honest tool is visibility: name the
+    lines, let the reader decide. Nothing here changes the report.
+    """
+    try:
+        d = datetime.strptime(str(dt_from)[:10], "%Y-%m-%d")
+    except ValueError:
+        return ""
+    prev_path = OUT_DIR / f"ZVIT_{d:%d.%m}_events.json"
+    head = ["", "", "Рядки, що спираються ЛИШЕ на перехоплення з учорашнього звіту",
+            "довідка для нас, у звіт НЕ йде; нічого не викидається",
+            f"звірено з {prev_path.name}", ""]
+    if not prev_path.exists():
+        return "\n".join(head + [f"учорашнього файлу подій немає ({prev_path.name}) - звірити нема з чим"]) + "\n"
+    try:
+        prev = json.loads(prev_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:      # a reference file must not lose a run
+        return "\n".join(head + [f"учорашній файл не прочитався: {e!r}"]) + "\n"
+
+    seen = {r for e in prev for r in (e.get("_src_ref") or [])}
+    if not seen:
+        return "\n".join(head + ["учорашній звіт зібраний до появи стійких посилань - звірка неможлива"]) + "\n"
+
+    prev_text = {" ".join(str(e.get("text") or "").split()) for e in prev}
+    twins = [e for e in events
+             if e.get("_src_ref") and set(e["_src_ref"]) <= seen]
+    if not twins:
+        return "\n".join(head + ["Таких рядків немає."]) + "\n"
+
+    out = head + [f"Таких рядків: {len(twins)}. Кожен - або справжній дубль, або підібране за"
+                  " вчорашнім пропуском, або виправлена версія вчорашнього рядка.", ""]
+    for e in twins:
+        same = " ".join(str(e.get("text") or "").split()) in prev_text
+        out.append(f"{e.get('time')} {e.get('text')}")
+        out.append(f"    {'дослівно як учора' if same else 'формулювання ІНШЕ, ніж учора'}"
+                   f" | мережа: {netlabel(str(e.get('_net')))}")
+        out.append(f"    перехоплення: {', '.join((e.get('_src_ref') or [])[:4])}")
+        out.append("")
+    return "\n".join(out) + "\n"
+
+
+def build_sibling_nets_section(events: list[dict], freqs_of: dict[str, list[str]],
+                               titles: dict, recs: list[dict], registers: dict) -> str:
+    """Blocks of THIS report that name the same formation but print separately - with the one
+    number that says whether they are really one net: how many correspondents they share.
+
+    Deliberately a note and NOT a merge. Measured over 16 report-days: 209 blocks, 7 such splits,
+    and only ONE of them should be merged -
+
+        3 мсб 70 мсп      56 vs   7 позивних | спільних 6 = 85.7%   одна мережа
+        шг 38 омсбр       70 vs 229          | спільних 5 =  7.1%   різні шг однієї бригади
+        60 омсбр          59 vs  52          | спільних 0 =  0.0%
+        дшб 155 пмп        9 vs  41          | спільних 0 =  0.0%
+        60 омсбр (20.08)  19 vs  59          | спільних 0 =  0.0%
+
+    Merging on the formation NAME would therefore be wrong four times out of five. Splitting does
+    not lie - the name above both blocks is correct - it only fails to show adjacency, once a
+    fortnight, for one line. `cluster()`'s known defect runs the OTHER way (transitive merging put an
+    event under the wrong battalion on 27.08, see PLANS.md), so adding a second merge path into it
+    would be building on the bug.
+
+    What this file buys instead: after a month there are thirty measurements rather than one, so if
+    the clustering work is ever done the threshold comes from data.
+
+    **Two names are compared, not one day's traffic.** The first version measured only the stations
+    heard inside this window and immediately produced a false verdict: on 06.09 every intercept on
+    147.0000 came in with an EMPTY station list (the operator filled none of them), so the overlap
+    was 0 of 0 and the note said `різні мережі однієї частини` - reading absence of data as evidence
+    of difference, which is the one thing a reference file must never do. The set is now the
+    analyst's accumulated roster for the net UNION the window's stations, and a verdict is withheld
+    entirely below `SIBLING_MIN_NAMES` names on either side.
+    """
+    def _callsigns(freqs: list[str]) -> set[str]:
+        mine = [float(x) for x in freqs if _is_float(x)]
+        out: set[str] = set()
+        for r in recs:
+            f = r.get("freq")
+            if not _is_float(f) or not any(abs(float(f) - x) * 1000 <= FREQ_TOL_KHZ for x in mine):
+                continue
+            for raw in r.get("stations", []) or []:
+                for p in re.split(r"[,/]| та ", raw or ""):
+                    p = p.strip().strip(".").upper()
+                    if len(p) > 2 and p != "НВ":
+                        out.add(p)
+        return out
+
+    # Keyed on the PARSED hierarchy, never on the printed header string. The first version keyed on
+    # the printed line and went blind on 07.09: `151.9550` came out as `3 мсб 70 мсп` and `147.0000`
+    # as `3 мсб 70 мсп 42 мсд 58 А`, so the note said "Таких блоків немає" about the ONE pair we had
+    # already established, by people and by days, to be a single net. A composed header unions the
+    # raw variants seen in THIS window, so its depth changes with whatever the operator happened to
+    # type - the division and the army are present some days and absent others. Anything keyed on
+    # that text is keyed on an accident.
+    #
+    # So the key is the formation (regiment/brigade) only, and the battalion/company are treated as
+    # COMPATIBILITY rather than identity: equal, or absent on one side, still pairs. Missing depth
+    # must not separate - that is the exact failure being fixed. Over-pairing costs one line of
+    # reference text and the overlap number then says "різні мережі"; under-pairing loses the
+    # finding entirely.
+    nets = list(dict.fromkeys(e.get("_net") for e in events if e.get("_net")))
+    lvl = {}
+    for net in nets:
+        head = titles.get(net, (net, []))[0] if titles else net
+        lvl[net] = parse_levels(str(head))
+
+    def _compatible(a: str, b: str) -> bool:
+        for part in ("battalion", "company"):
+            x, y = lvl[a].get(part), lvl[b].get(part)
+            if x and y and x != y:
+                return False
+        return True
+
+    by_formation: dict[str, list[str]] = defaultdict(list)
+    for net in nets:
+        if f := lvl[net].get("formation"):
+            by_formation[f].append(net)
+
+    split = {}
+    for f, group in by_formation.items():
+        pairs = [(a, b) for i, a in enumerate(group) for b in group[i + 1:] if _compatible(a, b)]
+        if pairs:
+            split[f] = (group, pairs)
+    head = ["", "", "Блоки цього звіту, що називають ОДНУ частину, але друкуються окремо",
+            "довідка для нас, у звіт НЕ йде; нічого не зливається",
+            "спільні кореспонденти - єдина ознака, що це справді одна мережа",
+            f"ефір рахується за {SIBLING_WINDOW_DAYS} діб назад, не за вікно звіту: за одну добу "
+            f"перетин занижений структурно (70 мсп: 33% за добу проти 60% за тиждень)", ""]
+    if not split:
+        return "\n".join(head + ["Таких блоків немає."]) + "\n"
+
+    out = head[:]
+    for key, (group, pairs) in sorted(split.items()):
+        out.append(f"{key} - {len(group)} блоки")
+        sets, heard = {}, {}
+        for net in group:
+            air = _callsigns(freqs_of.get(net, []))
+            roster = {str(cs).upper() for cs, _r, _o in registers.get(net, ([], [], []))[0]}
+            sets[net], heard[net] = air | roster, air
+            depth = " ".join(v for k, v in lvl[net].items()
+                             if k in ("battalion", "company", "division", "army")) or "-"
+            out.append(f"    {'/'.join(freqs_of.get(net, [])) or '?'} - імен {len(sets[net])} "
+                       f"(у реєстрі {len(roster)}, чути в цьому вікні {len(air)}) | шапка: {depth}")
+        for a, b in pairs:
+            A, B = sets[a], sets[b]
+            inter = A & B
+            small = min(len(A), len(B))
+            fa, fb = "/".join(freqs_of.get(a, [])), "/".join(freqs_of.get(b, []))
+            if small < SIBLING_MIN_NAMES:
+                out.append(f"    {fa} ∩ {fb}: ВИСНОВКУ НЕМАЄ - імен лише {small}, "
+                           f"нуль спільних тут означає брак даних, а не різні мережі")
+                continue
+            pct = 100 * len(inter) / small
+            verdict = ("ІМОВІРНО ОДНА МЕРЕЖА" if pct >= 50 and len(inter) >= 3
+                       else "різні мережі однієї частини" if pct < 15
+                       else "невизначено")
+            out.append(f"    {fa} ∩ {fb}: спільних {len(inter)} з {small} ({pct:.0f}%) - {verdict}")
+            if inter:
+                out.append(f"        {', '.join(sorted(inter))[:100]}")
+        out.append("")
+    return "\n".join(out) + "\n"
+
+
+def last_heard_map(recs: list[dict], freqs: list[str], names: list[str],
+                   dt_to: str) -> dict[str, float]:
+    """Days since each callsign was last heard on this network's channels, or talked about there.
+
+    Same evidence as the printed register's filter (`still_active`) — a man counts as present when
+    he keys the mic OR when someone names him — so the file can never say "heard yesterday" about
+    somebody the report decided to drop.
+    """
+    mine = [float(x) for x in freqs if _is_float(x)]
+    rows = []
+    for r in recs:
+        f, dt = r.get("freq"), r.get("_dt")
+        if not dt or not _is_float(f):
+            continue
+        if not any(abs(float(f) - x) * 1000 <= FREQ_TOL_KHZ for x in mine):
+            continue
+        st = {p.strip().strip(".").upper()
+              for raw in r.get("stations", []) for p in re.split(r"[,/]| та ", raw or "")}
+        rows.append((dt, st, " ".join(r.get("speech", []) or []).lower()))
+    rows.sort(key=lambda x: x[0], reverse=True)
+    hi = datetime.strptime(dt_to, "%Y-%m-%d %H:%M")
+    out: dict[str, float] = {}
+    for name in names:
+        for dt, st, blob in rows:
+            if still_active(name, st, blob):
+                out[name] = (hi - dt).total_seconds() / 86400
+                break
+    return out
+
+
+def _age_words(days: float | None) -> str:
+    if days is None:
+        return f"не чути {REGISTER_FILE_DAYS}+ діб"
+    if days < 1:
+        return "чути сьогодні"
+    if days < 2:
+        return "чути вчора"
+    return f"останнє чути {days:.0f} діб тому"
+
+
+def build_register_file(registers: dict, nets: list[str], freqs_of: dict[str, list[str]],
+                        dt_from: str, dt_to: str, active: dict | None = None) -> str:
+    """The FULL accumulated register, with the date each man was last on the air.
+
+    The report prints only the men confirmed within ROSTER_ACTIVE_DAYS; this file is what makes that
+    cut safe. Nothing is deleted from the archive, and a name the report dropped is here with the
+    reason next to it, so a man who is heard again comes back into the report by himself.
+
+    The `без ролі` block is deliberate: those are the analyst's own entries with no role written.
+    We do not invent one — the block exists so he can fill it in and we pick it up.
+    """
+    hi = datetime.strptime(dt_to, "%Y-%m-%d %H:%M")
+    recs = fetch(f"{hi - timedelta(days=REGISTER_FILE_DAYS):%Y-%m-%d %H:%M}", dt_to)
+
+    out = ["Повний реєстр позивних, накопичений з архіву аналітика",
+           "довідка для нас, у звіт НЕ йде",
+           f"вікно звіту {dt_from} - {dt_to}",
+           f"у звіт друкуються ті, кого чути за {ROSTER_ACTIVE_DAYS} доби; решта — тут",
+           f"давність рахується за {REGISTER_FILE_DAYS} діб назад", ""]
+    for net in nets:
+        roster, _legend, _notes = registers.get(net, ([], [], []))
+        if not roster:
+            continue
+        fr = freqs_of.get(net) or []
+        ages = last_heard_map(recs, fr, [c for c, _, _ in roster], dt_to)
+        thin = False
+        if active:
+            _n, _blob = heard_on(active, fr)
+            thin = len(_blob) < MIN_ACTIVITY_CHARS
+        if thin:
+            # the report printed this register whole (too little air to judge) — say so here too
+            shown = [(c, r) for c, r, _ in roster]
+        else:
+            shown = [(c, r) for c, r, _ in roster if (ages.get(c) is not None
+                                                     and ages[c] <= ROSTER_ACTIVE_DAYS)]
+        hidden = [(c, r) for c, r, _ in roster if (c, r) not in shown]
+        out += ["/".join(fr), net,
+                f"  у звіті ({len(shown)} з {len(roster)})"
+                + ("  [мало ефіру — реєстр не різався]" if thin else "") + ":"]
+        for c, r in shown:
+            out.append(f"    {c + (' - ' + r if r else ''):<58} {_age_words(ages.get(c))}")
+        if not shown:
+            out.append("    (нікого — за поріг не чути жодного)")
+        out.append(f"  не друкується ({len(hidden)}):")
+        for c, r in sorted(hidden, key=lambda x: ages.get(x[0], 1e9)):
+            out.append(f"    {c + (' - ' + r if r else ''):<58} {_age_words(ages.get(c))}")
+        no_role = [c for c, r, _ in roster if not r]
+        if no_role:
+            out.append(f"  без ролі (аналітик не вказав, ми не вигадуємо): {', '.join(no_role)}")
+        out.append("")
+    return "\n".join(out) + "\n"
+
+
+def register_for(freqs: list[str]) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """The callsign register and the code legend this network is already known to work with.
+
+    Both come from the analyst's own files, imported by `tools/report_import.py`. From 25.08.2026 he
+    stops producing reports and ours is the only one, so this block is no longer a convenience — it
+    is the only place the accumulated register survives.
+
+    Matched by FREQUENCY, never by header text: the header is retyped by hand every day and drifts,
+    the frequency set is the network's actual identity. Tolerance is the same 5 kHz used to cluster
+    the live traffic, because two readings of one channel differ by a couple of kHz.
+
+    Roster is per network by necessity — `ФОКС` is `ком склад` in one network of 38 омсбр and
+    `накопичувач` in another, so a global table would merge two different men. Legend is per network
+    too, on the owner's correction (2026-08-25): most codes do repeat unchanged, but the same `55`
+    has been documented carrying a different meaning in a different network, and inverting a reading
+    is the one error here that costs a whole line.
+    """
+    mine = _freq_set("/".join(freqs)) if freqs else []
+    if not mine or not REPORTS_DB.exists():
+        return [], []
+    try:
+        con = sqlite3.connect(f"file:{REPORTS_DB}?mode=ro", uri=True)
+        rows = con.execute("SELECT id, freqs FROM networks").fetchall()
+    except sqlite3.Error:
+        return [], []
+    hits = [nid for nid, fr in rows
+            if any(abs(a - b) * 1000 <= FREQ_TOL_KHZ for a in _freq_set(fr) for b in mine)]
+    if not hits:
+        return [], []
+    marks = ",".join("?" * len(hits))
+
+    def pull(sql: str) -> list[tuple[str, str]]:
+        # Deduped case-insensitively but printed as written: callsigns are uppercase, code words are
+        # not (`«платье»`), so upper-casing the key would mangle half the legend.
+        seen: dict[str, tuple[str, str]] = {}
+        for key, val in con.execute(sql.format(marks=marks), hits):
+            k = str(key or "").strip()
+            # A wrapped source line sometimes leaves the description opening on punctuation
+            # (`- , «прилетит в ворота» – …`); that is the seam, not content.
+            v = " ".join(str(val or "").split()).lstrip(",-–— ").strip()
+            if not k:
+                continue
+            # The same name is signed on several days; keep the fullest description we have.
+            if k.lower() not in seen or len(v) > len(seen[k.lower()][1]):
+                seen[k.lower()] = (k, v)
+        return list(seen.values())
+
+    roster = pull("SELECT callsign, role FROM roster WHERE network_id IN ({marks}) ORDER BY id")
+    legend = pull("SELECT code, meaning FROM legend WHERE network_id IN ({marks}) ORDER BY id")
+    # Only the legend is filtered. A callsign is never "already known" in the same way — the roster
+    # is who is on this net, and dropping a name because it is familiar would remove the point of it.
+    known = known_codes()
+    legend = [(c, m) for c, m in legend if not (_variants(c) & known)]
+    return roster, legend
+
+
+SILENT_LOOKBACK_DAYS = 6      # enough history that a normally-quiet net is not called dead
+SILENT_MIN_PRIOR = 10         # below this the channel was never a network, just a few catches
+
+
+def silent_networks(recs: list[dict], dt_from: str) -> list[tuple[str, int, datetime, str]]:
+    """Channels that carried real traffic in the preceding days and gave NOTHING in this window.
+
+    Not an event and not a model product — a deterministic comparison of two windows, so it costs
+    one query and no reasoning. A network falling silent is the reader's cue to ask why: the unit
+    moved, was destroyed, or changed channel.
+
+    Compared with the SAME 5 kHz tolerance the pipeline clusters with. Without it the list fills up
+    with phantoms — `411.9631` reads as silent while `411.9630` is live in the same report, and four
+    of the first run's "silent" channels were exactly that.
+
+    The `SILENT_MIN_PRIOR` floor is the other half. 35 of 41 candidates in the first count had been
+    heard one to nine times in six days; a channel like that cannot fall silent, it was never
+    speaking. Reporting them would bury the six that matter.
+    """
+    lo = datetime.strptime(dt_from, "%Y-%m-%d %H:%M")
+    prev = fetch(f"{lo - timedelta(days=SILENT_LOOKBACK_DAYS):%Y-%m-%d %H:%M}", dt_from)
+
+    live: list[float] = []
+    for r in recs:
+        if _is_float(r.get("freq")):
+            live.append(float(r["freq"]))
+
+    agg: dict[str, dict] = defaultdict(lambda: {"n": 0, "last": None, "heads": defaultdict(int)})
+    for r in prev:
+        f = r.get("freq")
+        if not _is_float(f):
+            continue
+        e = agg[f]
+        e["n"] += 1
+        if e["last"] is None or r["_dt"] > e["last"]:
+            e["last"] = r["_dt"]
+        if r.get("network"):
+            e["heads"][r["network"]] += 1
+
+    out = []
+    for f, e in agg.items():
+        if e["n"] < SILENT_MIN_PRIOR:
+            continue
+        if any(abs(float(f) - x) * 1000 <= FREQ_TOL_KHZ for x in live):
+            continue
+        head = max(e["heads"].items(), key=lambda kv: kv[1])[0] if e["heads"] else "(без шапки)"
+        out.append((f, e["n"], e["last"], head))
+    out.sort(key=lambda t: -t[1])
+    return out
+
+
+def unattended_networks(units: list[dict], events: list[dict]) -> list[tuple]:
+    """Networks that DID talk in the window and produced no report line at all.
+
+    The other half of the same question, and the half that actually needs watching. A silent channel
+    is usually just a channel that moved. A channel with a day of traffic and nothing selected is
+    either genuinely idle chatter — or our rules looking straight past something, and there is no
+    way to notice that from the report itself, because absence leaves no trace in it.
+    """
+    have = {e.get("_net") for e in events}
+    by_net: dict[str, list[dict]] = defaultdict(list)
+    for u in units:
+        by_net[u["net"]].extend(u["items"])
+    rows = []
+    for net, items in by_net.items():
+        if net in have:
+            continue
+        items.sort(key=lambda r: r["_dt"])
+        freqs = sorted({r["freq"] for r in items if r.get("freq")})
+        chars = sum(len(s) for r in items for s in r.get("speech", []))
+        rows.append((net, len(items), chars, items[0]["_dt"], items[-1]["_dt"], freqs))
+    # Ordered by VOLUME OF SPEECH, not by number of intercepts: how much was said and passed over is
+    # the thing worth checking. One intercept carrying 1386 characters outranks six carrying 587.
+    rows.sort(key=lambda t: -t[2])
+    return rows
+
+
+def unattributed_nets(events: list[dict]) -> dict[str, list[dict]]:
+    """Events whose network header names no formation — kept out of the report, filed separately."""
+    out: dict[str, list[dict]] = defaultdict(list)
+    for e in events:
+        net = e.get("_net") or ""
+        if net and not unit_tags(net):
+            out[net].append(e)
+    return dict(out)
+
+
+def build_quiet_file(silent: list[tuple[str, int, datetime, str]], unattended: list[tuple],
+                     dt_from: str, dt_to: str, unattributed: dict | None = None) -> str:
+    """A SEPARATE file, deliberately not part of the report (owner, 2026-08-25).
+
+    It answers a different question from the report — not what happened, but where nothing did. Two
+    sections, because there are two ways for a network to produce nothing and they mean opposite
+    things: one has gone off the air, the other is on the air and we wrote nothing about it.
+
+    Both live in ONE file on purpose: otherwise the second half only ever gets looked at when
+    somebody remembers to ask for it, and that is exactly what happened for four reports running.
+    """
+    out = [f"Мовчазні та без уваги - вікно звіту {dt_from} - {dt_to}", "",
+           f"=== 1. ЗАМОВКЛИ (працювали попередні {SILENT_LOOKBACK_DAYS} діб, "
+           f"мінімум {SILENT_MIN_PRIOR} перехоплень, у вікні - жодного)", ""]
+    if not silent:
+        out.append("(немає)")
+    for f, n, last, head in silent:
+        out.append(f"{f} - {head}")
+        out.append(f"    перехоплень за {SILENT_LOOKBACK_DAYS} діб: {n}, "
+                   f"останній {last:%d.%m.%Y %H:%M}")
+
+    out += ["", "", "=== 2. ПРАЦЮВАЛИ, АЛЕ ЖОДНОЇ ПОДІЇ У ЗВІТІ", ""]
+    if unattributed:
+        out += ["", "=== 3. БЕЗ ПРИВ'ЯЗКИ (шапка не називає частину — у звіт не йде)", ""]
+        for net, evs in unattributed.items():
+            out.append(f"{net}  ({len(evs)} подій)")
+            for e in sorted(evs, key=lambda x: str(x.get("time"))):
+                out.append(f"    {e.get('time')} {e.get('text')}")
+            out.append("")
+
+    if not unattended:
+        out.append("(немає)")
+    for net, n, chars, first, last, freqs in unattended:
+        out.append(f"{'/'.join(freqs) if freqs else '(без частоти)'} - {net}")
+        out.append(f"    перехоплень: {n}, мовлення: {chars} симв., "
+                   f"{first:%d.%m %H:%M} - {last:%d.%m %H:%M}")
+    return "\n".join(out) + "\n"
+
+
+def build_tail() -> list[tuple[str, bool, bool]]:
+    """Five blank lines and a marker where the owner pastes his own block.
+
+    The statistics footer we used to print is gone (owner, 2026-08-25): its four counters came from
+    another collection and were typed in by hand anyway, so the machine had nothing to contribute
+    there. What replaces it is a landing strip — five blanks so the seam is obvious, then `---`,
+    which is one easy selection to overwrite with the text he pastes in from elsewhere.
+    """
+    return [("", False, False)] * 5 + [("---", False, False)]
+
+
+# ─── layout: how blocks are grouped and what stands in their header ────────────────────────────
+#
+# The headers are NOT sloppy operator variants. They are written by the people who combine what the
+# operators hear with direction-finding, and `підрозділу 60 омсбр` / `1 мсб 60 омсбр` /
+# `йм. «шторм» 1 мсб 60 омсбр` are three DEPTHS of an attribution that was established at the time,
+# not three opinions. The old header — the most frequent raw variant of the day — therefore picks
+# not the best-established name but the most repeated one, re-elects it every day (so the same net
+# is called differently in consecutive reports), and silently drops the depth difference.
+#
+# Two replacements, both pure presentation — they regroup and rename blocks and never touch a fact:
+#   denominator — print what ALL the variants agree on, and list each variant with its frequencies
+#                 underneath. Never over-claims, never contradicts, and does not depend on a vote,
+#                 so it is stable from day to day on its own.
+#   registry    — the analyst's own archived nets first: what HE keeps apart we do not merge, and
+#                 his wording is used verbatim. Whatever is not in his archive falls back to
+#                 denominator, so the scheme degrades gracefully as the archive ages instead of
+#                 breaking.
+# Both are only possible because events now carry `_src_ref`: an event can be traced to the exact
+# frequencies it rests on, which is what lets a block be split without re-running the model.
+
+_LVL_FORM = re.compile(r"(\d+)\s*(омсбр|омбр|мсп|пмп|дмп|мсд)", re.I)
+_LVL_ARMY = re.compile(r"(\d+)\s*А\b")
+_LVL_BATT = re.compile(r"(\d+)\s*(мсб|шб|дшб|тб)", re.I)
+_LVL_COMP = re.compile(r"(\d+)(?:\s*,\s*\d+)*\s*(мср|шр|шз|тр)", re.I)
+_LVL_NAME = re.compile(r"[«\"']\s*([^«»\"']{3,20}?)\s*[»\"']")
+_PARENS = re.compile(r"\([^)]*\)")
+_LEAD = re.compile(r"^\s*(?:УКХ|КХ)\s+р/м\s*", re.I)
+
+
+_LVL_DIV = re.compile(r"(\d+)\s*(мсд|дмп|дшд|тд|пмд)", re.I)
+# A subunit type with NO number of its own: the specialists know the battalion is air-assault and do
+# not know which one («йм дшб 155 пмп 55дмп»). The numbered patterns above miss those, and the type
+# was dropped from the header. The lookbehind keeps this from also firing inside `1 мсб`, where the
+# numbered pattern already has it.
+_LVL_KIND = re.compile(r"(?<!\d)(?<!\d\s)\b(шгр|шг|шз|шр|дшб|мсб|мср|тб)\b", re.I)
+# Only the marker and its date: the analyst writes «186 МСП (трофей 11.08.26 ГІРКЕ)», and dragging
+# the settlement along would print it twice — once here and once in the composed direction.
+_TROPHY = re.compile(r"троф\w*\s*[\d.]*", re.I)
+
+
+def parse_levels(header: str) -> dict:
+    """Split a header into the hierarchy it asserts. Districts are cut away first — they live in
+    brackets and are full of numbers and capitals that would be read as units.
+
+    Everything captured here is something a composed header must be able to put BACK. Three of them
+    were lost by the first version and each mattered: the division (`114 мсп 127 мсд` came out as
+    plain `114 мсп`), the assault-group marker `шг` (the character of the subunit, not decoration),
+    and `трофей` — which is both provenance and the thing `order_networks` reads to print captured
+    radios last.
+    """
+    raw = " ".join(str(header or "").split())
+    h = _PARENS.sub(" ", raw)
+    out: dict[str, str] = {}
+    if m := _LVL_FORM.search(h):
+        out["formation"] = f"{m.group(1)} {m.group(2).lower()}"
+    if m := _LVL_DIV.search(h):
+        out["division"] = f"{m.group(1)} {m.group(2).lower()}"
+    if m := _LVL_ARMY.search(h):
+        out["army"] = f"{m.group(1)} А"
+    if m := _LVL_BATT.search(h):
+        out["battalion"] = f"{m.group(1)} {m.group(2).lower()}"
+    # ALL of them, not the first. `1 шр "V" 1 шз Шторм 38 омсбр` names two subunits, and taking
+    # only the first silently dropped the `шз` — which is what the header exists to say.
+    if comps := [" ".join(m.group(0).split()).lower() for m in _LVL_COMP.finditer(h)]:
+        out["company"] = ", ".join(dict.fromkeys(comps))
+    if kinds := [m.group(1).lower() for m in _LVL_KIND.finditer(h)]:
+        out["kind"] = ", ".join(dict.fromkeys(kinds))
+    if m := _LVL_NAME.search(h):
+        out["name"] = f"«{m.group(1).lower()}»"
+    if m := _TROPHY.search(raw):
+        out["trophy"] = " ".join(m.group(0).split()).rstrip(" .,")
+    return out
+
+
+def compose_header(raws: list[str]) -> str:
+    """One header for a whole cluster, in the analyst's own shape:
+    `УКХ р/м <підрозділи> <з'єднання> <армія> (<напрямок>)`.
+
+    Built by UNION, not by vote — every subunit any variant named is listed, every settlement any
+    variant named goes into the direction, ordered by how often it was written. So the header stops
+    changing from day to day for no reason: it moves only when the attributions themselves move,
+    and then it is supposed to.
+
+    When a cluster holds more than one formation the header says so («… 60 омсбр 5 А + шг 38 омсбр»)
+    instead of quietly printing whichever was more frequent. That is ugly on purpose: it is the
+    frequency clustering having welded two formations together, and hiding it was the old behaviour.
+    """
+    lv = [parse_levels(h) for h in raws]
+    forms: dict[str, dict] = {}
+    for p in lv:
+        f = p.get("formation")
+        if not f:
+            continue
+        d = forms.setdefault(f, {"army": set(), "div": set(), "sub": [], "trophy": set()})
+        for key, bag in (("army", "army"), ("division", "div"), ("trophy", "trophy")):
+            if p.get(key):
+                d[bag].add(p[key])
+        for k in ("name", "company", "battalion", "kind"):
+            # Split back into single subunits: a variant may carry several, and two variants that
+            # overlap must not print `1 шр, 1 шз` next to a second `1 шр`.
+            for one in str(p.get(k) or "").split(", "):
+                if one and one not in d["sub"]:
+                    d["sub"].append(one)
+    if not forms:
+        return ""
+    setts: dict[str, int] = defaultdict(int)
+    for h in raws:
+        for w in settlements_of([h]):
+            setts[w] += 1
+    place = ", ".join(w for w, _ in sorted(setts.items(), key=lambda kv: (-kv[1], kv[0]))[:5])
+    chunks = []
+    for f, d in forms.items():
+        sub = ", ".join(sorted(d["sub"], key=lambda x: (x[0] != "«", x)))
+        # A header that names only the division (`127 мсд`) matches BOTH patterns; printing it as
+        # its own parent would read `127 мсд 127 мсд`.
+        tail = " ".join(sorted(x for x in d["div"] if x != f) + sorted(d["army"])[:1])
+        chunks.append(" ".join(x for x in (sub, f, tail) if x))
+    head = "УКХ р/м " + " + ".join(chunks)
+    if place:
+        head += f" ({place})"
+    # Provenance last, the way he writes it — and `order_networks` reads this word to keep captured
+    # radios at the end of the report.
+    troph = sorted({t for d in forms.values() for t in d["trophy"]})
+    return head + (f" ({troph[0]})" if troph else "")
+
+
+_LEVEL_CHAIN = ("formation", "battalion", "company", "name")
+
+
+def denominator_header(headers: list[str]) -> str:
+    """The deepest attribution ALL these headers agree on, rendered in the analyst's word order.
+
+    Walks the chain from the top and stops at the first level where the variants disagree or where
+    one of them is silent — everything below an unsettled level is unanchored and must not be
+    asserted. Empty when they do not even agree on the formation; the caller then keeps the old name.
+
+    The army is NOT part of the chain: it is an attribute of the formation, not a rung between it and
+    the battalion, and half the headers simply omit it. Walking through it cost the battalion —
+    two headers that both said `1 мсб 60 омсбр` came out as plain `60 омсбр` because one of them did
+    not repeat `5 А`.
+    """
+    levels = [parse_levels(h) for h in headers]
+    agreed: dict[str, str] = {}
+    for key in _LEVEL_CHAIN:
+        vals = {l.get(key) for l in levels}
+        if len(vals) == 1 and next(iter(vals)):
+            agreed[key] = next(iter(vals))
+        else:
+            break
+    if "formation" not in agreed:
+        return ""
+    armies = {l.get("army") for l in levels}
+    if len(armies) == 1 and next(iter(armies)):
+        agreed["army"] = next(iter(armies))
+    parts = [agreed[k] for k in ("name", "company", "battalion", "formation", "army") if k in agreed]
+    return "УКХ р/м " + " ".join(parts)
+
+
+def registry_nets() -> list[tuple[frozenset, str]]:
+    """The analyst's archived nets as (frequency set, his header). His `{NNNN}` numbers are NOT an
+    identity — he renumbers them to keep his Word file in order, and the same net appears as {5025}
+    and {5050} — so a net is identified by its frequencies and nothing else."""
+    if not REPORTS_DB.exists():
+        return []
+    try:
+        con = sqlite3.connect(f"file:{REPORTS_DB}?mode=ro", uri=True)
+        rows = con.execute("SELECT freqs, header FROM networks").fetchall()
+    except sqlite3.Error:
+        return []
+    out, seen = [], set()
+    for fr, hdr in rows:
+        fs = frozenset(_freq_str(fr))
+        h = re.sub(r"\{\d+\}", "", " ".join(str(hdr or "").split())).strip()
+        if not fs or not h or (fs, h) in seen:
+            continue
+        seen.add((fs, h))
+        out.append((fs, h))
+    return out
+
+
+# Fixed geographic buckets. Cut from the settlements that actually co-occur in the headers of this
+# corpus (ГУЛЯЙПІЛЬСЬКЕ+ЗАЛІЗНИЧНЕ appear together 43 times, ЧАРІВНЕ+МИРНЕ 19, ДОРОЖНЯНКА+МИРНЕ 12),
+# not invented. They are deliberately FEW and fixed by hand: a reporting unit that drifts destroys
+# the one thing a daily report is for — being comparable with yesterday's. Re-cut them when the line
+# moves; that is a decision, and it should be one.
+SECTORS: list[tuple[str, set]] = [
+    ("ЗАЛІЗНИЧНЕ - ГУЛЯЙПІЛЬСЬКЕ - ГІРКЕ",
+     {"ЗАЛІЗНИЧНЕ", "ГУЛЯЙПІЛЬСЬКЕ", "ГІРКЕ", "ГУЛЯЙПОЛЕ", "ЗЕЛЕНЕ", "БЕРЕГОВА"}),
+    ("ЧАРІВНЕ - МИРНЕ - НОВОСЕЛІВКА",
+     {"ЧАРІВНЕ", "МИРНЕ", "НОВОСЕЛІВКА", "ЛУГІВСЬКЕ", "ЄГОРІВКА", "БАГАТЕ"}),
+    ("ДОРОЖНЯНКА - ЗАГІРНЕ", {"ДОРОЖНЯНКА", "ЗАГІРНЕ"}),
+    ("ПОЛОГИ - ВАРВАРІВКА - ВОЗДВИЖІВКА",
+     {"ПОЛОГИ", "ВАРВАРІВКА", "ВОЗДВИЖІВКА", "СВЯТОПЕТРІВКА", "ФЕДОРІВКА"}),
+]
+UNPLACED = "район не встановлено"
+# Words that stand inside a district but name no place: bearings, the direction of a movement, and
+# the bookkeeping the specialists write next to it.
+_NOT_SETTLEMENT = {"ТРОФЕЙ", "ДОРОЗВІДКА", "ПЕЛЕНГ", "МГЦ", "ПІВД", "ПІВН", "ЗАХ", "СХІД", "СХ",
+                   "ПДЗХ", "ПНЗХ", "ПДСХ", "ПНСХ", "РАЙОН", "ПІВДЕНЬ", "ПІВНІЧ", "ЗАХІД"}
+# Adjectives that open a two-word settlement name and mean nothing standing alone (ВЕРХНЯ ТЕРСА).
+_ADJ_PLACE = re.compile(
+    r"\b(ВЕРХНЯ|ВЕРХНЄ|ВЕРХНІЙ|НИЖНЯ|НИЖНЄ|НИЖНІЙ|НОВА|НОВЕ|НОВИЙ|СТАРА|СТАРЕ|СТАРИЙ"
+    r"|ВЕЛИКА|ВЕЛИКЕ|ВЕЛИКИЙ|МАЛА|МАЛЕ|МАЛИЙ|ЧЕРВОНА|ЧЕРВОНЕ|ЧЕРВОНИЙ)"
+    r"\s+([А-ЯЇІЄҐ][А-ЯЇІЄҐ']{3,})")
+
+
+def settlements_of(headers: list[str]) -> list[str]:
+    """Settlement names out of the bracketed districts. The district is the ONLY thing in our data
+    that puts an event on the map: of 52 lines in the 02.09 report exactly ONE named a settlement in
+    its own text — the rest say `через лс`, `до укриття`, `ор БЕРГАМОТ`, which locate nothing
+    without it."""
+    out = []
+    for h in headers:
+        for m in _PARENS.finditer(str(h or "")):
+            # Two-word names first. Only after an adjective that cannot be a settlement on its own,
+            # never between any two capitals: `ВЕРХНЯ ТЕРСА` is one place, but `ЧАРІВНЕ НОВОСЕЛІВКА`
+            # (19 times) and `МИРНЕ ГУЛЯЙПІЛЬСЬКЕ` (5) are two places written without a comma, and
+            # gluing those would invent a settlement that does not exist.
+            txt = _ADJ_PLACE.sub(lambda x: f"{x.group(1)}_{x.group(2)}", m.group(0).upper())
+            for w in re.findall(r"[А-ЯЇІЄҐ][А-ЯЇІЄҐ'_]{3,}", txt):
+                w = w.replace("_", " ")
+                if w not in _NOT_SETTLEMENT and w not in out:
+                    out.append(w)
+    return out
+
+
+def sector_of(headers: list[str]) -> str:
+    """Which bucket this net belongs to: the one most of its settlements fall into. A net whose
+    district spans two sectors (`ДОРОЖНЯНКА - ЗАЛІЗНИЧНЕ - ГІРКЕ`) goes where the majority is."""
+    setts = set(settlements_of(headers))
+    best, best_n = UNPLACED, 0
+    for name, members in SECTORS:
+        n = len(setts & members)
+        if n > best_n:
+            best, best_n = name, n
+    return best
+
+
+def _event_freqs(e: dict) -> set[str]:
+    """The channels an event actually rests on — the last token of each source ref."""
+    return {r.split()[-1] for r in (e.get("_src_ref") or []) if r.split()}
+
+
+def apply_layout(mode: str, events: list[dict], recs: list[dict],
+                 freqs_of: dict[str, list[str]]) -> tuple[list[dict], dict, dict, list | None]:
+    """Returns (events, freqs_of, titles, order). `titles[block] = (header_line, [sub-lines])`;
+    `order` overrides the usual formation-first print order (the sector layout needs area first).
+
+    `current` returns everything untouched, so the default path is bit-for-bit what it was.
+    """
+    if mode == "current":
+        return events, freqs_of, {}, None
+
+    canon = cluster([r for r in recs if r.get("speech")])
+    variants: dict[str, dict[str, set]] = defaultdict(lambda: defaultdict(set))
+    for r in recs:
+        if not r.get("speech"):
+            continue
+        raw = " ".join(str(r.get("network") or "").split())
+        net = canon.get(norm_net(r.get("network")), norm_net(r.get("network")))
+        if r.get("freq"):
+            variants[net][raw].add(r["freq"])
+
+    def _vkey(raw: str) -> str:
+        """What makes two variant headers the SAME writing of one attribution: the unit part with
+        the district, the punctuation and the hedging dropped. `186 МСП`, `186 МСП ( ГІРКЕ)` and
+        `186 МСП (трофей 11.08.26 ГІРКЕ)` are one net written three ways, and printing all three
+        under a block is the crowding this layout is meant to remove."""
+        s = _PARENS.sub(" ", _LEAD.sub("", str(raw)))
+        s = re.sub(r"\b(?:йм|ім)\.?\b", " ", s, flags=re.I)
+        return re.sub(r"[^\wЀ-ӿ]+", "", s).casefold()
+
+    def _sub_lines(raws: dict) -> list[str]:
+        """One line per DISTINCT variant, in the analyst's own words, with its own channels.
+        Variants that are the same writing keep the fullest wording and pool their frequencies."""
+        merged: dict[str, tuple[str, set]] = {}
+        for raw, fs in raws.items():
+            k = _vkey(raw)
+            best, pool = merged.get(k, ("", set()))
+            merged[k] = (raw if len(raw) > len(best) else best, pool | set(fs))
+        rows = [("/".join(sorted(f)), _LEAD.sub("", h)) for h, f in merged.values()]
+        rows.sort(key=lambda t: t[1])
+        return [f"{f} - {h}" for f, h in rows]
+
+    titles: dict[str, tuple[str, list[str]]] = {}
+
+    if mode == "composed":
+        # The default. Same shape of report as always — frequency line, header, register, events —
+        # with the header composed from every variant instead of elected from the most frequent one.
+        for net, raws in variants.items():
+            titles[net] = (compose_header(list(raws)) or net, [])
+        return events, freqs_of, titles, None
+
+    if mode == "sector":
+        # Area FIRST, formation second — the order the reader of the report actually needs: what
+        # happened, roughly where, and only then whose it was. Several of our frequency clusters
+        # collapse into one block here, which is the point: the recipient does not care that we
+        # signed one channel five ways, he cares which stretch of ground is involved.
+        # ONLY nets that produced events. Merging a whole formation-in-a-sector otherwise drags in
+        # every silent channel of that formation: its variant lines would suggest the block covers
+        # traffic it does not, and its frequencies would pull extra rosters into the register.
+        with_events = {e.get("_net") for e in events}
+        blocks: dict[str, dict] = {}
+        for net, raws in variants.items():
+            if net not in with_events:
+                continue
+            sec = sector_of(list(raws))
+            forms = sorted({p["formation"] for p in map(parse_levels, raws) if p.get("formation")})
+            who = " / ".join(forms) if forms else "без прив'язки"
+            key = f"{sec}  ·  {who}"
+            b = blocks.setdefault(key, {"sec": sec, "nets": [], "raws": {}, "freqs": set()})
+            b["nets"].append(net)
+            for raw, fs in raws.items():
+                b["raws"].setdefault(raw, set()).update(fs)
+                b["freqs"] |= set(fs)
+        remap = {n: k for k, b in blocks.items() for n in b["nets"]}
+        for e in events:
+            if e.get("_net") in remap:
+                e["_net"] = remap[e["_net"]]
+        freqs_of = {k: sorted(b["freqs"]) for k, b in blocks.items()}
+        order_index = {name: i for i, (name, _) in enumerate(SECTORS)}
+        for k, b in blocks.items():
+            titles[k] = (k, _sub_lines(b["raws"]))
+        counts: dict[str, int] = defaultdict(int)
+        for e in events:
+            counts[e.get("_net")] += 1
+        order = sorted(blocks, key=lambda k: (order_index.get(blocks[k]["sec"], 99),
+                                              -counts.get(k, 0), k))
+        return events, freqs_of, titles, order
+
+    if mode == "registry":
+        reg = registry_nets()
+        moved = 0
+        new_freqs: dict[str, set] = defaultdict(set)
+        for e in events:
+            efs = _event_freqs(e)
+            if not efs:
+                continue
+            hits = {h for fs, h in reg if fs & efs}
+            if len(hits) != 1:        # unknown to him, or he spreads these channels over two nets
+                continue              # → leave it where the frequency clustering put it
+            his = hits.pop()
+            e["_net"] = his
+            new_freqs[his] |= efs
+            moved += 1
+        if moved:
+            print(f"розкладка registry: {moved} подій розкладено за мережами аналітика",
+                  file=sys.stderr)
+        for net, fs in new_freqs.items():
+            freqs_of[net] = sorted(fs)
+            raws = {raw: f for parent in variants.values() for raw, f in parent.items() if f & fs}
+            titles[net] = (net, _sub_lines(raws) if len(raws) > 1 else [])
+
+    # Everything not claimed by the registry (all of it, in `denominator` mode) gets the
+    # common-denominator header with its variants spelled out underneath.
+    for net, raws in variants.items():
+        if net in titles:
+            continue
+        head = denominator_header(list(raws))
+        if not head:
+            # They do not even agree on the formation — which means the frequency clustering has
+            # welded two formations together (a channel one side signs as 60 омсбр and the other as
+            # шг 38 омсбр). Falling back to the old majority name would hide exactly that, so name
+            # the formations that are in there and let it be visible.
+            forms = sorted({p["formation"] for p in map(parse_levels, raws) if p.get("formation")})
+            head = "УКХ р/м " + " / ".join(forms) if forms else net
+        titles[net] = (head, _sub_lines(raws))
+
+    # Two clusters can reduce to the same header (114 мсп appears twice today). Printed as is, the
+    # report would carry two identical block titles and no way to tell them apart; the district of
+    # the block's fullest variant is what separates them.
+    seen: dict[str, list[str]] = defaultdict(list)
+    for net, (head, _) in titles.items():
+        seen[head].append(net)
+    for head, nets in seen.items():
+        if len(nets) < 2:
+            continue
+        for net in nets:
+            district = ""
+            for raw in sorted(variants.get(net, {}), key=len, reverse=True):
+                if m := _PARENS.search(raw):
+                    district = " ".join(m.group(0).split())
+                    break
+            if district:
+                titles[net] = (f"{head} {district}", titles[net][1])
+    return events, freqs_of, titles, None
+
+
+def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
+                 dt_to: str, active: dict[str, dict] | None = None,
+                 titles: dict | None = None, order: list | None = None) -> str:
+    """Group by network, then by callsign — the analyst's own layout.
+
+    Several events about one man are kept together even when other people's events fall between them
+    in time: the first is a normal line, the rest are indented under it. That is much easier to scan,
+    and it costs the model nothing because it happens after it has finished.
+    """
+    by_net: dict[str, list[dict]] = defaultdict(list)
+    for e in events:
+        by_net[e.get("_net") or "(без шапки)"].append(e)
+
+    # (text, bold, centered) — the docx layer takes this verbatim; the .txt is the same lines plain.
+    styled: list[tuple[str, bool, bool]] = [("Про результати аналізу радіоперехоплень", False, True)]
+    if band:
+        styled.append((f"у смузі {band}", False, True))
+    styled += [(f"на {dt_to[11:16]} {datetime.strptime(dt_to, '%Y-%m-%d %H:%M'):%d.%m.%Y}",
+                False, True), ("", False, False)]
+
+    # Owner's rule (29.08): «Частоти без прив'язки не кидати в звіт». A header that names no
+    # formation — `УКХ р/м НВ підрозділу 141.500 МГц` — is a frequency we hear and have not yet
+    # attributed. A block under it says somebody moved somewhere and nothing about whose movement it
+    # was, which is the one thing the report is for. Set aside, not deleted: the events go to the
+    # companion _silent.txt so the net can be attributed and enter the next report properly.
+    unattributed = {n: evs for n, evs in by_net.items() if not unit_tags(n)}
+    for n, evs in list(unattributed.items()):
+        print(f"без прив'язки, не йде у звіт: {netlabel(n, 70)} ({len(evs)} подій)",
+              file=sys.stderr)
+        by_net.pop(n, None)
+
+    registers = assign_registers(freqs_of)
+    seq = [n for n in order if n in by_net] if order else order_networks(by_net)
+    for i, net in enumerate(seq):
+        evs = sorted(by_net[net], key=lambda e: stamp(e.get("time")) or 0)
+        if i:
+            styled.append(("", False, False))       # two blank lines between network blocks
+        head, subs = (titles or {}).get(net, (net, []))
+        fr = freqs_of.get(net) or []
+        # With variant lines the channels stand next to the wording they belong to, so repeating the
+        # whole list above the header would be the same crowding this layout exists to undo.
+        if fr and not subs:
+            styled.append(("/".join(fr), True, False))
+        styled.append((head, True, False))
+        for s in subs:
+            styled.append((s, False, False))
+
+        # The register goes between the header and the events, exactly where the analyst keeps it.
+        roster, legend, notes = registers.get(net, ([], [], []))
+        # Every name has to prove it is still on the air, the analyst's last list included. What the
+        # filter removes is not lost — it stands in `<out>_reestr.txt` with the date it was last
+        # heard, so a man who comes back is printed again the same day.
+        if ROSTER_ACTIVE_DAYS > 0 and active:
+            names, blob = heard_on(active, fr)
+            if len(blob) < MIN_ACTIVITY_CHARS:
+                print(f"реєстр {netlabel(net)}: НЕ ріжемо — за {ROSTER_ACTIVE_DAYS} доби лише "
+                      f"{len(blob)} симв. ефіру (мало доказів)", file=sys.stderr)
+                names, blob = set(), ""
+            if names or blob:        # fail open: an empty lookup must not touch the register
+                kept, dropped = [], []
+                for cs, role, older in roster:
+                    tgt = kept if still_active(cs, names, blob) else dropped
+                    tgt.append((cs, role, older))
+                if dropped:
+                    # The names are the POINT of this line — it is how we notice that a whole
+                    # roster moved to another network name. Cutting the list at 90 characters
+                    # silently swallowed the last few (19 -> 3 printed only 12 of 16 dropped), so
+                    # nothing is dropped without saying how many.
+                    gone = [c for c, _, _ in dropped]
+                    shown, room = [], 120
+                    for c in gone:
+                        if room - len(c) - 2 < 0:
+                            break
+                        shown.append(c)
+                        room -= len(c) + 2
+                    tail = f" +{len(gone) - len(shown)} ще" if len(shown) < len(gone) else ""
+                    print(f"реєстр {netlabel(net)}: {len(roster)} -> {len(kept)} "
+                          f"(за {ROSTER_ACTIVE_DAYS} доби не чути: "
+                          f"{', '.join(shown)}{tail})", file=sys.stderr)
+                roster = kept
+        for cs, role, _older in roster:
+            styled.append((f"{cs} - {role}" if role else cs, False, False))
+        # Our own readings join the legend of THIS network only if its own lines use the word — a
+        # reader who never met «океан» today should not be told what it means.
+        blob_ev = " ".join(e.get("text", "") or "" for e in evs).lower()
+        have = {_stem(c) for c, _m in legend}
+        for code, meaning in our_codes():
+            if _stem(code) in blob_ev and _stem(code) not in have:
+                legend = list(legend) + [(code, meaning)]
+                have.add(_stem(code))
+        for code, meaning in legend:
+            styled.append((f"«{code}» - {meaning}" if meaning else f"«{code}»", False, False))
+        # The analyst's own network-level remarks close the block, on their own lines — which is
+        # exactly where he wrote them, under the legend and above the events.
+        for note in notes:
+            styled.append((note, False, False))
+        if roster or legend or notes:
+            styled.append(("", False, False))
+
+        groups: dict[str, list[dict]] = defaultdict(list)
+        order: list[str] = []
+        for e in evs:
+            k = subject(e) or f"_{len(order)}"
+            if k not in groups:
+                order.append(k)
+            groups[k].append(e)
+        for e in evs:
+            if e.get("text"):
+                e["text"] = lower_type_names(e["text"])
+        for k in order:
+            for n, e in enumerate(groups[k]):
+                line = f"{e.get('time','')} {e.get('text','')}".strip()
+                styled.append((line if n == 0 else f"\t{line}", False, False))
+        styled.append(("", False, False))
+    return styled
+
+
+def snapshot() -> str:
+    """Freeze the rules behind every run — owner's standing rule, after the configuration of the
+    first accepted report turned out to be unrecoverable."""
+    files = [RULES, Path(__file__), GLOSSARY]
+    h = hashlib.sha256()
+    for f in files:
+        h.update(f.read_bytes() if f.exists() else b"")
+    vid = f"{datetime.now():%Y%m%d}-{h.hexdigest()[:8]}"
+    d = VERSIONS / vid
+    if not d.exists():
+        d.mkdir(parents=True, exist_ok=True)
+        for f in files:
+            if f.exists():
+                shutil.copy2(f, d / f.name)
+    return vid
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    # `--day 2026-08-20` IS the normal way to call this. "Звіт на 20 серпня" means one fixed thing —
+    # 19.08 15:00 → 20.08 15:00 — and computing that by hand every time is an invitation to get the
+    # window, the stamp or the filename out of step with each other. Given the day, all three are
+    # derived from one number and cannot disagree.
+    ap.add_argument("--day", help="report day, YYYY-MM-DD or DD.MM.YYYY: window is the 24 h ending "
+                                  "at 15:00 of that day")
+    ap.add_argument("--from", dest="dt_from")
+    ap.add_argument("--to", dest="dt_to")
+    ap.add_argument("--band", default=DEFAULT_BAND)
+    ap.add_argument("--out")
+    ap.add_argument("--model", default="claude-sonnet-5")
+    ap.add_argument("--effort", default="medium")
+    # One pass is the standard. Multi-pass union was inherited from v1, where a single call read a
+    # 40–80 KB thread and skimmed it, so passes disagreed and adding them up recovered real material
+    # (+12 points of coverage there). Measured on v2's per-network units of ~12 KB: one pass and
+    # three passes cover EXACTLY the same 22 of the analyst's 47 lines — the extra two passes bought
+    # 95 more lines and not one additional finding. Splitting by network cured the cause; the union
+    # was treating the symptom. Raise it with --passes if a future change makes calls unreliable
+    # again, but do not pay for it by default.
+    # How blocks are grouped and headed. Pure presentation — see apply_layout(). `current` keeps the
+    # daily majority-vote name the reports have used until now; the other two are the replacements
+    # being trialled. Combines with --render-only, so all three can be built from ONE events file in
+    # seconds and differ by nothing except the layout rule.
+    ap.add_argument("--layout", choices=["composed", "current", "denominator", "registry", "sector"],
+                    default="composed")
+    ap.add_argument("--passes", type=int, default=1)
+    ap.add_argument("--jobs", type=int, default=6)
+    # Everything downstream of the model — the register, the activity filter, the layout, the docx —
+    # is pure rendering over `<out>_events.json`. A change there should not cost another 40 minutes
+    # of model time, and re-running would also silently produce DIFFERENT events (the model is not
+    # deterministic), which makes a rendering change impossible to judge. This replays the saved
+    # events instead: same facts, new presentation.
+    ap.add_argument("--allow-stale", action="store_true",
+                    help="зібрати звіт, навіть якщо корпус не покриває вікно (за замовчуванням - відмова)")
+    ap.add_argument("--render-only", action="store_true",
+                    help="rebuild the files from an existing <out>_events.json, no model calls")
+    # The collector lags 25-30 minutes behind the group, so the last half hour of a window closing at
+    # 15:00 has usually not arrived when the report is made. The answer is not a gate that asks
+    # whether to proceed — it is to start the window half an hour EARLIER than it says. What the
+    # previous report missed off its end, this one picks up off its start. Nothing is lost, the price
+    # is that consecutive reports can repeat an event from that overlap, and that is the cheaper
+    # error. One constant, applied always, nothing to remember and nothing to decide.
+    ap.add_argument("--lead-in", type=int, default=WINDOW_LEAD_IN_MIN,
+                    help="minutes to extend the START of the window by (0 disables)")
+    a = ap.parse_args()
+
+    if a.day:
+        for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m"):
+            try:
+                d = datetime.strptime(a.day, fmt)
+                if fmt == "%d.%m":
+                    d = d.replace(year=datetime.now().year)
+                break
+            except ValueError:
+                d = None
+        if d is None:
+            sys.exit(f"не розібрав дату: {a.day!r} (треба YYYY-MM-DD або DD.MM.YYYY)")
+        a.dt_to = f"{d:%Y-%m-%d} {REPORT_HOUR}"
+        a.dt_from = f"{d - timedelta(days=1):%Y-%m-%d} {REPORT_HOUR}"
+        a.out = a.out or f"ZVIT_{d:%d.%m}"
+    elif not (a.dt_from and a.dt_to and a.out):
+        sys.exit("треба або --day, або всі три: --from --to --out")
+
+    print(f"звіт на {a.dt_to}   вікно {a.dt_from} - {a.dt_to}   файл {a.out}", file=sys.stderr)
+    print(f"версія правил: {snapshot()}", file=sys.stderr)
+    lo = datetime.strptime(a.dt_from, "%Y-%m-%d %H:%M") - timedelta(minutes=a.lead_in)
+    read_from = f"{lo:%Y-%m-%d %H:%M}"
+    if a.lead_in:
+        print(f"вікно {a.dt_from} - {a.dt_to}, читаємо з {read_from} "
+              f"(перекриття {a.lead_in} хв на затримку колектора)", file=sys.stderr)
+    check_coverage(a.dt_to, allow_stale=a.allow_stale or a.render_only)
+    recs = fetch(read_from, a.dt_to)
+    units = units_of_work(recs)
+    nets = {u["net"] for u in units}
+    print(f"перехватів: {len(recs)}   мереж: {len(nets)}   одиниць роботи: {len(units)}",
+          file=sys.stderr)
+
+    freqs_of: dict[str, list[str]] = defaultdict(set)
+    for u in units:
+        for r in u["items"]:
+            if r.get("freq"):
+                freqs_of[u["net"]].add(r["freq"])
+    freqs_of = {k: sorted(v) for k, v in freqs_of.items()}
+
+    if a.render_only:
+        src = OUT_DIR / f"{a.out}_events.json"
+        if not src.exists():
+            sys.exit(f"немає {src} — нічого перемальовувати")
+        events = json.loads(src.read_text())
+        age_h = (time.time() - src.stat().st_mtime) / 3600
+        print(f"перемальовування з {src.name}: {len(events)} подій, модель не викликається",
+              file=sys.stderr)
+        # The events are frozen at the moment of the original run; the register, the silent list and
+        # the "no events" list are recomputed against the database as it is NOW. Half an hour of drift
+        # is nothing. A day of it would put the header and the silence on one date and the events on
+        # another, and nothing in the output would say so.
+        if age_h > 6:
+            print(f"УВАГА: події зібрані {age_h:.0f} год тому, а решта рахується по свіжій базі — "
+                  f"для чогось старішого за пів дня краще повний прогон", file=sys.stderr)
+        finish(a, recs, units, events, freqs_of)
+        return
+
+    rules = RULES.read_text() + "\n\n---\n\n# Глосарій\n\n" + GLOSSARY.read_text()
+
+    def run_one(task):
+        p, i, u = task
+        body = render_unit(u)
+        last = None
+        for attempt in range(1, CALL_RETRIES + 1):
+            try:
+                raw, dt = call_model(rules, "# Матеріал\n\n" + body, a.model, a.effort)
+                return p, i, u, extract_json(raw), dt
+            except Exception as exc:            # noqa: BLE001
+                last = exc
+                print(f"прохід {p} · {i}: спроба {attempt} впала: {exc}", file=sys.stderr)
+                if attempt < CALL_RETRIES:
+                    time.sleep(RETRY_BACKOFF_S * attempt)
+        print(f"!!! ВТРАЧЕНО прохід {p} · одиниця {i} ({netlabel(u['net'])}) — {last}",
+              file=sys.stderr)
+        return p, i, u, [], 0.0
+
+    tasks = [(p, i, u) for p in range(1, a.passes + 1) for i, u in enumerate(units)]
+    per_pass: list[list[dict]] = [[] for _ in range(a.passes)]
+    spent = 0.0
+    with ThreadPoolExecutor(max_workers=a.jobs) as pool:
+        for p, i, u, got, dt in pool.map(run_one, tasks):
+            spent += dt
+            if got:
+                print(f"прохід {p} · {i+1}/{len(units)}: {len(got)} подій за {dt:.0f}s "
+                      f"[{netlabel(u['net'])}]", file=sys.stderr)
+            for e in got:
+                e["_net"] = u["net"]
+                # Resolved HERE, where the unit is still in hand — see ref_of(). After this point
+                # the event carries its own addresses and no longer depends on the chunking.
+                e["_src_ref"] = refs_for(u, e.get("src"))
+                per_pass[p - 1].append(e)
+
+    events = union(per_pass) if a.passes > 1 else per_pass[0]
+    if a.passes > 1:
+        multi = sum(1 for e in events if e.get("_passes", 1) > 1)
+        print(f"проходи: {' + '.join(str(len(x)) for x in per_pass)} → {len(events)} унікальних "
+              f"(>1 проходом: {multi}, лише одним: {len(events)-multi})", file=sys.stderr)
+
+    # One march split across several lines by shared intercepts. Needs a model call to compose the
+    # single line, so it lives HERE and not in finish() - --render-only must stay model-free.
+    events, marches = merge_split_marches(events, a.model, a.effort)
+    for parts, winner in marches:
+        print(f"зведено марш ({len(parts)} рядки) → «{str(winner.get('text'))[:80]}»",
+              file=sys.stderr)
+        for p in parts:
+            print(f"    було: {p.get('time')} {str(p.get('text'))[:70]}", file=sys.stderr)
+    if marches:
+        print(f"зведення маршів: -{sum(len(p) - 1 for p, _ in marches)} → {len(events)} подій",
+              file=sys.stderr)
+
+    finish(a, recs, units, events, freqs_of, spent)
+
+
+def finish(a, recs: list[dict], units: list[dict], events: list[dict],
+           freqs_of: dict[str, list[str]], spent: float = 0.0) -> None:
+    """Everything after the model: register, activity filter, layout, the three files.
+
+    Split out so `--render-only` can reach exactly this and nothing else — the guarantee that a
+    presentation change cannot touch the facts is worth more as one shared code path than as a
+    promise.
+    """
+    # Deliberately HERE and not next to the model call: this is the one path both a full run and
+    # --render-only go through, so an already-shipped report can be cleaned without spending
+    # another 40 minutes of model time.
+    events, dups, empty = drop_exact_duplicates(events)
+    for e in dups:
+        print(f"дубль прибрано: {e.get('time')} {str(e.get('text'))[:70]}", file=sys.stderr)
+    for e in empty:
+        print(f"порожню подію прибрано: {e.get('time')} [{netlabel(str(e.get('_net')))}]",
+              file=sys.stderr)
+    if dups or empty:
+        print(f"очищення: -{len(dups)} дублів, -{len(empty)} порожніх → {len(events)} подій",
+              file=sys.stderr)
+
+    # Seam duplicates: the same fact returned twice by two chunks that share an intercept. Needs
+    # the stable refs, so an events file written before they existed simply passes through.
+    events, seam = merge_by_source(events)
+    for loser, winner in seam:
+        print(f"злито по спільному перехопленню: «{str(loser.get('text'))[:60]}» → "
+              f"«{str(winner.get('text'))[:60]}»", file=sys.stderr)
+    if seam:
+        print(f"злиття швів: -{len(seam)} → {len(events)} подій", file=sys.stderr)
+
+    # On COPIES, deliberately. A layout reassigns `_net` to its own block keys, and the first
+    # version of this wrote those keys straight into `<out>_events.json` — the next `--render-only`
+    # then had no real network names left to group by and produced an empty report. The events file
+    # is the record of what the model found; a presentation option must not be able to touch it.
+    report_events, report_freqs, titles, order = apply_layout(
+        getattr(a, "layout", "current"), [dict(e) for e in events], recs, dict(freqs_of))
+    styled = build_report(report_events, report_freqs, a.band, a.dt_to,
+                          activity_index(a.dt_to), titles, order)
+    while styled and not styled[-1][0].strip():     # exactly five blanks, not five plus the ones
+        styled.pop()                                # build_report leaves after the last block
+    styled += build_tail()
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out = OUT_DIR / f"{a.out}.txt"
+    out.write_text("\n".join(t for t, _, _ in styled))
+
+    try:
+        src_json, n_src = build_sources_file(recs, events)
+        (OUT_DIR / f"{a.out}_sources.json").write_text(src_json)
+        if n_src:
+            print(f"джерела подій: {n_src} перехоплень у {a.out}_sources.json", file=sys.stderr)
+        else:
+            print("джерела подій: порожньо (події зібрані до появи стійких посилань)",
+                  file=sys.stderr)
+    except Exception as e:                      # noqa: BLE001 — a reference file must not lose a run
+        print(f"джерела подій не вийшли: {e!r}", file=sys.stderr)
+
+    nets_in_report = list(dict.fromkeys(e.get("_net") for e in events if e.get("_net")))
+    dupes_txt = build_dupes_file(assign_registers(freqs_of), nets_in_report, a.dt_from, a.dt_to)
+    try:
+        carry = build_carryover_section(events, a.dt_from)
+        dupes_txt += carry
+        n_carry = sum(1 for l in carry.splitlines() if l.startswith("    перехоплення: "))
+        if n_carry:
+            print(f"рядків лише з учорашніх перехоплень: {n_carry} (довідка у {a.out}_dubli.txt)",
+                  file=sys.stderr)
+    except Exception as e:                      # noqa: BLE001 — a reference file must not lose a run
+        print(f"звірка з учорашнім звітом не вийшла: {e!r}", file=sys.stderr)
+    try:
+        hi_dt = datetime.strptime(a.dt_to, "%Y-%m-%d %H:%M")
+        wide = fetch(f"{hi_dt - timedelta(days=SIBLING_WINDOW_DAYS):%Y-%m-%d %H:%M}", a.dt_to)
+        sib = build_sibling_nets_section(report_events, report_freqs, titles, wide or recs,
+                                         assign_registers(freqs_of))
+        dupes_txt += sib
+        n_sib = sum(1 for l in sib.splitlines() if " - " in l and "блоки" in l)
+        if n_sib:
+            print(f"частин, розщеплених на кілька блоків: {n_sib} "
+                  f"(довідка у {a.out}_dubli.txt)", file=sys.stderr)
+    except Exception as e:                      # noqa: BLE001 — a reference file must not lose a run
+        print(f"звірка розщеплених блоків не вийшла: {e!r}", file=sys.stderr)
+    (OUT_DIR / f"{a.out}_dubli.txt").write_text(dupes_txt)
+    n_dupes = sum(1 for l in dupes_txt.splitlines() if " - у " in l and "мережах" in l)
+    print(f"позивних у кількох мережах: {n_dupes} (довідка у {a.out}_dubli.txt)", file=sys.stderr)
+
+    try:
+        reg_txt = build_register_file(assign_registers(freqs_of), nets_in_report, freqs_of,
+                                      a.dt_from, a.dt_to, activity_index(a.dt_to))
+        (OUT_DIR / f"{a.out}_reestr.txt").write_text(reg_txt)
+        print(f"повний реєстр: {a.out}_reestr.txt", file=sys.stderr)
+    except Exception as e:                      # noqa: BLE001 — a reference file must not lose a run
+        print(f"повний реєстр не вийшов: {e!r}", file=sys.stderr)
+
+    quiet = silent_networks(recs, a.dt_from)
+    idle = unattended_networks(units, events)
+    unattr = unattributed_nets(events)
+    (OUT_DIR / f"{a.out}_silent.txt").write_text(
+        build_quiet_file(quiet, idle, a.dt_from, a.dt_to, unattr))
+    if unattr:
+        print(f"без прив'язки: {len(unattr)} мереж, "
+              f"{sum(len(v) for v in unattr.values())} подій — у {a.out}_silent.txt", file=sys.stderr)
+    print(f"замовкли: {len(quiet)}   працювали без жодної події: {len(idle)}", file=sys.stderr)
+    (OUT_DIR / f"{a.out}_events.json").write_text(json.dumps(events, ensure_ascii=False, indent=2))
+    docx = out.with_suffix(".docx")
+    try:
+        from text_to_docx import write as write_docx
+        write_docx(styled, docx, title=None)
+    except Exception as e:                      # a failed export must not lose the run
+        print(f"docx не вийшов: {e!r}", file=sys.stderr)
+        docx = None
+    print(f"\nподій: {len(events)}   мереж у звіті: "
+          f"{len({e.get('_net') for e in events} - set(unattr))}   "
+          f"час моделі: {spent:.0f}s\nзвіт: {out}" + (f"\ndocx: {docx}" if docx else ""),
+          file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

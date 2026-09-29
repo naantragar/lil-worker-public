@@ -97,7 +97,16 @@ def _block(reason: str) -> None:
 # hung command cannot freeze the TURN. Once the command becomes a durable job the turn is no longer
 # waiting on it, and the wrapper turns from a guard into a self-destruct: the very first converted
 # analytics run was killed at 60s with exit 124, having done nothing but read the window. Strip it.
-RE_TIMEOUT = re.compile(r"^\s*timeout\s+(?:-k\s+\S+\s+|-{1,2}\S+\s+)*\d+(?:\.\d+)?[smhd]?\s+")
+# Anchored at the start of ANY command segment, not just at offset zero. A leading-only anchor was
+# what let this through on 28.09.2026: the command was
+#     mkdir -p <dir> && timeout 120 python3 tools/identity/unsigned_scan.py --day … --model
+# so the wrapper sat behind `&&`, survived the strip, and killed the job at 72 of 111 intercepts —
+# and the trailing `| tail -5` handed back exit 0, so it reported as a success with half the work
+# missing. A `timeout` anywhere in a command that is becoming a job is a self-destruct wherever it
+# stands.
+RE_TIMEOUT = re.compile(
+    r"(?:(?<=^)|(?<=[;&|])|(?<=\n))(\s*)timeout\s+"
+    r"(?:-k\s+\S+\s+|-{1,2}\S+\s+)*\d+(?:\.\d+)?[smhd]?\s+")
 # Not anchored at all. Anchoring was tried twice and failed twice for the same reason: a real command
 # has the assignment after a `cd` line, or after a `;`, or inside a loop — never at offset zero. This
 # is an explicit opt-in marker that only I write, so a plain substring is both sufficient and
@@ -106,7 +115,7 @@ RE_INLINE_PREFIX = re.compile(r"\bKREVETKA_INLINE_BASH=1\b")
 
 
 def _strip_timeout(command: str) -> tuple[str, bool]:
-    stripped = RE_TIMEOUT.sub("", command, count=1)
+    stripped = RE_TIMEOUT.sub(lambda m: m.group(1), command)
     return stripped, stripped != command
 
 
