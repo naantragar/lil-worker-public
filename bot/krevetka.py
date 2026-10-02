@@ -3266,6 +3266,15 @@ async def _notify_finished_jobs(bot: Bot) -> None:
             continue
         notified.write_text(time.strftime("%Y-%m-%dT%H:%M:%S%z"))
         logger.info(f"job {job_dir.name}: notified owner {owner} (status={status})")
+        # The follow-up belongs here too, not only after a wake report. job_ctl attaches a followup
+        # to EVERY job it launches (its own default chain), so a job without `wake` was carrying the
+        # text and silently never firing it — the owner got "задача завершена, вот файл" and then
+        # silence until he asked what was in it. That is exactly the case this feature exists for,
+        # and the plain dump needs it MORE than the wake report does: the dump is raw stdout with no
+        # one to say what it means. Same guards as the wake branch — only on `done`, only after the
+        # notification is marked delivered, so a crash here can never re-send the report.
+        if status == "done":
+            await _followup_turn(bot, spec)
 
 
 async def poll_jobs_loop(bot: Bot) -> None:
