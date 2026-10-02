@@ -21,9 +21,13 @@ bot/*.log
 *.pid
 bot/.runtime.sock
 bot/bot_runtime_state.json
-bot/krevetka.py.bak
-bot/bot.py.bak
-bot/bot.py.prerename
+# Hand-made rollback copies. A general rule, not a growing list of names: this was two named
+# files until 2026-10-02, when a third (tools/hooks/durable_commands.json.bak, left by another
+# instance) walked straight past them and tripped the secret scan on a path inside it. A .bak is a
+# copy of something git already versions — none of them belong in a published skeleton.
+*.bak
+*.bak.*
+*.prerename
 bot/backups/
 # Index / state
 .sessions.json

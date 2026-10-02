@@ -1,124 +1,137 @@
 {
- "_readme": [
-  "Commands that must ALWAYS run as a durable job, even in the foreground — read by",
-  "tools/hooks/durable_bash.py. Anything with run_in_background:true is converted regardless of",
-  "this list; this file exists for the long runners that get started in the foreground and would",
-  "otherwise die with the turn.",
-  "",
-  "Add an entry the moment a command turns out to be long-running and worth surviving. `pattern`",
-  "is a Python regex searched against the whole command string. It no longer has to defend itself",
-  "against being MENTIONED: the hook now also requires the match to sit in command position,",
-  "right behind an interpreter (python3/bash/sh/./), and refuses to convert when the segment's",
-  "verb only inspects things (ls, grep, cat, git, diff...). `ls tools/analytics_pipeline.sh` was",
-  "launched as a durable job on 30.08.2026 before that existed.",
-  "",
-  "Optional `not_if`: a regex that VETOES the entry — for a flag that makes the same script fast,",
-  "like `--render-only`, which rebuilds a report from saved events in about a second.",
-  "",
-  "`never` is the OPPOSITE list and it outranks everything, including run_in_background:true.",
-  "A durable job is a TASK: it runs, finishes, and reports. A dev server is a SERVICE: it never",
-  "finishes by design, so converting it produces a job stuck at `running` forever, holding its",
-  "room's launch gate, whose report can never arrive — and the only way out is a manual cancel,",
-  "which is then delivered as a 'задача скасована' message. That happened three times in one",
-  "evening on 16.09.2026 with `npm run dev` before this list existed. Left inline in the",
-  "background a dev server behaves CORRECTLY: it lives as long as the turn that needs it to look",
-  "at the page, and the turn's teardown cleans it up.",
-  "Keep these patterns TIGHT — an over-broad one here silently disarms the protection for a real",
-  "long runner. A match is a plain regex search: the worst a false positive can do is leave a",
-  "command inline, which is the default for almost everything anyway.",
-  "",
-  "Skipped conversions and launch failures are logged to bot/jobs/durable_bash_hook.log."
- ],
- "never": [
-  {
-   "pattern": "\\b(npm|pnpm|yarn|bun)\\s+(run\\s+)?(dev|start|serve|preview|watch)\\b",
-   "why": "дев-сервер пакетного менеджера — служба, не задача"
-  },
-  {
-   "pattern": "\\bvite\\b(?!\\s+build)",
-   "why": "vite в режиме сервера не завершается (vite build — завершается, поэтому исключён)"
-  },
-  {
-   "pattern": "\\b(next|nuxt|astro|remix)\\s+(dev|start)\\b",
-   "why": "дев-сервер фреймворка — служба"
-  },
-  {
-   "pattern": "\\b(nodemon|webpack-dev-server)\\b|\\bwebpack\\s+serve\\b",
-   "why": "наблюдатель за файлами — работает бесконечно"
-  },
-  {
-   "pattern": "\\b(uvicorn|gunicorn|hypercorn|daphne)\\b|\\bflask\\s+run\\b|-m\\s+http\\.server\\b",
-   "why": "питоновский веб-сервер — служба"
-  },
-  {
-   "pattern": "\\btail\\s+-\\w*f\\b|\\bjournalctl\\b[^|;]*\\s-f\\b|^\\s*watch\\s+",
-   "why": "бесконечный поток вывода, завершения нет"
-  }
- ],
- "commands": [
-  {
-   "pattern": "glossary/beta\\.py\\s+presort",
-   "label": "бета: автоснятие мусора",
-   "why": "один вызов модели на каждое слово-кандидат: два десятка слов это уже минуты, а после полного добора их будут сотни",
-   "followup": "Просеиватель мусора отработал. Скажи коротко: сколько слов снял и какие (с пояснением почему), сколько осталось мне на кнопки. Если снял что-то, что выглядит подозрительно - назови отдельно, я верну. Потом собери набор: python3 tools/glossary/beta.py survey --min-hits 2"
-  },
-  {
-   "pattern": "tools/analytics2/run\\.py\\s+--(day|from)\\b",
-   "not_if": "--render-only\\b",
-   "label": "аналитика: отчёт",
-   "why": "прогон отчёта по перехватам идёт десятки минут",
-   "followup": "Отчёт посчитался. Перепроверь его, как я обычно прошу — строки против речи (_src_ref ведёт в <out>_sources.json).\n\n- A (выдумка, не тот человек или сторона, обратный смысл, опасный пропуск) — по пунктам: строка и что в речи на самом деле\n- B (формулировка, потерянная деталь) — одним списком\n- C (разброс модели) — не перечисляй\n\nПЕРЕД тем как объявить класс A — ПОДНИМИ перехваты этой строки и прочитай речь целиком. Счётчик по словам ошибается: 23.09 он выдал «хохол» как выдумку, а в речи человек отзывался «я Хохол на связи» — это был их боец. Класс A объявляется только после чтения речи.\n\nПо каждому A — чем чинится: правка события в _events.json плюс --render-only (секунда, без модели) или полный перегон (десятки минут, все формулировки станут другими). Решаю я.\n\nКласса A нет — скажи одной строкой, и всё."
-  },
-  {
-   "pattern": "tools/analytics_run\\.py\\s+--from|tools/analytics_pipeline\\.sh",
-   "label": "аналитика v1",
-   "why": "старый конвейер аналитики идёт десятки минут"
-  },
-  {
-   "pattern": "tools/analytics_sense\\.py\\s+--from",
-   "label": "аналитика: смысловой проход",
-   "why": "проход по всему окну идёт долго"
-  },
-  {
-   "pattern": "analytics2/movement_count\\.py[^|;]*--freq",
-   "label": "аналітика: підрахунок переміщень о/с",
-   "why": "один виклик моделі на добу на частоту — десятки хвилин, і 28.08 такий прогон загинув разом із рестартом бота; шаблон вимагає --freq, щоб згадка шляху не конвертувалась"
-  },
-  {
-   "pattern": "callsign_roles/(infer_role|calibrate)\\.py",
-   "label": "ролі позивних: вивід/калібрування",
-   "why": "один виклик моделі на позивного, 164 позивних - години"
-  },
-  {
-   "pattern": "callsign_roles/(daily\\.sh|dossier\\.py)",
-   "label": "досьє позивних: згортання",
-   "why": "лічильник ефіру читає весь корпус, це хвилини"
-  },
-  {
-   "pattern": "identity/extract_observations\\.py",
-   "label": "спостереження з мови",
-   "why": "виклик моделі на кожну розмову, ~1с моделі на перехоплення; 13.09 такий прогон у фоні був убитий разом із процесом сесії і результат втрачено"
-  },
-  {
-   "pattern": "identity/(guide_layer|answer_key|callsign_file|unit_binding)\\.py",
-   "label": "шар ведення / файл позивних",
-   "why": "читають корпус за 14-90 діб (до 99 тис. перехоплень) - хвилини без жодної моделі"
-  },
-  {
-   "pattern": "identity/unsigned_scan\\.py[^|;]*--model\\b",
-   "label": "неподписанные сети: разбор дня",
-   "why": "с --model модель читает КАЖДОЕ перехоплення группы: день это десятки вызовов, полный добор за 29 дней - больше тысячи. Без --model это чистый код и секунды, поэтому шаблон требует флаг",
-   "followup": "Прогон по неподписанным закончился. Открой свежий файл в knowledge/upstream/unsigned/ и расскажи, ЧТО там - своими словами, а не сухой отпиской.\n\n- сколько перехватов, сколько с зацепкой, на какие подразделения указывают\n- КТО ВОДИТ - это первый по ценности класс: имя, частота, время, его фраза дословно. Если один и тот же водит несколько раз - скажи это отдельно\n- 1-3 самых интересных перехвата: приведи речь дословно в код-блоке, не пересказывай\n- новые слова в бете: сколько, какие стоит посмотреть, сколько отброшено как выдуманные (слова нет в речи). Если есть что разбирать - дай команду beta.py survey\n- что выглядит подозрительно или сломанным в самом прогоне\n\nНЕ вываливай файл целиком и не пересказывай каждую строку. Он на сотни строк, а нужно то, ради чего запускали. Если день пустой - так и скажи одной строкой, это нормальный результат."
-  },
-  {
-   "pattern": "identity/code_sieve\\.py",
-   "label": "сито кодовых слов",
-   "why": "калибровка идёт по всему подписанному корпусу - минуты без всякой модели"
-  },
-  {
-   "pattern": "glossary/ingest\\.py\\s+run",
-   "label": "трансфер: читання документів у базу",
-   "why": "модель читає кожен документ шматками - десятки хвилин на пачку з 20 файлів"
-  }
- ]
+  "_readme": [
+    "Commands that must ALWAYS run as a durable job, even in the foreground — read by",
+    "tools/hooks/durable_bash.py. Anything with run_in_background:true is converted regardless of",
+    "this list; this file exists for the long runners that get started in the foreground and would",
+    "otherwise die with the turn.",
+    "",
+    "Add an entry the moment a command turns out to be long-running and worth surviving. `pattern`",
+    "is a Python regex searched against the whole command string. It no longer has to defend itself",
+    "against being MENTIONED: the hook now also requires the match to sit in command position,",
+    "right behind an interpreter (python3/bash/sh/./), and refuses to convert when the segment's",
+    "verb only inspects things (ls, grep, cat, git, diff...). `ls tools/analytics_pipeline.sh` was",
+    "launched as a durable job on 30.08.2026 before that existed.",
+    "",
+    "Optional `not_if`: a regex that VETOES the entry — for a flag that makes the same script fast,",
+    "like `--render-only`, which rebuilds a report from saved events in about a second.",
+    "",
+    "`never` is the OPPOSITE list and it outranks everything, including run_in_background:true.",
+    "A durable job is a TASK: it runs, finishes, and reports. A dev server is a SERVICE: it never",
+    "finishes by design, so converting it produces a job stuck at `running` forever, holding its",
+    "room's launch gate, whose report can never arrive — and the only way out is a manual cancel,",
+    "which is then delivered as a 'задача скасована' message. That happened three times in one",
+    "evening on 16.09.2026 with `npm run dev` before this list existed. Left inline in the",
+    "background a dev server behaves CORRECTLY: it lives as long as the turn that needs it to look",
+    "at the page, and the turn's teardown cleans it up.",
+    "Keep these patterns TIGHT — an over-broad one here silently disarms the protection for a real",
+    "long runner. A match is a plain regex search: the worst a false positive can do is leave a",
+    "command inline, which is the default for almost everything anyway.",
+    "",
+    "Skipped conversions and launch failures are logged to bot/jobs/durable_bash_hook.log."
+  ],
+  "never": [
+    {
+      "pattern": "\\b(npm|pnpm|yarn|bun)\\s+(run\\s+)?(dev|start|serve|preview|watch)\\b",
+      "why": "дев-сервер пакетного менеджера — служба, не задача"
+    },
+    {
+      "pattern": "\\bvite\\b(?!\\s+build)",
+      "why": "vite в режиме сервера не завершается (vite build — завершается, поэтому исключён)"
+    },
+    {
+      "pattern": "\\b(next|nuxt|astro|remix)\\s+(dev|start)\\b",
+      "why": "дев-сервер фреймворка — служба"
+    },
+    {
+      "pattern": "\\b(nodemon|webpack-dev-server)\\b|\\bwebpack\\s+serve\\b",
+      "why": "наблюдатель за файлами — работает бесконечно"
+    },
+    {
+      "pattern": "\\b(uvicorn|gunicorn|hypercorn|daphne)\\b|\\bflask\\s+run\\b|-m\\s+http\\.server\\b",
+      "why": "питоновский веб-сервер — служба"
+    },
+    {
+      "pattern": "\\btail\\s+-\\w*f\\b|\\bjournalctl\\b[^|;]*\\s-f\\b|^\\s*watch\\s+",
+      "why": "бесконечный поток вывода, завершения нет"
+    }
+  ],
+  "commands": [
+    {
+      "pattern": "identity/net_read\\.py",
+      "label": "читання мережі моделлю",
+      "why": "два проходи моделлю по тижню однієї мережі: десятки викликів, це хвилини-години",
+      "followup": "Читання мережі закінчилось. Відкрий свіжий файл у knowledge/upstream/callsigns/ і розкажи по суті питання, яке ставили - своїми словами, не переказом файла.\n\n- ХТО ВЕДЕ людей: імена, дослівні фрази. Це перше за цінністю\n- відповідь на саме питання: знайшли чи ні. «Не знайшли» одним рядком - нормальний результат\n- імена, які самі абоненти не могли розібрати, і різні написання того самого чоловіка\n- 1-2 найцікавіші місця - речю дослівно в код-блоці"
+    },
+    {
+      "pattern": "glossary/beta\\.py\\s+presort",
+      "label": "бета: автоснятие мусора",
+      "why": "один вызов модели на каждое слово-кандидат: два десятка слов это уже минуты, а после полного добора их будут сотни",
+      "followup": "Просеиватель мусора отработал. Скажи коротко: сколько слов снял и какие (с пояснением почему), сколько осталось мне на кнопки. Если снял что-то, что выглядит подозрительно - назови отдельно, я верну. Потом собери набор: python3 tools/glossary/beta.py survey --min-hits 2"
+    },
+    {
+      "pattern": "tools/analytics2/run\\.py\\s+--(day|from)\\b",
+      "not_if": "--render-only\\b",
+      "label": "аналитика: отчёт",
+      "why": "прогон отчёта по перехватам идёт десятки минут",
+      "followup": "Отчёт посчитался. Перепроверь его, как я обычно прошу — строки против речи (_src_ref ведёт в <out>_sources.json).\n\n- A (выдумка, не тот человек или сторона, обратный смысл, опасный пропуск) — по пунктам: строка и что в речи на самом деле\n- B (формулировка, потерянная деталь, дубль, потерянное событие) — тоже правь, в этом же ходе\n- C (разброс модели) — не перечисляй\n\nПЕРЕД тем как объявить класс A — ПОДНИМИ перехваты этой строки и прочитай речь целиком. Счётчик по словам ошибается: 23.09 он выдал «хохол» как выдумку, а в речи человек отзывался «я Хохол на связи» — это был их боец. Класс A объявляется только после чтения речи.\n\nA правь сам и говори, что именно изменил и как было. B правь там же, где из речи однозначно видно, что новая формулировка лучше (дубль слить, потерянную деталь вернуть, выпавшее событие дописать); где нужен мой выбор — оставь в списке и спроси. Чинится всё одинаково: правка события в _events.json плюс --render-only (секунда, без модели). Полный перегон — только если я скажу.\n\nПравила (rules.md) сам не меняй. Отдельный проход и существует для того, что правилами не ловится — разброс формулировок от прогона к прогону. Видишь, что правило реально стоит дописать, — предложи одной строкой и жди меня.\n\nКласса A нет — скажи одной строкой и перечисли, что поправил по B."
+    },
+    {
+      "pattern": "tools/analytics_run\\.py\\s+--from|tools/analytics_pipeline\\.sh",
+      "label": "аналитика v1",
+      "why": "старый конвейер аналитики идёт десятки минут"
+    },
+    {
+      "pattern": "tools/analytics_sense\\.py\\s+--from",
+      "label": "аналитика: смысловой проход",
+      "why": "проход по всему окну идёт долго"
+    },
+    {
+      "pattern": "analytics2/movement_count\\.py[^|;]*--freq",
+      "label": "аналітика: підрахунок переміщень о/с",
+      "why": "один виклик моделі на добу на частоту — десятки хвилин, і 28.08 такий прогон загинув разом із рестартом бота; шаблон вимагає --freq, щоб згадка шляху не конвертувалась"
+    },
+    {
+      "pattern": "callsign_roles/(infer_role|calibrate)\\.py",
+      "label": "ролі позивних: вивід/калібрування",
+      "why": "один виклик моделі на позивного, 164 позивних - години"
+    },
+    {
+      "pattern": "callsign_roles/(daily\\.sh|dossier\\.py)",
+      "label": "досьє позивних: згортання",
+      "why": "лічильник ефіру читає весь корпус, це хвилини"
+    },
+    {
+      "pattern": "identity/extract_observations\\.py",
+      "label": "спостереження з мови",
+      "why": "виклик моделі на кожну розмову, ~1с моделі на перехоплення; 13.09 такий прогон у фоні був убитий разом із процесом сесії і результат втрачено"
+    },
+    {
+      "pattern": "identity/(guide_layer|answer_key|callsign_file|unit_binding)\\.py",
+      "label": "шар ведення / файл позивних",
+      "why": "читають корпус за 14-90 діб (до 99 тис. перехоплень) - хвилини без жодної моделі"
+    },
+    {
+      "pattern": "identity/unsigned_scan\\.py[^|;]*--model\\b",
+      "label": "неподписанные сети: разбор дня",
+      "why": "с --model модель читает КАЖДОЕ перехоплення группы: день это десятки вызовов, полный добор за 29 дней - больше тысячи. Без --model это чистый код и секунды, поэтому шаблон требует флаг",
+      "followup": "Прогон по неподписанным закончился. Открой свежий файл в knowledge/upstream/unsigned/ и расскажи, ЧТО там - своими словами, а не сухой отпиской.\n\n- сколько перехватов, сколько с зацепкой, на какие подразделения указывают\n- КТО ВОДИТ - это первый по ценности класс: имя, частота, время, его фраза дословно. Если один и тот же водит несколько раз - скажи это отдельно\n- 1-3 самых интересных перехвата: приведи речь дословно в код-блоке, не пересказывай\n- новые слова в бете: сколько, какие стоит посмотреть, сколько отброшено как выдуманные (слова нет в речи). Если есть что разбирать - дай команду beta.py survey\n- что выглядит подозрительно или сломанным в самом прогоне\n\nНЕ вываливай файл целиком и не пересказывай каждую строку. Он на сотни строк, а нужно то, ради чего запускали. Если день пустой - так и скажи одной строкой, это нормальный результат."
+    },
+    {
+      "pattern": "alerts/(bench|compare)\\.(py|sh)",
+      "not_if": "--limit\\s+\\d",
+      "label": "тривоги: прогін дня моделлю",
+      "why": "модель читає весь день вікнами по 10 перехоплень: ~195 викликів на модель, а compare.sh женет три моделі підряд - це години. --limit це димовий тест на кілька вікон, він швидкий",
+      "followup": "Прогін тривог закінчився.\n\nЯКЩО це був стенд порівняння моделей (compare.sh, є оцінка проти еталона) - розкажи по-людськи, не таблицею: яка модель узяла всі історії й ЩО саме загубила; у які пастки хто влетів (Морозик, їхній дезертир з 54-ї, позивний ХОХОЛ, 200/300 як відстань) - це важливіше за пропуски; скільки часу пішло на добу; рекомендація - каскад чи одна модель, і чому.\n\nЯКЩО це був бойовий прогін доби (--hours або один --day без оцінки) - подай як черговому:\n\n- СПОЧАТКУ список push: кожен окремим рядком, час, частота, клас, одне речення. Це те, заради чого систему робимо\n- по 1-3 найтяжчих - сирий перехват дослівно в код-блоці, не переказ (`show.py <run> --raw`)\n- потім ОДНИМ рядком, скільки впало в log, і 3-4 приклади, щоб було видно, де модель провела межу\n- окремо назви все, що виглядає як хибний push або як пропущений push. Межа між push і log зараз калібрується, і саме це господар має побачити, щоб її посунути\n\nНе вивалюй усе підряд. Якщо push порожній - скажи це одним рядком, це нормальний результат доби.\n\nЧитати: python3 tools/alerts/show.py <файл прогону> [--raw] [--level log]"
+    },
+    {
+      "pattern": "identity/code_sieve\\.py",
+      "label": "сито кодовых слов",
+      "why": "калибровка идёт по всему подписанному корпусу - минуты без всякой модели"
+    },
+    {
+      "pattern": "glossary/ingest\\.py\\s+run",
+      "label": "трансфер: читання документів у базу",
+      "why": "модель читає кожен документ шматками - десятки хвилин на пачку з 20 файлів"
+    }
+  ]
 }

@@ -213,11 +213,11 @@ def _verb_before(prefix: str) -> str:
 def _match(command: str) -> dict | None:
     for entry in _registry():
         try:
-            m = re.search(entry["pattern"], command)
+            hits = list(re.finditer(entry["pattern"], command))
         except re.error as e:
             _log(f"bad pattern {entry['pattern']!r}: {e}")
             continue
-        if not m:
+        if not hits:
             continue
         # A flag that makes the same script fast (`--render-only` rebuilds the files from saved
         # events with no model calls at all — one second) vetoes the entry.
@@ -229,18 +229,25 @@ def _match(command: str) -> dict | None:
                     continue
             except re.error as e:
                 _log(f"bad not_if {veto!r}: {e}")
-        prefix = command[:_token_start(command, m.start())]
-        if _quoted(prefix):
-            _log(f"not converted, the path is inside a quoted string: {command[:160]}")
-            continue
-        verb = _verb_before(prefix)
-        if verb in READ_ONLY_VERBS:
-            _log(f"not converted, `{verb}` only inspects the path: {command[:160]}")
-            continue
-        if not RE_INVOKED.search(prefix):
-            _log(f"not converted, path mentioned but not invoked: {command[:160]}")
-            continue
-        return entry
+        # EVERY mention is examined, not just the first. `chmod +x x.sh && bash x.sh` mentions the
+        # script twice: the first is an inspecting verb, the second is the real launch. Judging on
+        # the first hit alone silently refused to convert it (29.09.2026 — a three-model benchmark
+        # ran inline and died with the turn), which is the exact failure this hook exists to stop.
+        why = ""
+        for m in hits:
+            prefix = command[:_token_start(command, m.start())]
+            if _quoted(prefix):
+                why = "the path is inside a quoted string"
+                continue
+            verb = _verb_before(prefix)
+            if verb in READ_ONLY_VERBS:
+                why = f"`{verb}` only inspects the path"
+                continue
+            if not RE_INVOKED.search(prefix):
+                why = "path mentioned but not invoked"
+                continue
+            return entry
+        _log(f"not converted, {why}: {command[:160]}")
     return None
 
 

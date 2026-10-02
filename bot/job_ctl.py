@@ -28,6 +28,37 @@ BOT_DIR = Path(__file__).resolve().parent
 # krevetka's chat and vice versa. The main instance has no LIL_WORKER_DATA_DIR, so it keeps bot/jobs.
 DATA_DIR = Path(os.environ.get("LIL_WORKER_DATA_DIR") or BOT_DIR)
 JOBS_DIR = DATA_DIR / "jobs"
+
+# A job with no `followup` used to deliver only the wake report: a dry «команда завершилась,
+# ось stdout». That report runs in an ISOLATED session by design, so it cannot say what the
+# result MEANS for the work we were doing. Every door hit this, but the main bot hid it: its
+# long commands are in tools/hooks/durable_commands.json, which supplies a tailored followup
+# per command. An instance whose jobs come from tools/workflow_job.py (`--wake`, no followup)
+# — the match3 door, for one — got the dry version every time.
+# So the fallback lives HERE, where every door's job is born, instead of being wired per caller:
+#   1. bot/instances/<name>/followup.md  — this door's own wording
+#   2. bot/job_followup.md               — shared wording
+#   3. the generic text below
+GENERIC_FOLLOWUP = (
+    "Довга задача завершилась. Відкрий її результат і розкажи своїми словами, що саме зроблено "
+    "і що знайдено - не переказуй вивід, а скажи, що це означає для роботи, яку ми робили. "
+    "Якщо щось зламалося або виглядає підозрілим - скажи прямо й назви що. Якщо результат "
+    "порожній або нічого цікавого нема - однієї фрази досить, це нормальний результат."
+)
+
+
+def _default_followup() -> str | None:
+    inst = os.environ.get("LIL_WORKER_INSTANCE", "").strip()
+    for cand in ([BOT_DIR / "instances" / inst / "followup.md"] if inst else []) + \
+                [BOT_DIR / "job_followup.md"]:
+        try:
+            if cand.exists():
+                txt = cand.read_text(encoding="utf-8").strip()
+                if txt:
+                    return txt
+        except OSError:
+            pass
+    return GENERIC_FOLLOWUP
 # The runner script itself is SHARED code and always lives in the repo — only the job state is
 # per-instance.
 RUN_JOB = BOT_DIR / "jobs" / "run_job.sh"
@@ -227,7 +258,7 @@ def cmd_launch(args: argparse.Namespace) -> None:
         # chat context); a follow-up like "перепроверь отчёт" is worthless without that context —
         # the whole value of the owner typing it by hand is that I remember what we changed today.
         # So this one runs in the live session instead. Empty = nothing happens (the default).
-        "followup": (args.followup or "").strip() or None,
+        "followup": (args.followup or "").strip() or _default_followup(),
     }
     # spec.json + status MUST exist before the runner starts — run_job.sh reads the command out of
     # spec.json as its first action.

@@ -1138,21 +1138,6 @@ def external_notes() -> tuple:
     return tuple(data.get("notes") or [])
 
 
-def external_codes() -> tuple:
-    """Readings of code words we established ourselves, from the same file as the callsign notes.
-
-    Separate from `notes` because they overlay a different thing - the LEGEND, not the roster.
-    """
-    if not CALLSIGN_NOTES.exists():
-        return ()
-    try:
-        data = json.loads(CALLSIGN_NOTES.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as e:      # noqa: BLE001 — never lose a run over a note
-        print(f"нотатки про коди не прочитались: {e!r}", file=sys.stderr)
-        return ()
-    return tuple(data.get("codes") or [])
-
-
 def _formation_matches(formation: str, header: str) -> bool:
     """EVERY token of the note's formation must be in the block header. The whole safety of the
     file: `МАРС` also stands on 141.2500 under `2 мсб 71 мсп 42 мсд 58 А`, and a note scoped only by
@@ -1212,44 +1197,7 @@ def apply_external_notes(net: str, reg: tuple, freqs: list[str] | None = None) -
             roster[hit] = (roster[hit][0], role, roster[hit][2])
             if was.casefold() != role.casefold():
                 _log_note(f"{roster[hit][0]} у {netlabel(net, 40)} «{was or '—'}» -> «{role}»")
-
-    legend = _apply_external_codes(net, list(legend), freqs)
     return roster, legend, remarks
-
-
-def _apply_external_codes(net: str, legend: list, freqs: list[str] | None) -> list:
-    """Overlay OUR OWN readings of code words onto one block's legend.
-
-    The archive's legend is what an analyst typed for a net on one day, and the same two digits mean
-    different things on different nets: `«44»` is a status request on 148.5000 (60 омсбр) and, on
-    148.6500 (38 омсбр), the state of the air - «там у Тея 44», «у тебя пока 44, присядь, отдохни»,
-    «минус 44». A reading established from the traffic belongs in the legend of the net it was heard
-    on, and nowhere else, so these entries are pinned by formation AND by frequency - the same
-    discipline `apply_external_notes` learned when a brigade-wide note put БОРЕЦ into eleven nets.
-    """
-    for rec in external_codes():
-        if not _formation_matches(rec.get("formation", ""), net):
-            continue
-        if want := rec.get("freqs"):
-            mine = [float(x) for x in (freqs or []) if _is_float(x)]
-            if not any(abs(float(w) - m) * 1000 <= FREQ_TOL_KHZ
-                       for w in want if _is_float(w) for m in mine):
-                continue
-        code = str(rec.get("code") or "").strip()
-        meaning = " ".join(str(rec.get("meaning") or "").split())
-        if not code or not meaning:
-            continue
-        vs = _variants(code)
-        for i, (c, m) in enumerate(legend):
-            if _variants(c) & vs:
-                if m.casefold() != meaning.casefold():
-                    _log_note(f"код «{c}» у {netlabel(net, 40)} «{m}» -> «{meaning}»")
-                legend[i] = (c, meaning)
-                break
-        else:
-            legend.append((code, meaning))
-            _log_note(f"код «{code}» ДОДАНО до {netlabel(net, 40)} - {meaning}")
-    return legend
 
 
 _NOTE_LOGGED: set[str] = set()

@@ -213,3 +213,6 @@ btn from 323182394: 'a:beta_kody:b_кофе:точка'
 msg from 323182394: ''
 update 494732030: оброблено за 9.8s
 btn from 323182394: 'menu'
+  ПОВТОР getMe після 0.1s
+бот: None
+getUpdates: <urlopen error [Errno -3] Temporary failure in name resolution>

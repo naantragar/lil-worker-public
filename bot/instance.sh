@@ -243,6 +243,12 @@ cmd_ensure_all() {
   for d in "$INSTANCES_DIR"/*/; do
     [ -f "$d/instance.env" ] || continue
     local name; name="$(basename "$d")"
+    # Инстанс с файлом `no-listen` — не агент, а односторонний канал: его токеном только
+    # ОТПРАВЛЯЮТ (tools/alerts/push_tg.py), процесс-слушатель ему не нужен и cron его не поднимает.
+    # Снять: rm bot/instances/<name>/no-listen  (следующий ensure-all поднимет сам).
+    if [ -f "$d/no-listen" ]; then
+      continue
+    fi
     if ! cmd_running "$name"; then
       echo "$(date '+%Y-%m-%d %H:%M:%S') ensure-all: поднимаю '$name'"
       cmd_start "$name"

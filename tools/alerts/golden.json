@@ -1,0 +1,98 @@
+{
+ "_readme": [
+  "Ground truth for the alerting benchmark. Day 27.09.2026. Written by hand after reading the",
+  "speech of every candidate — see knowledge/upstream/alerts/GOLDEN_2026-09-27.md for the reasoning.",
+  "",
+  "Scoring: the WHOLE day is the negative set. must_fire is what a correct system reports;",
+  "anything else it reports is a false positive, except ids in borderline, which score neither",
+  "way. must_not_fire is the annotated subset of the negatives — the traps — so a design that",
+  "trips one can be named, not just counted.",
+  "",
+  "Stories matter more than intercepts: missing 3 of the 10 intercepts of story cap-1 is a",
+  "different (lesser) failure than missing the story entirely."
+ ],
+ "day": "2026-09-27",
+ "must_fire": {
+  "cap-1": {
+   "what": "capture and interrogation of Ukrainian soldiers, 437.0650, 1198 мсп",
+   "peak": "14:55 — our route read off a captured phone",
+   "ids": {
+    "3EB0CD398529A162AD7AE9": "10:00 approach to the position (weak on its own)",
+    "3EB0F282BE2422A4A2FF42": "10:30 the capture, callsigns Старый/Нед/Дед, 66 and 61 бригада",
+    "3EB00CAE3D8797E15FD073": "10:35 order to torture the prisoner",
+    "3EB0ACBC818B671E070778": "10:43 interrogation, commander's callsign Мыкола disclosed",
+    "3EB093E60817CD5D5D1E9E": "10:47 two Ukrainian KIA located and described",
+    "3EB069EC35091C3120819F": "11:41 interrogation continues",
+    "3EB0EC6E4A68B92CC87AC1": "13:07 interrogation results: positions, rotation, army app, radio",
+    "3EB069431CCB5F3FB5EF6F": "14:51 captured Ukrainian phone with our map",
+    "3EB0153723596F0F4E1F84": "14:55 our green route read aloud: button 10 Чарівне, Орел-8, button 20",
+    "3EB0194A5650BCC24503F9": "15:40 what else he gave up; frequency not obtained"
+   }
+  },
+  "seen-1": {
+   "what": "our people spotted, 411.9630, 09:46",
+   "ids": {
+    "3EB06134DA799F16565FBC": "09:46 IH — «Хохлов вроде трое… Вышел на Льва с запада»",
+    "3EB0C672031F486611DCA6": "09:46 Patagonia duplicate of the same"
+   }
+  },
+  "abuse-1": {
+   "what": "abuse of captured Ukrainians reported second-hand, 411.9630, 23:04",
+   "ids": {
+    "3EB0BA11819B8638ADE411": "23:04 IH — «наши кого то там петушат, Хохолов»",
+    "3EB02AA6326EFF0DF9D211": "23:05 Patagonia duplicate"
+   }
+  },
+  "kia-1": {
+   "what": "our KIA found and their kit searched, 146.1300, 17:48",
+   "ids": {
+    "3EB06B3A94A22DF4A503B5": "17:48 — «4 двести, 2 наших, 2 хохла», searching the bags"
+   }
+  },
+  "pos-1": {
+   "what": "our position discovered, 437.0650, 22:24",
+   "ids": {
+    "3EB0C35397B2ED92F0DFE4": "22:24 — «замечено движение… Все, 3 пидара там 3»"
+   }
+  },
+  "fpv-1": {
+   "what": "location of their FPV crews, 147.0000, 20:05 — a strike asset we can act on",
+   "peak": "«там был один, но туда заехали фипивишники второго хозяйства»",
+   "note": "MISLABELLED BY ME on 29.09.2026: filed as a «200/300 metres is a distance» trap because the surrounding lines are about distances between blindages. The owner corrected it — the FPV crews ARE the content. Haiku flagged it and was right.",
+   "ids": {
+    "3EB0BE83AC3698A1293A90": "20:05 — «туда заехали фипивишники второго хозяйства»: місце їхніх FPV-розрахунків",
+    "3EB0B048E4F65178C2E813": "20:05 Patagonia duplicate of the same",
+    "3EB0420028A11EB0ED780A": "20:09 third airing of the same report"
+   }
+  }
+ },
+ "must_not_fire": {
+  "3EB083F331B9737F8B3EA8": "08:57 Морозик 300 — THEIR casualty",
+  "3EB0135BB9E3778616A108": "08:58 Морозик 300 duplicate",
+  "3EB09C9ADBCBB8F703594B": "09:15 Морозик 200 — their KIA, wound described in detail",
+  "3EB0289B21E6500E4645BF": "09:16 Морозик 200 duplicate",
+  "3EB0FF13E0450422E0F9B0": "22:03 165.2350 — a bound man being questioned. THEIR deserter from 54",
+  "3EB0F0F123B8AC949FF702": "22:28 165.2350 — same man, «ушел с новой Оленовки», their own",
+  "3EB0F95EF7DB5996AFBBE1": "17:49 147.0000 — their wounded man refusing to walk out",
+  "3EB0DEE3A007CE5A71FB81": "17:49 duplicate",
+  "3EB0F8518DF0BCBAEB4D1A": "17:57 same thread",
+  "3EB07E769296F0A871DA78": "17:57 duplicate",
+  "3EB07D86EF73249AEFE0B6": "17:59 same thread",
+  "3EB0A20ADACC75FE420D5B": "18:05 same thread, most dramatic and entirely theirs",
+  "3EB047E4336084ECC5ED48": "07:10 146.1300 — their 300 «в булку»",
+  "3EB0BB37D67702D6D89926": "09:18 146.1300 — their 300 Вини, cannot walk",
+  "3EB015B27E80B5CAFBBFA4": "13:49 — «метров 200» is a DISTANCE",
+  "3EB09A66F1A59DEB780C27": "13:50 duplicate",
+  "3EB0563F8F21B0C2A1DBD5": "22:32 — «300 метров надо преодолеть» distance",
+  "3EB07AEF8AE508B922DF88": "22:33 duplicate"
+ },
+ "borderline": {
+  "3EB05A6F975F1E86169FD1": "15:21 146.1300 — probe toward a position where they suspect us; keyword штурм present but negated, and nothing is confirmed. Neither credited nor penalised.",
+  "3EB083650B3391CFA88A69": "15:29 146.1350 — the same probe being briefed (Царь/Слепой contact drill)."
+ },
+ "notes": {
+  "callsign_trap": "ХОХОЛ is an ordinary station on 437.0650 all day («Хохол без связи», «Хохол, на тебя в воздухе»). Roughly a dozen intercepts. None are in must_fire; all count as false positives if flagged.",
+  "side_trap": "ТАЙПАН (10:35) is THEIRS — they interrogate our prisoner about where Тайпан was taken. A system that reads him as our missing man has inverted the sides.",
+  "comment_trap": "The operator's comment on 3EB0F282BE2422A4A2FF42 (the capture) says «знайшов 200-го» — found a body. It is wrong. The comment is a hint, never the label."
+ }
+}
