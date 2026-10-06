@@ -192,18 +192,29 @@ def collect(events: list[dict]) -> dict:
     return {"rows": rows, "unnamed": kept, "lines": n_lines}
 
 
+# Only a casualty with a callsign is counted (owner's decision, 06.10.2026). A nameless body is
+# real but unattributable, and three of them in one block were a guess dressed as a number: `2 тіла,
+# приналежність не встановлена` seen at two times is either two men or four, and `300 о\с РОВ` is a
+# man we cannot follow, name or cross-check tomorrow. The count now answers one question only — how
+# many NAMED men of theirs this net lost — and that is the question worth a number.
+# The nameless ones are still extracted and kept in `data["unnamed"]`: they stand in the events, and
+# turning them back on is this one flag.
+COUNT_UNNAMED = False
+
+
 def counts(data: dict) -> dict:
     out = {"200": 0, "300": 0, "200_unnamed": 0, "300_unnamed": 0,
            "ally_200": 0, "ally_300": 0}
     for r in data["rows"].values():
         pref = "ally_" if r["side"] == "ally" else ""
         out[f"{pref}{r['state']}"] = out.get(f"{pref}{r['state']}", 0) + 1
-    for u in data["unnamed"]:
-        pref = "ally_" if u["side"] == "ally" else ""
-        n = int(u.get("n", 1))
-        out[f"{pref}{u['state']}"] = out.get(f"{pref}{u['state']}", 0) + n
-        if not pref:
-            out[f"{u['state']}_unnamed"] += n
+    if COUNT_UNNAMED:
+        for u in data["unnamed"]:
+            pref = "ally_" if u["side"] == "ally" else ""
+            n = int(u.get("n", 1))
+            out[f"{pref}{u['state']}"] = out.get(f"{pref}{u['state']}", 0) + n
+            if not pref:
+                out[f"{u['state']}_unnamed"] += n
     return out
 
 
@@ -211,7 +222,9 @@ def invariants(data: dict, c: dict) -> list[str]:
     """What must hold before a number is printed. A wrong number is worse than no number."""
     bad = []
     total = c["200"] + c["300"] + c["ally_200"] + c["ally_300"]
-    capacity = data["lines"] + sum(max(0, int(u.get("n", 1)) - 1) for u in data["unnamed"])
+    capacity = data["lines"]
+    if COUNT_UNNAMED:
+        capacity += sum(max(0, int(u.get("n", 1)) - 1) for u in data["unnamed"])
     if total > capacity:
         bad.append(f"людей ({total}) більше, ніж рядків про втрати ({capacity})")
     for r in data["rows"].values():
