@@ -41,7 +41,11 @@ BARE_RE = re.compile(r"(?:^|[;,]\s*)([А-ЯЁЇІЄ][А-ЯЁЇІЄ0-9'’-]{2,})
 # and `ВУ БпЛА СОУ по позиції ... 300 в\с ІВАН` is their wounded man, not ours. This is the single
 # place where a wrong reading would silently add our losses to their total.
 NAME_RE = re.compile(
-    r"(?:в[\\/]с|о[\\/]с|гр|пораненого|трьохсотим|двохсотим|союзник\w*)\s+(?:\(ім\s+)?((?:[А-ЯЁЇІЄ][А-ЯЁЇІЄ0-9'’-]{2,})(?:\s*,\s*[А-ЯЁЇІЄ][А-ЯЁЇІЄ0-9'’-]{2,})*)"
+    # `в\с РОВ БЕСПАЛЫЙ` - our abbreviation for their side stands between the prefix and the man, and
+    # the capture used to stop at РОВ, so the real callsign was swallowed and the casualty counted as
+    # nameless. The optional group steps over it, and backtracks when nothing follows (`в\с РОВ (300)`
+    # is still a man with no callsign).
+    r"(?:в[\\/]с|о[\\/]с|гр|пораненого|трьохсотим|двохсотим|союзник\w*)\s+(?:(?:РОВ|СОУ)\s+)?(?:\(ім\s+)?((?:[А-ЯЁЇІЄ][А-ЯЁЇІЄ0-9'’-]{2,})(?:\s*,\s*[А-ЯЁЇІЄ][А-ЯЁЇІЄ0-9'’-]{2,})*)"
     r"|(?:^|[;,]\s*)([А-ЯЁЇІЄ][А-ЯЁЇІЄ0-9'’-]{2,})(?=\s*(?:\([^)]*\))?\s*[-—–]\s*(?:ім\s*)?\b[23]00\b)")
 
 DRONE_SOU_RE = re.compile(r"(?:бпла|фпв|борт|дрон|вампір|бабка|баба\s*яга|ждун|мавік|мавик)\s*[^,;]{0,18}соу", re.I)
@@ -63,28 +67,29 @@ def _fold(s: str) -> str:
 
 
 def _side(text: str, at: int) -> str:
-    """ours | ally | theirs — judged from the words AROUND the subject, not from the whole line.
+    """ours | ally | theirs — decided by GRAMMAR around the subject, never by a window of words.
 
-    The ally window is deliberately TIGHT and the ours window is wide, because the two mistakes are
-    not symmetric. `союзник` reaches a man only when it stands right in front of him: in
-    `300 о\\с РОВ поруч з укриттям «союзників»` the casualty is theirs and the allies are a landmark,
-    and a ±60 window read that as an ally's loss. `СОУ` next to a person, on the other hand, must be
-    seen from further away — counting our dead into their total is the one error we never ship.
+    Both side words appear in these lines for reasons that have nothing to do with whose man is down:
+    `союзник` can be the stretcher party or a landmark (`поруч з укриттям «союзників»`), and `СОУ`
+    marks the side that FIRED far more often than it marks the casualty — `ВУ СОУ по укриттю
+    в\\с ЧАБАН` is their wounded man, hit by us. A window read both wrongly, and the second one is
+    the expensive direction: it quietly deleted a named casualty and left a whole net block with no
+    line at all.
+
+    So a side word counts only where it qualifies the PERSON: directly in front of him, or in
+    brackets right after. `в\\с СОУ`, `о\\с СОУ`, `гр СОУ` are ours; `БпЛА СОУ`, `ВУ СОУ`, `ФПВ СОУ`
+    are the weapon and the shooter.
     """
     at = max(at, 0)
-    # `союзник` marks a side only where it QUALIFIES the man: right in front of him, or in brackets
-    # right after. Anywhere else in the line it is somebody standing nearby — in
-    # `300 о\\с РОВ, союзники допомагають з евакуацією` the casualty is theirs and the allies are the
-    # stretcher party, and in `поруч з укриттям «союзників»` they are a landmark. Both were read as
-    # an ally's loss while this looked at a window instead of at the grammar.
-    if re.search(r"союзник\w*\s*$", text[max(0, at - 20): at], re.I) \
-            or re.match(r"[А-ЯЁЇІЄ0-9'’-]*\s*\([^)]{0,12}союзник", text[at:], re.I):
+    before = text[max(0, at - 20): at]
+    after = text[at:]
+    if re.search(r"союзник\w*\s*$", before, re.I) \
+            or re.match(r"[А-ЯЁЇІЄ0-9'’-]*\s*\([^)]{0,12}союзник", after, re.I):
         return "ally"
-    near = text[max(0, at - 60): at + 60]
-    for m in re.finditer(r"соу", near, re.I):
-        chunk = near[max(0, m.start() - 30): m.end()]
-        if not DRONE_SOU_RE.search(chunk):
-            return "ours"
+    if re.search(r"(?:в[\\/]с|о[\\/]с|гр|бійц\w*)\s+СОУ\s*$", before, re.I) \
+            or re.match(r"СОУ\b", after, re.I) \
+            or re.match(r"[А-ЯЁЇІЄ0-9'’-]*\s*\([^)]{0,12}СОУ", after, re.I):
+        return "ours"
     return "theirs"
 
 
@@ -128,6 +133,15 @@ def collect(events: list[dict]) -> dict:
             u["lines"].append(text)
             u["n"] = max(u["n"], mult)
 
+        # With exactly one candidate in the line there is nobody to confuse him with, so distance
+        # stops mattering: `ВУ СОУ по укриттю в\с ЧАБАН - пошкоджено дах, легкі поранення (ім 300)`
+        # puts 45 characters between the man and the digits and used to count as nameless, which left
+        # a whole net block with no casualty line at all.
+        cands = [nm for nm in NAME_RE.finditer(text)
+                 if any(p.strip() not in NOT_A_CALLSIGN
+                        for p in re.split(r"\s*,\s*", nm.group(1) or nm.group(2) or ""))]
+        lone = cands[0] if len(cands) == 1 else None
+
         for mk in MARKER_RE.finditer(text):
             state = "200" if re.match(r"200|двохсот|загиб|тіло|вбит", mk.group(0), re.I) else "300"
             best = None
@@ -144,6 +158,8 @@ def collect(events: list[dict]) -> dict:
                     else abs(pos - mk.start())
                 if best is None or d < best[1]:
                     best = (nm, d)
+            if best is None and lone is not None:
+                best = (lone, 0)
             if best is None:
                 if found:            # this line already named somebody; a second marker in the
                     continue         # same line is the same casualty, not an extra body
