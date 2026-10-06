@@ -193,6 +193,13 @@ _wake_lock = asyncio.Lock()         # serialize wake reports (one at a time)
 # A job may carry `followup`: text injected into the owner's LIVE session after the report lands.
 # How long a follow-up waits for a busy chat before giving up (see _run_turn).
 FOLLOWUP_WAIT_SEC = 300
+# Which terminal states earn a follow-up turn. `failed` is in here deliberately: on 2026-10-06 a
+# match3 job ended its command with `grep -c`, which exits 1 when it finds nothing — so a trap that
+# ran its eight clean passes and legitimately caught no bug was delivered as «задача упала», with
+# no follow-up to say what actually happened, and the owner had to come and ask another instance.
+# A failure needs the explanation MORE than a success does. `cancelled` stays out: a deliberate
+# stop is a one-line notice by design, and raising a turn to analyse it would be noise.
+FOLLOWUP_STATUSES = frozenset({"done", "failed"})
 
 
 def load_claude_model() -> str:
@@ -3253,7 +3260,7 @@ async def _notify_finished_jobs(bot: Bot) -> None:
             # Only AFTER the job is marked delivered. A follow-up is a convenience; if it crashes or
             # the bot restarts mid-way, the report itself must still count as delivered rather than
             # be re-sent on the next tick.
-            if status == "done":
+            if status in FOLLOWUP_STATUSES:
                 await _followup_turn(bot, spec)
             continue
 
@@ -3271,9 +3278,9 @@ async def _notify_finished_jobs(bot: Bot) -> None:
         # text and silently never firing it — the owner got "задача завершена, вот файл" and then
         # silence until he asked what was in it. That is exactly the case this feature exists for,
         # and the plain dump needs it MORE than the wake report does: the dump is raw stdout with no
-        # one to say what it means. Same guards as the wake branch — only on `done`, only after the
-        # notification is marked delivered, so a crash here can never re-send the report.
-        if status == "done":
+        # one to say what it means. Same guards as the wake branch — only after the notification is
+        # marked delivered, so a crash here can never re-send the report.
+        if status in FOLLOWUP_STATUSES:
             await _followup_turn(bot, spec)
 
 
