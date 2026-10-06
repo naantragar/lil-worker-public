@@ -45,7 +45,10 @@ NAME_RE = re.compile(
     r"|(?:^|[;,]\s*)([А-ЯЁЇІЄ][А-ЯЁЇІЄ0-9'’-]{2,})(?=\s*(?:\([^)]*\))?\s*[-—–]\s*(?:ім\s*)?\b[23]00\b)")
 
 DRONE_SOU_RE = re.compile(r"(?:бпла|фпв|борт|дрон|вампір|бабка|баба\s*яга|ждун|мавік|мавик)\s*[^,;]{0,18}соу", re.I)
-ALLY_RE = re.compile(r"союзник|«союзники»", re.I)
+ALLY_RE = re.compile(r"союзник", re.I)
+# Our own abbreviations stand where a callsign stands but name nobody: `о\с РОВ` is a serviceman of
+# theirs with no callsign at all — the «без позивного» case, not a man called РОВ.
+NOT_A_CALLSIGN = {"РОВ", "СОУ", "ІМ", "ИМ", "ВУ", "БПЛА", "ФПВ", "МТЗ", "БК", "КНП"}
 
 VOWELS = "аеёиоуыэюяіїє"
 
@@ -60,10 +63,24 @@ def _fold(s: str) -> str:
 
 
 def _side(text: str, at: int) -> str:
-    """ours | ally | theirs — judged from the words AROUND the subject, not from the whole line."""
-    near = text[max(0, at - 60): at + 60]
-    if ALLY_RE.search(near):
+    """ours | ally | theirs — judged from the words AROUND the subject, not from the whole line.
+
+    The ally window is deliberately TIGHT and the ours window is wide, because the two mistakes are
+    not symmetric. `союзник` reaches a man only when it stands right in front of him: in
+    `300 о\\с РОВ поруч з укриттям «союзників»` the casualty is theirs and the allies are a landmark,
+    and a ±60 window read that as an ally's loss. `СОУ` next to a person, on the other hand, must be
+    seen from further away — counting our dead into their total is the one error we never ship.
+    """
+    at = max(at, 0)
+    # `союзник` marks a side only where it QUALIFIES the man: right in front of him, or in brackets
+    # right after. Anywhere else in the line it is somebody standing nearby — in
+    # `300 о\\с РОВ, союзники допомагають з евакуацією` the casualty is theirs and the allies are the
+    # stretcher party, and in `поруч з укриттям «союзників»` they are a landmark. Both were read as
+    # an ally's loss while this looked at a window instead of at the grammar.
+    if re.search(r"союзник\w*\s*$", text[max(0, at - 20): at], re.I) \
+            or re.match(r"[А-ЯЁЇІЄ0-9'’-]*\s*\([^)]{0,12}союзник", text[at:], re.I):
         return "ally"
+    near = text[max(0, at - 60): at + 60]
     for m in re.finditer(r"соу", near, re.I):
         chunk = near[max(0, m.start() - 30): m.end()]
         if not DRONE_SOU_RE.search(chunk):
@@ -95,8 +112,24 @@ def collect(events: list[dict]) -> dict:
 
         found: list[tuple[str, int, str]] = []        # (name, pos, state)
         seen_spans: set[tuple[int, int]] = set()
+
+        def add_unnamed(state: str, at: int) -> None:
+            """A casualty nobody named. One per distinct state and time, with a body multiplier."""
+            mult = 1
+            m = re.search(r"(\d+)\s*(?:тіл|в[\\/]с|о[\\/]с|бійц)", text)
+            if m and int(m.group(1)) in range(2, 10):
+                mult = int(m.group(1))
+            side = _side(text, at)
+            if side == "ours":
+                return
+            key = (state, side, e.get("time"))
+            u = unnamed.setdefault(key, {"state": state, "side": side, "n": mult,
+                                         "lines": [], "text": text})
+            u["lines"].append(text)
+            u["n"] = max(u["n"], mult)
+
         for mk in MARKER_RE.finditer(text):
-            state = "200" if KILLED_RE.match(mk.group(0)) or re.match(r"200|двохсот|загиб|тіло|вбит", mk.group(0), re.I) else "300"
+            state = "200" if re.match(r"200|двохсот|загиб|тіло|вбит", mk.group(0), re.I) else "300"
             best = None
             for nm in NAME_RE.finditer(text):
                 pos = nm.start(1) if nm.group(1) is not None else nm.start(2)
@@ -114,25 +147,24 @@ def collect(events: list[dict]) -> dict:
             if best is None:
                 if found:            # this line already named somebody; a second marker in the
                     continue         # same line is the same casualty, not an extra body
-                mult = 1
-                m = re.search(r"(\d+)\s*(?:тіл|в[\\/]с|о[\\/]с|бійц)", text)
-                if m and int(m.group(1)) in range(2, 10):
-                    mult = int(m.group(1))
-                side = _side(text, mk.start())
-                if side != "ours":
-                    key = (state, side, e.get("time"))
-                    u = unnamed.setdefault(key, {"state": state, "side": side, "n": mult, "lines": []})
-                    u["lines"].append(text)
-                    u["n"] = max(u["n"], mult)
+                add_unnamed(state, mk.start())
                 continue
             nm = best[0]
             if (nm.start(), nm.end()) in seen_spans:
                 continue
             seen_spans.add((nm.start(), nm.end()))
+            at = nm.start(1) if nm.group(1) is not None else nm.start(2)
+            named = False
             for part in re.split(r"\s*,\s*", (nm.group(1) or nm.group(2))):
                 part = part.strip()
-                if part and part not in {"РОВ", "СОУ", "ІМ", "ИМ"}:
-                    found.append((part, (nm.start(1) if (nm.group(1) or nm.group(2)) else nm.start(2)), state))
+                if part and part not in NOT_A_CALLSIGN:
+                    found.append((part, at, state))
+                    named = True
+            # `300 о\с РОВ` matched the subject pattern but named nobody — it is still a casualty,
+            # and the whole marker used to be dropped here. Three such lines went uncounted on
+            # 05.10.2026 before this branch existed.
+            if not named and not found:
+                add_unnamed(state, at)
 
         for name, at, state in found:
             side = _side(text, at)
@@ -145,7 +177,19 @@ def collect(events: list[dict]) -> dict:
                 row["state"] = "200"
             if side == "ally":
                 row["side"] = "ally"
-    return {"rows": rows, "unnamed": list(unnamed.values()), "lines": n_lines}
+
+    # A line may name its man too far from the digits to be matched — `в\\с ВЕТЕР лишається один на
+    # позиції, лежить (ім 300)` is 45 characters wide — and then he is counted once by name from
+    # another line and once more as a nameless body here. If the line names somebody who already
+    # stands in the count IN THE SAME STATE, the nameless entry is that same man.
+    cs_re = re.compile(r"\b[А-ЯЁЇІЄ][А-ЯЁЇІЄ0-9'’-]{2,}\b")
+    kept = []
+    for u in unnamed.values():
+        same = any(_fold(c) in rows and rows[_fold(c)]["state"] == u["state"]
+                   for c in cs_re.findall(u.get("text", "")) if c not in NOT_A_CALLSIGN)
+        if not same:
+            kept.append(u)
+    return {"rows": rows, "unnamed": kept, "lines": n_lines}
 
 
 def counts(data: dict) -> dict:

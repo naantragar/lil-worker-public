@@ -30,6 +30,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 OUT = REPO / "knowledge" / "upstream" / "reports_out"
+sys.path.insert(0, str(REPO / "tools" / "analytics2"))
+import losses                           # noqa: E402 — one definition of "who is a casualty"
 CORPUS_DB = Path(os.environ.get("UPSTREAM_MESSAGES_DB", "~/wa-monitor/messages.db"))
 
 # A report term on the left may only stand in a line if the speech under it carries one of the
@@ -104,11 +106,17 @@ def corpus_vocab() -> set:
     return vocab
 
 
-def ours_vocab() -> set:
-    """Everything our own past reports and notes have printed — a name we have used before is not
-    novel even if this day's traffic does not say it."""
+def ours_vocab(skip_day: str = "") -> set:
+    """Everything our own PAST reports and notes have printed — a name we have used before is not
+    novel even if this day's traffic does not say it.
+
+    `skip_day` excludes the report being checked, and that argument is the whole point: the day's own
+    txt sits in the same folder, so without it every invented name is "already in our reports" —
+    found there because this very report printed it. The check was quietly validating itself.
+    """
     v: set = set()
-    for f in list(OUT.glob("ZVIT_*.txt")) + list((REPO / "knowledge" / "upstream").glob("*.md")):
+    files = [f for f in OUT.glob("ZVIT_*.txt") if not skip_day or f.name != f"ZVIT_{skip_day}.txt"]
+    for f in files + list((REPO / "knowledge" / "upstream").glob("*.md")):
         try:
             v.update(re.findall(r"[а-яёіїєa-z]{3,}", f.read_text(encoding="utf-8").casefold()))
         except (OSError, UnicodeDecodeError):
@@ -130,7 +138,7 @@ def main() -> int:
     src = json.loads(src_path.read_text(encoding="utf-8"))
 
     corpus = corpus_vocab()
-    mine = ours_vocab()
+    mine = ours_vocab(a.day)
     flags: list[tuple[int, str, dict, list]] = []
 
     # --- per-line checks ---------------------------------------------------
@@ -194,6 +202,14 @@ def main() -> int:
 
         # novel entities: a codeword or callsign nobody has ever said
         for w in QUOTED_RE.findall(text) + CALLSIGN_RE.findall(text):
+            if w.strip() in NOT_A_NAME:          # our own abbreviations are not entities
+                continue
+            # A quote of three or more words is translated SPEECH, not a name: «ти знаєш, що робити»
+            # renders «ты знаешь что делать», so none of its words stand in the Russian traffic and
+            # the check fired on every quoted order. One- and two-word quotes stay — that is where a
+            # channel, a codeword or a nickname lives, and «6 больших» is exactly that shape.
+            if len(w.split()) >= 3:
+                continue
             for tok in re.findall(r"[а-яёіїєa-z]{3,}", w.casefold()):
                 if tok in corpus or tok in mine:
                     continue
@@ -205,14 +221,18 @@ def main() -> int:
             flags.append((sev, text, e, reasons))
 
     # --- cross-line checks -------------------------------------------------
+    # Who is actually dead is decided by the same code that counts the casualties (`losses.py`), not
+    # by "a callsign standing in a line that contains 200". The crude version read САИД out of
+    # `2 тіла (200) ... поруч з САИД` and ХОХОЛ out of `доповідь «200» від ХОХОЛ` — a bystander and a
+    # reporter — and then flagged every later line about them as a contradiction.
     dead: dict[str, str] = {}
     for e in events:
         t = e.get("text") or ""
-        if re.search(r"\b200\b", t):
-            for c in CALLSIGN_RE.findall(t):
-                if c in NOT_A_NAME:
-                    continue
-                dead.setdefault(c, e.get("time", ""))
+        if not re.search(r"\b200\b", t):
+            continue
+        for row in losses.collect([e])["rows"].values():
+            if row["state"] == "200":
+                dead.setdefault(row["name"], e.get("time", ""))
     cross: list[str] = []
     for e in events:
         t = e.get("text") or ""
@@ -233,6 +253,11 @@ def main() -> int:
         for i in range(len(texts)):
             for j in range(i + 1, len(texts)):
                 a_, b_ = set(norm(texts[i]).split()), set(norm(texts[j]).split())
+                # Two four-word lines share `в\с` and `ім` and look 50% identical while saying
+                # nothing in common: `200 в\с ОКАБР (ім)` ~ `300 в\с КОРЕЯ (ім)`. Overlap only means
+                # something once there is enough line to overlap.
+                if min(len(a_), len(b_)) < 6:
+                    continue
                 if a_ and b_ and len(a_ & b_) / max(len(a_), len(b_)) > 0.45:
                     dupes.append(f"{tm}: «{texts[i][:70]}» ~ «{texts[j][:70]}»")
 
