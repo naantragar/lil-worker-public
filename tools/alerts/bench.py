@@ -231,6 +231,15 @@ CODES = Path(__file__).resolve().parent / "codes.json"
 # drown the ones that matter. 99 is kept - it is rare and it means «heavy UAV activity».
 CODE_SKIP = {"200", "300", "55", "11", "13", "202", "100", "000"}
 CODE_KEEP_SHORT = {"99"}
+# ВИНЯТОК ІЗ ПРОПУСКУ, ПАРАМИ «формація + код». Навмисне не прапорець і не правило, а список:
+# 114 мсп кодує втрати як 202 (загиблий) і 303 (поранений), і це протилежне до решти корпусу,
+# де 202 - буденне «прийом». Пара прив'язує виняток до ОДНІЄЇ формації, тож він фізично не може
+# перетекти на 38 омсбр чи 1198 мсп, хоч би що потім дописали в глосарій.
+CODE_SKIP_EXCEPT = {("114", "202"), ("114", "303")}
+# Підказка для них несе попередження: таблиця каже одне, більшість мереж - інше, вирішує зміст.
+CODE_WARN = {("114", "202"): "УВАГА: у більшості мереж 202 - звичайне «прийом/норма», тут "
+                             "за таблицею це ВТРАТА. Вирішуй за змістом розмови.",
+             ("114", "303"): "УВАГА: 303 поза 114 мсп нічого не означає; тут за таблицею це 300-й."}
 RE_DIGIT_GROUP = re.compile(r"(?<!\d)\d(?:\s*[.,]?\s*\d){1,2}(?!\d)")
 _codes: dict | None = None
 
@@ -262,7 +271,10 @@ def code_hints(speech_text: str, header: str) -> list[str]:
     out, seen = [], set()
     for m in RE_DIGIT_GROUP.finditer(speech_text):
         key = re.sub(r"\D", "", m.group(0))
-        if key in seen or key in CODE_SKIP or not (len(key) == 3 or key in CODE_KEEP_SHORT):
+        excepted = {f for f in mine if (f, key) in CODE_SKIP_EXCEPT}
+        if key in seen or (key in CODE_SKIP and not excepted):
+            continue
+        if not excepted and not (len(key) == 3 or key in CODE_KEEP_SHORT):
             continue
         entries = table.get(key)
         if not entries:
@@ -270,7 +282,12 @@ def code_hints(speech_text: str, header: str) -> list[str]:
         seen.add(key)
         same = [e for e in entries if mine & set(e["formations"])]
         if same:
-            out.append(f"{key} = " + "; ".join(dict.fromkeys(e["meaning"] for e in same)))
+            line = f"{key} = " + "; ".join(dict.fromkeys(e["meaning"] for e in same))
+            for f in excepted:
+                warn = CODE_WARN.get((f, key))
+                if warn:
+                    line += f" [{warn}]"
+            out.append(line)
         else:
             other = "; ".join(dict.fromkeys(e["meaning"] for e in entries))
             out.append(f"{key} = {other} (записано в ІНШИХ підрозділів, тут не підтверджено)")

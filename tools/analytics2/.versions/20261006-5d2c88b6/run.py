@@ -2435,11 +2435,8 @@ def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
                         shown.append(c)
                         room -= len(c) + 2
                     tail = f" +{len(gone) - len(shown)} ще" if len(shown) < len(gone) else ""
-                    # Two windows now, so the line must say which one did the cutting — otherwise a
-                    # commander dropped after a fortnight reads as dropped after two days.
                     print(f"реєстр {netlabel(net)}: {len(roster)} -> {len(kept)} "
-                          f"(не чути: за {ROSTER_ACTIVE_DAYS} доби — рядові, "
-                          f"за {COMMAND_ACTIVE_DAYS} — ком склад: "
+                          f"(за {ROSTER_ACTIVE_DAYS} доби не чути: "
                           f"{', '.join(shown)}{tail})", file=sys.stderr)
                 roster = kept
         for cs, role, _older in roster:

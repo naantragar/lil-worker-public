@@ -60,11 +60,21 @@ if [ -z "$RUN" ] || [ ! -f "$RUN" ]; then
   exit 0
 fi
 
-# ДВА КАНАЛИ З ОДНОГО ПРОХОДУ. Модель уже поділила: red - те, де названо МІСЦЕ або НАСЛІДОК,
-# yellow - решта по темі. Другого читання це не коштує, ділиться готовий результат.
-# Червоний іде першим: якщо щось піде не так із жовтим, найважче вже доставлено.
-python3 tools/alerts/push_tg.py "$RUN" --state "$STATE" --level red \
+# ТРИ КАНАЛИ З ОДНОГО ПРОХОДУ (04.10.2026). Модель читає все одним проходом, ділиться готовий
+# результат - другого читання це не коштує. Розкладка за РІВНЕМ і ДЖЕРЕЛОМ одразу:
+#
+#   наш ефір (Invisible Hand, AllInARow)  red    -> червоний бот   найважче, дивитись першим
+#                                         yellow -> жовтий бот     решта по темі
+#   Патагонія                             red    -> сірий бот      чуже, але варте уваги
+#                                         yellow -> НІКУДИ         оцінюється й лягає в прогін
+#
+# Жовте з Патагонії свідомо не доставляється: воно є в файлі прогону й у базі, його можна
+# підняти будь-коли, але в телефон воно не йде - інакше топить те, заради чого все робилось.
+# Порядок важливий: наш червоний іде ПЕРШИМ, щоб збій на пізніших каналах не затримав найважче.
+python3 tools/alerts/push_tg.py "$RUN" --state "$STATE" --level red --source ours \
         --instance alerts_red >> "$LOG" 2>&1
-python3 tools/alerts/push_tg.py "$RUN" --state "$STATE" --level yellow \
+python3 tools/alerts/push_tg.py "$RUN" --state "$STATE" --level yellow --source ours \
         --instance helper >> "$LOG" 2>&1
+python3 tools/alerts/push_tg.py "$RUN" --state "$STATE" --level red --source patagonia \
+        --instance alerts_grey >> "$LOG" 2>&1
 echo "$(stamp) [$LANE] завершено" >> "$LOG"

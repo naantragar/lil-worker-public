@@ -35,6 +35,11 @@ CORPUS = "~/wa-monitor/messages.db"
 SRC_NAME = {"Invisible Hand": "Invisible Hand", "AllInARow": "AllInARow",
             "All in a Row": "AllInARow", "PATAGONIA_GP": "Patagonia"}
 OURS = {"Invisible Hand", "AllInARow", "All in a Row"}
+# Коло = РІВЕНЬ усередині свого потоку. Джерела вже розведені по РІЗНИХ ботах, тому колір більше
+# не мусить кричати «це Патагонія» - про це каже сам бот і підпис під заголовком. Усередині
+# сірого бота цінно інше: наскільки це важливо. Нові рівні додаються рядком у цю таблицю.
+MARK = {"ours":      {"red": "🔴", "yellow": "🟡"},
+        "patagonia": {"red": "🟠", "yellow": "⚪"}}
 CLASS_RU = {"polon": "ПЛЕН", "vbyto": "ЗАГИБЛИЙ", "vyiavleno": "ВИЯВЛЕНО НАШИХ",
             "pozytsiia": "РОЗКРИТО ПОЗИЦІЮ", "dokumenty": "НАШЕ МАЙНО У НИХ",
             "shturm": "НАЗЕМНИЙ ШТУРМ", "vu": "ВОГНЕВЕ УРАЖЕННЯ", "tekhnika": "ЇХНЯ ТЕХНІКА", "prapor": "ПРАПОР НА ЗАХОПЛЕНІЙ ЗЕМЛІ",
@@ -88,6 +93,8 @@ def main() -> None:
     ap.add_argument("run")
     ap.add_argument("--instance", default="helper")
     ap.add_argument("--level", default="red", choices=["red", "yellow", "log", "all"])
+    ap.add_argument("--source", default="all", choices=["ours", "patagonia", "all"],
+                    help="ours = Invisible Hand + AllInARow; patagonia = решта")
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--state", default="",
                     help="sqlite зі вже надісланими id; з ним повтори не йдуть")
@@ -97,6 +104,12 @@ def main() -> None:
 
     run = json.loads(Path(a.run).read_text(encoding="utf-8"))
     alerts = [x for x in run["alerts"] if a.level == "all" or x.get("level") == a.level]
+    # РОЗВЕДЕННЯ ЗА ДЖЕРЕЛОМ. Наш ефір і Патагонія йдуть у РІЗНІ боти, бо увага до них різна:
+    # червоне наше - у червоний, жовте наше - у жовтий, червоне з Патагонії - у сірий, а жовте
+    # з Патагонії не доставляється взагалі (модель його все одно оцінює й пише в прогін).
+    if a.source != "all":
+        want_ours = a.source == "ours"
+        alerts = [x for x in alerts if (str(x.get("src") or "") in OURS) == want_ours]
     alerts.sort(key=lambda x: x.get("hhmmss", ""))
     if not alerts:
         print("нема чого слати")
@@ -160,10 +173,7 @@ def main() -> None:
     for i, x in enumerate(alerts, 1):
         body = texts.get(x["id"], "").strip()
         src = str(x.get("src") or "")
-        if src in OURS:
-            mark = "🔴" if x.get("level") == "red" else "🟡"
-        else:
-            mark = "⚪"
+        mark = MARK["ours" if src in OURS else "patagonia"].get(x.get("level"), "⚪")
         src_line = SRC_NAME.get(src, src or "джерело невідоме")
         if x.get("escalated"):
             src_line += f" · у червоний за {x['escalated']}"

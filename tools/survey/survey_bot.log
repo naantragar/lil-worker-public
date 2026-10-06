@@ -216,3 +216,7 @@ btn from 323182394: 'menu'
   ПОВТОР getMe після 0.1s
 бот: None
 getUpdates: <urlopen error [Errno -3] Temporary failure in name resolution>
+getUpdates: {"ok":false,"error_code":502,"description":"Bad Gateway"}
+getUpdates: {"ok":false,"error_code":502,"description":"Bad Gateway"}
+getUpdates: {"ok":false,"error_code":502,"description":"Bad Gateway"}
+getUpdates: {"ok":false,"error_code":502,"description":"Bad Gateway"}

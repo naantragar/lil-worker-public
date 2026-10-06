@@ -825,23 +825,12 @@ KNOWN_CODES = REPO / "knowledge" / "upstream" / "known_codes.md"
 # applies to EVERY name — the analyst's last list has no immunity (owner's decision, 27.08 evening).
 # Printing the whole accumulated register was 145 callsigns over 97 events, longer than the report
 # it heads. Two days brings that to ~58. Deliberately NOT done: a per-network cap (the owner sees no
-# reason for one) and a floor (if only one man was heard on a net, one man is the truth).
+# reason for one) and a floor (if only one man was heard on a net, one man is the truth). Command
+# staff get no exemption either — `ком склад` stands against 41 of the 145 names, so exempting them
+# would not filter anything.
 # Nothing is lost by this: the FULL accumulated register, with each man's last time on the air, is
 # written to `<out>_reestr.txt` next to the report (see build_register_file).
 ROSTER_ACTIVE_DAYS = 2
-
-# COMMAND STAFF LIVE LONGER (owner, 06.10.2026). An earlier note here said they get no exemption,
-# because `ком склад` stood against 41 of 145 names and exempting them would filter nothing. That
-# argument was about VOLUME; the owner's is about VALUE — a commander is the thing we track, and two
-# quiet days is not evidence that he is gone, while losing him from the header is a real loss. So a
-# name whose ROLE marks him as command staff has to be silent for two weeks before he is dropped.
-# `ЛИСИЙ`, the deputy commander of 1 шр "V", fell out of the 05.10 report at "3 діб тому" while
-# being the loudest voice on his own net.
-COMMAND_ACTIVE_DAYS = 14
-COMMAND_ROLE_RE = re.compile(
-    r"ком\s*склад|командир|\bкр\b|\bкв\b|\bнш\b|начальник|заступник|офіцер|підполковник|"
-    r"полковник|майор|капітан|лейтенант|ст\.?\s*груп|старший|ком\s*розрахунк|ком\.",
-    re.I)
 
 # How far back the companion file looks when dating a silent callsign. Only the file uses it; the
 # report itself never reads more than ROSTER_ACTIVE_DAYS.
@@ -856,7 +845,7 @@ REGISTER_FILE_DAYS = 14
 MIN_ACTIVITY_CHARS = 4000
 
 
-def activity_index(dt_to: str, days: int = ROSTER_ACTIVE_DAYS) -> dict[str, dict]:
+def activity_index(dt_to: str) -> dict[str, dict]:
     """Who has actually been on the air lately, per frequency.
 
     The register printed under a network header is the analyst's accumulated list, and it accumulates
@@ -872,7 +861,7 @@ def activity_index(dt_to: str, days: int = ROSTER_ACTIVE_DAYS) -> dict[str, dict
     empty (a bad query, a DB hiccup), the register is printed in full rather than blanked.
     """
     hi = datetime.strptime(dt_to, "%Y-%m-%d %H:%M")
-    recs = fetch(f"{hi - timedelta(days=days):%Y-%m-%d %H:%M}", dt_to)
+    recs = fetch(f"{hi - timedelta(days=ROSTER_ACTIVE_DAYS):%Y-%m-%d %H:%M}", dt_to)
     out: dict[str, dict] = defaultdict(lambda: {"names": set(), "speech": []})
     for r in recs:
         f = r.get("freq")
@@ -900,27 +889,6 @@ def heard_on(index: dict[str, dict], freqs: list[str]) -> tuple[set[str], str]:
     return names, "\n".join(speech).lower()
 
 
-def _fold(s: str) -> str:
-    """One spelling for a callsign written in Russian and in Ukrainian.
-
-    The register is kept by a Ukrainian-speaking analyst, the air is Russian, and the two spellings
-    of the same man never met: `ЛИСИЙ` in our register against `ЛЫСЫЙ` in every intercept. The
-    freshness check therefore found three days of silence for the loudest voice on that net and
-    dropped him from the 05.10.2026 report (fixed 06.10.2026).
-
-    Folded deliberately NARROW — only the letters that are the SAME sound in the two alphabets:
-    и/і/ї/ы/й → и, е/є/э/ё → е, ґ → г, soft and hard signs away. `і → е` is NOT folded even though
-    Ukrainian `і` often stands where Russian has `е`: that would merge ЛИС and ЛЕС, two different
-    men. The bias of the whole activity filter is "keep rather than drop", so an over-merge here
-    only keeps a name printed longer, which is the cheap error.
-    """
-    t = (s or "").lower()
-    for a, b in (("і", "и"), ("ї", "и"), ("ы", "и"), ("й", "и"),
-                 ("є", "е"), ("э", "е"), ("ё", "е"), ("ґ", "г")):
-        t = t.replace(a, b)
-    return t.replace("ь", "").replace("ъ", "")
-
-
 def still_active(name: str, names: set[str], blob: str) -> bool:
     """A callsign counts as active if it keyed the mic OR was talked about.
 
@@ -933,17 +901,11 @@ def still_active(name: str, names: set[str], blob: str) -> bool:
     key = name.strip().upper()
     if key in names:
         return True
-    folded_names = {_fold(n) for n in names}
-    folded_blob = _fold(blob)
     for v in re.split(r"[,/]", key):
         v = v.strip()
         if len(v) < 3:
             return True             # too short to match safely — never drop on this evidence
         if re.search(rf"\b{re.escape(v.lower())}", blob):
-            return True
-        # the same man spelled the other way: ЛИСИЙ (register) vs ЛЫСЫЙ (air)
-        fv = _fold(v)
-        if fv in folded_names or re.search(rf"\b{re.escape(fv)}", folded_blob):
             return True
     return False
 
@@ -1368,8 +1330,7 @@ def _pull_register(con, ids: list[int]) -> tuple[list[tuple[str, str, bool]], li
         """
         out: list[tuple[set, str, str]] = []
         for name, role in rows:
-            # folded too, so ЛИСИЙ and ЛЫСЫЙ are one man and not two rows
-            vs = _variants(name) | {_fold(v) for v in _variants(name)}
+            vs = _variants(name)
             for i, (seen, kept_name, kept_role) in enumerate(out):
                 if vs & seen:
                     best_name = kept_name if len(kept_name) >= len(name) else name
@@ -2352,8 +2313,7 @@ def apply_layout(mode: str, events: list[dict], recs: list[dict],
 
 def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
                  dt_to: str, active: dict[str, dict] | None = None,
-                 titles: dict | None = None, order: list | None = None,
-                 active_cmd: dict[str, dict] | None = None) -> str:
+                 titles: dict | None = None, order: list | None = None) -> str:
     """Group by network, then by callsign — the analyst's own layout.
 
     Several events about one man are kept together even when other people's events fall between them
@@ -2409,18 +2369,10 @@ def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
                 print(f"реєстр {netlabel(net)}: НЕ ріжемо — за {ROSTER_ACTIVE_DAYS} доби лише "
                       f"{len(blob)} симв. ефіру (мало доказів)", file=sys.stderr)
                 names, blob = set(), ""
-            # Command staff are checked against a much longer window (COMMAND_ACTIVE_DAYS): the
-            # header must not lose a commander over two quiet days. Everyone else keeps the short
-            # one — that is what holds the register down to a readable length.
-            cmd_names, cmd_blob = (heard_on(active_cmd, fr) if active_cmd else (names, blob))
             if names or blob:        # fail open: an empty lookup must not touch the register
                 kept, dropped = [], []
                 for cs, role, older in roster:
-                    if COMMAND_ROLE_RE.search(role or ""):
-                        alive = still_active(cs, cmd_names, cmd_blob)
-                    else:
-                        alive = still_active(cs, names, blob)
-                    tgt = kept if alive else dropped
+                    tgt = kept if still_active(cs, names, blob) else dropped
                     tgt.append((cs, role, older))
                 if dropped:
                     # The names are the POINT of this line — it is how we notice that a whole
@@ -2435,11 +2387,8 @@ def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
                         shown.append(c)
                         room -= len(c) + 2
                     tail = f" +{len(gone) - len(shown)} ще" if len(shown) < len(gone) else ""
-                    # Two windows now, so the line must say which one did the cutting — otherwise a
-                    # commander dropped after a fortnight reads as dropped after two days.
                     print(f"реєстр {netlabel(net)}: {len(roster)} -> {len(kept)} "
-                          f"(не чути: за {ROSTER_ACTIVE_DAYS} доби — рядові, "
-                          f"за {COMMAND_ACTIVE_DAYS} — ком склад: "
+                          f"(за {ROSTER_ACTIVE_DAYS} доби не чути: "
                           f"{', '.join(shown)}{tail})", file=sys.stderr)
                 roster = kept
         for cs, role, _older in roster:
@@ -2693,8 +2642,7 @@ def finish(a, recs: list[dict], units: list[dict], events: list[dict],
     report_events, report_freqs, titles, order = apply_layout(
         getattr(a, "layout", "current"), [dict(e) for e in events], recs, dict(freqs_of))
     styled = build_report(report_events, report_freqs, a.band, a.dt_to,
-                          activity_index(a.dt_to), titles, order,
-                          activity_index(a.dt_to, COMMAND_ACTIVE_DAYS))
+                          activity_index(a.dt_to), titles, order)
     while styled and not styled[-1][0].strip():     # exactly five blanks, not five plus the ones
         styled.pop()                                # build_report leaves after the last block
     styled += build_tail()

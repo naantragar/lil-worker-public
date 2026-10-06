@@ -381,16 +381,55 @@ def report() -> None:
         print("\n=== чекає, щоб я подивився очима ===")
         for r in eyes:
             print("  " + r["file"])
+    # ВЕРДИКТ ОСТАННІМ РЯДКОМ. 04.10.2026 прогін завершився «успішно», поклавши три найцінніші
+    # таблиці в чергу needs_eyes - і це було видно лише посеред виводу. Звіт, що закінчується
+    # словом «усе прочитано», не дає прийняти чергу за зроблену роботу.
     bad = con.execute("SELECT file, status FROM sources WHERE status LIKE 'failed%'").fetchall()
     if bad:
         print("\n=== не прочитано ===")
         for r in bad:
             print(f"  {r['status']:<22} {r['file']}")
 
+    pend = con.execute("SELECT count(*) n FROM sources WHERE status='pending'").fetchone()["n"]
+    eyes_n = len(eyes)
+    bad_n = len(bad)
+    print("\n" + "=" * 60)
+    if eyes_n or pend or bad_n:
+        parts = []
+        if eyes_n:
+            parts.append(f"{eyes_n} чекає моїх очей")
+        if pend:
+            parts.append(f"{pend} не читано")
+        if bad_n:
+            parts.append(f"{bad_n} впало")
+        print("!!! РОБОТА НЕ ЗАВЕРШЕНА: " + ", ".join(parts))
+        if eyes_n:
+            print("    -> python3 tools/glossary/ingest.py eyes   (шляхи, щоб відкрити й прочитати)")
+    else:
+        print("усе прочитано, черги нема")
+    print("=" * 60)
+
+
+def eyes() -> None:
+    """Файли, які конвеєр читати не вміє: фотографії аркушів без текстового шару.
+
+    Вони не «пропущені» - вони адресовані МЕНІ. Конвеєр бачить лише текст, а таблицю на фото
+    читають очима; після читання запис ставиться руками й джерело переходить у `read_eyes`,
+    щоб потім було видно, що саме внесла людина, а що модель."""
+    con = db()
+    rows = con.execute("SELECT file, kind FROM sources WHERE status='needs_eyes' ORDER BY file").fetchall()
+    if not rows:
+        print("черги нема - усе прочитано")
+        return
+    print(f"чекають очей: {len(rows)}\n")
+    for r in rows:
+        print(f"  {r['kind']:<14} {RAW / r['file']}")
+    print("\nпрочитати очима -> внести через ingest.write_entries(..., source=<імʼя файлу>)")
+    print("і поставити sources.status='read_eyes'")
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("verb", choices=["scan", "plan", "run", "report"])
+    ap.add_argument("verb", choices=["scan", "plan", "run", "report", "eyes"])
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--model", default="claude-sonnet-5")
     ap.add_argument("--effort", default="medium")
@@ -401,6 +440,8 @@ def main() -> None:
         plan()
     elif a.verb == "run":
         run(a.limit, a.model, a.effort)
+    elif a.verb == "eyes":
+        eyes()
     else:
         report()
 
