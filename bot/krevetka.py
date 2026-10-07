@@ -940,8 +940,17 @@ FLOOD_MAX_WAIT = 30.0   # longest single pause we're willing to sit out
 FLOOD_ATTEMPTS = 3
 
 
-async def _deliver(message: Message, text: str, *, html: bool, attempts: int) -> str:
+async def _deliver(message: Message, text: str, *, html: bool, attempts: int,
+                   silent: bool = False) -> str:
     """Send ONE Telegram message. Never raises.
+
+    `silent` maps to Telegram's `disable_notification` (Bot API: "Sends the message silently.
+    Users will receive a notification with no sound"). It exists so the owner can UNMUTE the bot:
+    a turn is mostly progress lines, and with every one of them chiming he had to silence the chat
+    outright — which also silenced the answer. Progress now arrives mute, the answer rings. The
+    badge and the banner still appear for both; only sound and vibration are dropped.
+    Note this is weaker than a client-side mute: if the chat is muted in Telegram, nothing sounds
+    regardless of this flag.
 
     Returns "sent"; "rejected" (Telegram refused the CONTENT, e.g. broken HTML — the caller may
     retry it as plain text); "network" (the transport broke — see below); or "flooded" (rate-limited
@@ -961,7 +970,8 @@ async def _deliver(message: Message, text: str, *, html: bool, attempts: int) ->
     parse_mode = "HTML" if html else None
     for attempt in range(1, attempts + 1):
         try:
-            await message.answer(text, parse_mode=parse_mode)
+            await message.answer(text, parse_mode=parse_mode,
+                                 disable_notification=silent or None)
             return "sent"
         except TelegramRetryAfter as e:
             if attempt == attempts:
@@ -994,10 +1004,15 @@ async def _deliver(message: Message, text: str, *, html: bool, attempts: int) ->
 async def send_notification(message: Message, text: str) -> bool:
     """A cosmetic message (tool notification / progress line). Dropped rather than
     waited out — losing one '🔧 ...' line costs nothing, and not queueing on a
-    throttled chat is what leaves room for the answer itself."""
-    status = await _deliver(message, text, html=True, attempts=1)
+    throttled chat is what leaves room for the answer itself.
+
+    SILENT by definition: this function IS the progress channel, so the sound belongs to the
+    answer (`send_long_message`) and never here. The split already existed — the two functions
+    were written apart for delivery stubbornness — which is why the notification dial needed no
+    buffering and no guessing which block is the last one."""
+    status = await _deliver(message, text, html=True, attempts=1, silent=True)
     if status == "rejected":
-        status = await _deliver(message, text, html=False, attempts=1)
+        status = await _deliver(message, text, html=False, attempts=1, silent=True)
     return status == "sent"
 
 
