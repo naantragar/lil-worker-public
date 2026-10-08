@@ -145,6 +145,12 @@ def collect(events: list[dict]) -> dict:
         for mk in MARKER_RE.finditer(text):
             state = "200" if re.match(r"200|двохсот|загиб|тіло|вбит", mk.group(0), re.I) else "300"
             best = None
+            # Deliberately ALL matches compete, abbreviations included. An `о\с РОВ` standing next
+            # to the digits means "a casualty with no callsign" and must BLOCK the marker — letting
+            # only real names compete was tried on 08.10.2026 and immediately mis-fired the other
+            # way: `наказ ШАЙБА в\с ВАЛУН зняти відео 200 о\с РОВ` handed ВАЛУН somebody else's 200.
+            # The two shapes are indistinguishable by distance, so the ambiguity is resolved in the
+            # LINE (write the callsign beside the number), never here.
             for nm in NAME_RE.finditer(text):
                 pos = nm.start(1) if nm.group(1) is not None else nm.start(2)
                 if abs(pos - mk.start()) > NEAR:
