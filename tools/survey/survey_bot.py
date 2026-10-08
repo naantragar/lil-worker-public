@@ -45,6 +45,22 @@ ENV = Path("~/upstream-backups/monitor.env")
 OWNER = 323182394
 CHUNK = 3500              # Telegram hard limit is 4096; leave room for the keyboard
 
+# --- roles (owner 08.10.2026) -----------------------------------------------------------------
+# The bot is first of all the upstream MONITORING bot: the owner and the second developer both get the
+# health board and the alerts. The quizzes are the owner's alone. The monitoring audience is read
+# from the SAME env line the alert timer sends to (UPSTREAM_ALERT_TG_CHAT), so «who gets alerts» and
+# «who may press the button» cannot drift apart.
+HEALTH = Path("~/upstream-system/ops/monitor/upstream_health.py")
+MUTES = Path("/var/lib/upstream-health/mutes.json")     # written here, read by the alert timer
+MUTE_SEC = 6 * 3600
+
+
+def monitor_users() -> set[int]:
+    for line in ENV.read_text(encoding="utf-8").splitlines():
+        if line.startswith("UPSTREAM_ALERT_TG_CHAT="):
+            return {int(x) for x in line.split("=", 1)[1].split(",") if x.strip().lstrip("-").isdigit()}
+    return {OWNER}
+
 
 def token() -> str:
     for line in ENV.read_text(encoding="utf-8").splitlines():
@@ -207,6 +223,51 @@ def next_item(name: str) -> dict | None:
     return None
 
 
+def home(uid: int, note: str = "") -> None:
+    """Main menu. The status button is the first, alone on its row and loud on purpose - it is the
+    reason this bot exists for both people; the quizzes row exists only for the owner."""
+    rows = [[{"text": "🩺  СТАН СИСТЕМИ", "callback_data": "status"}]]
+    if uid == OWNER:
+        rows.append([{"text": "📝 Вікторини", "callback_data": "quiz"}])
+    say(chat_id=uid, text=(note + "\n\n" if note else "") + "Огма · сервісний бот",
+        reply_markup={"inline_keyboard": rows})
+
+
+STATUS_KB = {"inline_keyboard": [[{"text": "🔄 Оновити", "callback_data": "status"},
+                                  {"text": "⬅ Меню", "callback_data": "home"}]]}
+
+
+def status(uid: int, edit_id: int | None = None) -> None:
+    """Run the health board in a SEPARATE process: a hung check costs this one answer 90 s, never
+    the bot. The message under the finger turns into «перевіряю…» first, so a press is visibly taken."""
+    if edit_id:
+        r = call("editMessageText", chat_id=uid, message_id=edit_id, text="⏳ перевіряю систему…")
+        if not r.get("ok"):
+            edit_id = None
+    if not edit_id:
+        r = say(chat_id=uid, text="⏳ перевіряю систему…")
+        edit_id = (r.get("result") or {}).get("message_id")
+    try:
+        p = subprocess.run([sys.executable, str(HEALTH)], capture_output=True, text=True, timeout=90)
+        text = p.stdout.strip() or f"перевірка не дала відповіді:\n{p.stderr[-400:]}"
+    except subprocess.TimeoutExpired:
+        text = "⏱ перевірка не вклалась у 90 с - це саме по собі тривожна ознака."
+    if edit_id:
+        r = call("editMessageText", chat_id=uid, message_id=edit_id, text=text[:4000],
+                 reply_markup=STATUS_KB)
+        if r.get("ok"):
+            return
+    say(chat_id=uid, text=text[:4000], reply_markup=STATUS_KB)
+
+
+def mute(uid: int, cid: str) -> None:
+    mutes = {k: v for k, v in load(MUTES, {}).items() if v > time.time()}
+    mutes[cid] = time.time() + MUTE_SEC
+    save(MUTES, mutes)
+    until = datetime.fromtimestamp(mutes[cid]).strftime("%H:%M")
+    say(chat_id=uid, text=f"🔕 {cid} приглушено до {until}. Решта вузлів і далі шлють тривоги.")
+
+
 def menu(uid: int, note: str = "") -> None:
     rows = []
     for s in surveys():
@@ -215,8 +276,10 @@ def menu(uid: int, note: str = "") -> None:
         rows.append([{"text": f"{mark}{s['title']}  ({done}/{s['total']})",
                       "callback_data": f"pick:{s['name']}"}])
     if not rows:
-        say(chat_id=uid, text="Наборів поки немає.")
+        say(chat_id=uid, text="Наборів поки немає.",
+            reply_markup={"inline_keyboard": [[{"text": "⬅ Головне меню", "callback_data": "home"}]]})
         return
+    rows.append([{"text": "⬅ Головне меню", "callback_data": "home"}])
     say(chat_id=uid, text=(note + "\n\n" if note else "") + "Обери набір:",
         reply_markup={"inline_keyboard": rows})
 
@@ -297,10 +360,25 @@ def handle_callback(cq: dict) -> None:
     uid = cq["from"]["id"]
     print(f"btn from {uid}: {(cq.get('data') or '')[:60]!r}", file=sys.stderr, flush=True)
     call("answerCallbackQuery", callback_query_id=cq["id"])
-    if uid != OWNER:
-        print(f"  ЗБІЙ: id {uid} не збігається з OWNER {OWNER}", file=sys.stderr, flush=True)
-        return
     data = cq.get("data") or ""
+    mid = (cq.get("message") or {}).get("message_id")
+    # Monitoring is open to the whole monitoring audience; everything below it is the owner's.
+    if uid in monitor_users() or uid == OWNER:
+        if data == "status":
+            status(uid, mid)
+            return
+        if data == "home":
+            home(uid)
+            return
+        if data.startswith("mute:"):
+            mute(uid, data.split(":", 1)[1])
+            return
+    if uid != OWNER:
+        print(f"  ЗБІЙ: id {uid} не може {data[:30]!r}", file=sys.stderr, flush=True)
+        return
+    if data == "quiz":
+        menu(uid)
+        return
     state = load(STATE, {})
     if data == "menu":
         mid = (cq.get("message") or {}).get("message_id")
@@ -347,6 +425,13 @@ def handle_message(msg: dict) -> None:
     text = (msg.get("text") or "").strip()
     voice = msg.get("voice") or msg.get("audio") or msg.get("video_note")
     print(f"msg from {uid}: {text[:60]!r}", file=sys.stderr, flush=True)
+    if uid != OWNER and uid in monitor_users():
+        # The second developer's whole bot is the monitoring section.
+        if text == "/status":
+            status(uid)
+        else:
+            home(uid)
+        return
     if uid != OWNER:
         print(f"  ЗБІЙ: id {uid} не збігається з OWNER {OWNER} - відповідь не надсилається",
               file=sys.stderr, flush=True)
@@ -380,13 +465,19 @@ def handle_message(msg: dict) -> None:
         if voice:
             say(chat_id=uid, text="Голосове приймаю тільки там, де я прошу коментар.")
         return
-    if text in ("/start", "/menu", "/list"):
+    if text in ("/start", "/menu"):
+        home(uid)
+        return
+    if text == "/status":
+        status(uid)
+        return
+    if text in ("/list", "/quiz"):
         menu(uid)
         return
     if text == "/next" and cur.get("survey"):
         show(uid, cur["survey"], None)
         return
-    menu(uid, "Команди: /start - список наборів, /next - наступне питання.")
+    home(uid, "Команди: /start - меню, /status - стан системи, /quiz - вікторини, /next - наступне питання.")
 
 
 def main() -> None:

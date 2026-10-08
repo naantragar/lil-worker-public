@@ -220,3 +220,6 @@ getUpdates: {"ok":false,"error_code":502,"description":"Bad Gateway"}
 getUpdates: {"ok":false,"error_code":502,"description":"Bad Gateway"}
 getUpdates: {"ok":false,"error_code":502,"description":"Bad Gateway"}
 getUpdates: {"ok":false,"error_code":502,"description":"Bad Gateway"}
+бот: oongomanaganada_bot
+msg from 323182394: '/status'
+update 494732032: оброблено за 3.5s

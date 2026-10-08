@@ -128,7 +128,7 @@ TG_GETFILE_LIMIT = 20 * 1024 * 1024
 # knowledge/upstream/reports_out, and report work regularly means editing tools/analytics2). A cap
 # wide enough for that is just full rights with extra failure modes, so the twin is privileged and
 # the separation of duties is the owner's discipline, not a lock.
-PRIVILEGED_INSTANCES = {"lil_worker", "twin", "twin2"}
+PRIVILEGED_INSTANCES = {"lil_worker", "twin", "twin2", "twin3"}
 PRIVILEGED_INSTANCE = "lil_worker"          # the default/original one, kept for messages
 ALLOW_SELF_MODIFICATION = INSTANCE_NAME in PRIVILEGED_INSTANCES
 SELFMOD_GUARD_PATH = CODE_DIR / "selfmod_guard.py"
