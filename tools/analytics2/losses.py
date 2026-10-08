@@ -166,8 +166,11 @@ def collect(events: list[dict]) -> dict:
                 add_unnamed(state, mk.start())
                 continue
             nm = best[0]
-            if (nm.start(), nm.end()) in seen_spans:
-                continue
+            # Deliberately NOT skipping a span we have already used. A line can carry the same man
+            # twice with a worsening state — `в\с СТАРЫЙ (щелепа) важкий, згодом підтверджено - 200`
+            # names him once and marks him 300 then 200 — and skipping the second marker left him
+            # counted as wounded when the same sentence says he died. Rows are keyed by folded name,
+            # so a repeat cannot become a second person; it can only upgrade the state.
             seen_spans.add((nm.start(), nm.end()))
             at = nm.start(1) if nm.group(1) is not None else nm.start(2)
             named = False
