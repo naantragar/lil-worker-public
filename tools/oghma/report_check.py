@@ -57,10 +57,14 @@ FORBIDDEN = [
 ]
 
 IMPOSSIBLE = [
-    # `ведення` must stand alone: `без наведення місця` contains it and has nothing to do with a drone
-    # leading a man. `веде` likewise hides in `приведе`, `зведення`.
-    (r"\b(супровід|супроводі|під наглядом|під спостереженням|ведення|веде|координац|керівництв)",
-     r"бпла\s+соу|соу\s*\(|«?соу»?\)?\s*$",
+    # The escort word must stand NEXT TO «БпЛА СОУ», not merely in the same line. Four days running
+    # (06-09.10.2026) this flagged correct lines of the commonest shape there is: their handler leads
+    # the man («веде ШАЙБА», «супровід КОЛЮЧИЙ») while OUR drone is the threat that stopped him. Both
+    # halves are true and the line is right; only adjacency distinguishes the inverted case.
+    # `ведення` must also stand alone: `без наведення місця` contains it and means nothing here.
+    (r"\b(супровід|супроводі|під наглядом|під спостереженням|ведення|веде|координац|керівництв)"
+     r"\w*\s+(?:\w+\s+){0,2}?(?:бпла\s+)?соу\b",
+     r".",
      "наш борт не водить їхнього бійця: «супровід/під наглядом» разом із БпЛА СОУ — це перевернуте, "
      "у мові майже завжди «рух через/під загрозою БпЛА СОУ»"),
     (r"\bнаш[іихе]?\b", r".",
