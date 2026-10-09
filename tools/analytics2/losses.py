@@ -18,6 +18,19 @@ import re
 
 # A line is about a casualty if it carries one of these. `зник` is deliberately NOT here: a man who
 # stopped answering is not a loss until somebody says he is.
+# `200` is a casualty code only when it is NOT a measurement. These lines are full of distances,
+# and on 09.10.2026 `ВУ по опорному пункту (150-200 м від в\с КАРПУХ)` made КАРПУХ a dead man and
+# printed `Втрати: 200 - 1` for a net where nobody was hurt. So a number followed by a unit, or
+# standing as the upper end of a range, is struck out before anything else looks at the line.
+NOT_A_CODE = re.compile(r"\b[23]00\s*(?:м\b|м\.|метр|хв\b|мм\b|кг\b|%)|\b\d{1,3}\s*[-–]\s*[23]00\b", re.I)
+
+
+def _strip_measures(text: str) -> str:
+    """Blank out 200/300 that are measurements, keeping the string length so positions still line
+    up with the original (every subject search in this module works by character distance)."""
+    return NOT_A_CODE.sub(lambda m: "·" * len(m.group(0)), text or "")
+
+
 CASUALTY_RE = re.compile(r"\b200\b|\b300\b|поранен|загибель|загинув|\bтіло\b|вбит", re.I)
 KILLED_RE = re.compile(r"\b200\b|загибель|загинув|\bтіло\b|вбит", re.I)
 
@@ -110,7 +123,9 @@ def collect(events: list[dict]) -> dict:
     n_lines = 0
 
     for e in events:
-        text = str(e.get("text") or "")
+        raw = str(e.get("text") or "")
+        # measurements are blanked here, once, so every pattern below sees only real codes
+        text = _strip_measures(raw)
         if not CASUALTY_RE.search(text):
             continue
         n_lines += 1
