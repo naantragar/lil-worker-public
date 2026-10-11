@@ -24,6 +24,7 @@ import argparse
 import hashlib
 import json
 import os
+import tempfile
 import re
 import shutil
 import sqlite3
@@ -388,16 +389,39 @@ def render_unit(u: dict) -> str:
 # ─── model ─────────────────────────────────────────────────────────────────────────────────────
 
 def call_model(system: str, material: str, model: str, effort: str) -> tuple[str, float]:
+    """The system prompt goes in a FILE, never in argv.
+
+    On 11.10.2026 the whole report came out empty - 0 events, 0 nets, and a clean exit code - because
+    every single unit died with `[Errno 7] Argument list too long: 'claude'`. The cause was not the
+    corpus and not the model: `rules.md` had grown to 124 KB, and Linux caps ONE argument at
+    MAX_ARG_STRLEN = 128 KB regardless of the 2 MB ARG_MAX for the whole list. So the rules I had been
+    adding all week silently crossed a kernel limit, and the failure looked like «the model found
+    nothing».
+
+    `--system-prompt-file` removes the ceiling for good, which matters more than the fix: the rules
+    file is meant to keep growing, and no size of it may ever again be able to produce a believable
+    empty report.
+    """
     BARE_CWD.mkdir(parents=True, exist_ok=True)
-    cmd = ["claude", "-p", "--model", model, "--system-prompt", system,
-           "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-           "--disallowedTools", *NO_TOOLS, "--effort", effort]
-    t0 = time.monotonic()
-    p = subprocess.run(cmd, input=material, capture_output=True, text=True,
-                       timeout=3600, cwd=str(BARE_CWD))
-    if p.returncode != 0:
-        raise RuntimeError(f"claude exited {p.returncode}: {p.stderr[-300:]}")
-    return p.stdout.strip(), time.monotonic() - t0
+    sp = tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".md",
+                                     dir=str(BARE_CWD), delete=False)
+    try:
+        sp.write(system)
+        sp.close()
+        cmd = ["claude", "-p", "--model", model, "--system-prompt-file", sp.name,
+               "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+               "--disallowedTools", *NO_TOOLS, "--effort", effort]
+        t0 = time.monotonic()
+        p = subprocess.run(cmd, input=material, capture_output=True, text=True,
+                           timeout=3600, cwd=str(BARE_CWD))
+        if p.returncode != 0:
+            raise RuntimeError(f"claude exited {p.returncode}: {p.stderr[-300:]}")
+        return p.stdout.strip(), time.monotonic() - t0
+    finally:
+        try:
+            os.unlink(sp.name)
+        except OSError:
+            pass
 
 
 def extract_json(s: str) -> list[dict]:
