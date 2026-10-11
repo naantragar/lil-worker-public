@@ -268,6 +268,60 @@ def mute(uid: int, cid: str) -> None:
     say(chat_id=uid, text=f"🔕 {cid} приглушено до {until}. Решта вузлів і далі шлють тривоги.")
 
 
+# --- login approval for the extension's settings sync (11.10.2026) ---------------------------
+# corpus-api (/api/v1/operator/hello) sends a card with «✅ Прийняти / ❌ Відхилити» to everyone in
+# UPSTREAM_ALERT_TG_CHAT when a NEW platform login shows up in the Commintify console. Only this process
+# may receive the press (it owns getUpdates), so it relays the decision to corpus-api over the local
+# port - corpus-api keeps every database write; this bot never touches Postgres.
+# Approvers = the monitoring audience (owner's decision: the owner and the second developer).
+# /decide answers only to requests WITHOUT X-Forwarded-For (i.e. not through nginx) and only to a
+# key with the `admin` scope, kept in monitor.env as UPSTREAM_OPERATOR_ADMIN_KEY.
+DECIDE_URL = "http://127.0.0.1:8300/api/v1/operator/decide"
+
+
+def admin_key() -> str:
+    for line in ENV.read_text(encoding="utf-8").splitlines():
+        if line.startswith("UPSTREAM_OPERATOR_ADMIN_KEY="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def login_decision(cq: dict, data: str) -> None:
+    uid = cq["from"]["id"]
+    who = " ".join(x for x in (cq["from"].get("first_name"), cq["from"].get("last_name")) if x) or str(uid)
+    try:
+        _, verb, handle = data.split(":", 2)
+        body = {"handle": int(handle), "decision": "approved" if verb == "ok" else "rejected",
+                "by": f"{uid} {who}"[:120]}
+    except ValueError:
+        return
+    req = urllib.request.Request(DECIDE_URL, data=json.dumps(body).encode("utf-8"), method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": "Bearer " + admin_key()})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            res = json.loads(r.read().decode("utf-8"))
+    except Exception as e:                                   # noqa: BLE001
+        print(f"  login decide FAILED: {str(e)[:200]}", file=sys.stderr, flush=True)
+        call("answerCallbackQuery", callback_query_id=cq["id"], text="Не вдалось - corpus-api не відповів",
+             show_alert=True)
+        return
+    mark = "✅ Прийнято" if res.get("status") == "approved" else "❌ Відхилено"
+    by = (res.get("decided_by") or "").split(" ", 1)[-1]
+    when = datetime.now().strftime("%d.%m %H:%M")
+    text = f"{mark}: <b>{html_escape(res.get('login', ''))}</b>\n{html_escape(by)}" + ("" if not res.get("changed") else f", {when}")
+    # Every copy of the card (both admins) loses its buttons - otherwise the second admin keeps a
+    # live button that silently does nothing.
+    for c in res.get("cards") or []:
+        call("editMessageText", chat_id=c["chat"], message_id=c["msg"], text=text, parse_mode="HTML")
+    print(f"  login {res.get('login')!r} -> {res.get('status')} by {uid} (changed={res.get('changed')})",
+          file=sys.stderr, flush=True)
+
+
+def html_escape(s: str) -> str:
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def menu(uid: int, note: str = "") -> None:
     rows = []
     for s in surveys():
@@ -372,6 +426,9 @@ def handle_callback(cq: dict) -> None:
             return
         if data.startswith("mute:"):
             mute(uid, data.split(":", 1)[1])
+            return
+        if data.startswith("lg:"):
+            login_decision(cq, data)
             return
     if uid != OWNER:
         print(f"  ЗБІЙ: id {uid} не може {data[:30]!r}", file=sys.stderr, flush=True)

@@ -122,6 +122,32 @@ def cmd_record(a: argparse.Namespace) -> None:
         "host": socket.gethostname(),
         **prov,
     })
+    _mirror_to_upstream_journal(a)
+
+
+# (11.10.2026) upstream's server is shared with the second developer, whose agents never see this private
+# ledger. Anything I record about upstream (deploys, restarts, notes on the server, the corpus, the
+# collector) is mirrored into the SHARED journal both sides read (upstream-system ops/journal, rule 1 of
+# upstream-system/AGENTS.md), so the two journals cannot drift into two separate stories.
+_UPSTREAM_MARKS = ("upstream", "/opt/corpus", "corpus-api", "commintify", "wa-monitor", "server")
+_UPSTREAM_JOURNAL = "/var/log/upstream/journal.jsonl"
+
+
+def _mirror_to_upstream_journal(a: argparse.Namespace) -> None:
+    try:
+        blob = f"{a.repo} {a.ref or ''} {a.summary or ''}".lower()
+        if not any(m in blob for m in _UPSTREAM_MARKS):
+            return
+        from zoneinfo import ZoneInfo
+        rec = {"ts": datetime.now(ZoneInfo("Europe/Kyiv")).isoformat(timespec="seconds"),
+               "user": os.environ.get("USER") or "root", "from": "local",
+               "agent": "krevetka/" + (os.environ.get("LIL_WORKER_INSTANCE") or "lil_worker"),
+               "cwd": os.getcwd(), "text": f"[{a.action}] {a.repo} {a.ref or ''} | {a.summary or ''}"}
+        os.makedirs(os.path.dirname(_UPSTREAM_JOURNAL), exist_ok=True)
+        with open(_UPSTREAM_JOURNAL, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass   # the private ledger already has it; the mirror must never break a record
 
 
 def cmd_record_commit(a: argparse.Namespace) -> None:

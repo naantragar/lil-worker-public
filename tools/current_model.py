@@ -59,6 +59,12 @@ def _global_effort() -> str:
     return e if e in VALID_EFFORTS else ""
 
 
+def _effort_from(path: Path) -> str:
+    """`effort` pinned beside the model in a model_config.json, "" if absent/invalid."""
+    e = str(_json(path).get("effort") or "").strip().lower()
+    return e if e in VALID_EFFORTS else ""
+
+
 def resolve() -> dict:
     """-> {door, who, model, effort}. `who` is the instance name or the room label."""
     room = os.environ.get("KREVETKA_ROOM", "").strip()
@@ -76,8 +82,13 @@ def resolve() -> dict:
 
     data_dir = os.environ.get("LIL_WORKER_DATA_DIR", "").strip()
     if data_dir:
-        model = _model_from(Path(data_dir) / "model_config.json") or env_model
-        effort = str(os.environ.get("LIL_WORKER_EFFORT") or "").strip().lower()
+        cfg_path = Path(data_dir) / "model_config.json"
+        model = _model_from(cfg_path) or env_model
+        # Same order krevetka.load_claude_effort() uses, so the trailer cannot disagree with the
+        # effort the turn actually ran at: config file -> LIL_WORKER_EFFORT -> global effortLevel.
+        effort = _effort_from(cfg_path)
+        if not effort:
+            effort = str(os.environ.get("LIL_WORKER_EFFORT") or "").strip().lower()
         if effort not in VALID_EFFORTS:
             effort = _global_effort()
         who = os.environ.get("LIL_WORKER_INSTANCE", "").strip() or "lil_worker"
@@ -89,7 +100,7 @@ def resolve() -> dict:
         "door": "shell",
         "who": "",
         "model": _model_from(GLOBAL_MODEL) or env_model or "unknown",
-        "effort": _global_effort(),
+        "effort": _effort_from(GLOBAL_MODEL) or _global_effort(),
     }
 
 

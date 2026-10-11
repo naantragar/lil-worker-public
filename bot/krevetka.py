@@ -211,6 +211,29 @@ def load_claude_model() -> str:
         return CLAUDE_MODEL
 
 
+def load_claude_effort() -> str:
+    """Reasoning effort for THIS turn, resolved per request like the model is.
+
+    Order: `effort` in model_config.json  ->  LIL_WORKER_EFFORT  ->  "" (global effortLevel).
+
+    Why the config file and not only the env var: `run.sh` deliberately SCRUBS
+    LIL_WORKER_EFFORT when starting the MAIN bot (to stop a restart invoked from a secondary
+    instance leaking its effort in), so the main instance had no way to pin an effort of its own
+    short of editing the global ~/.claude/settings.json — which would silently drag every other
+    unpinned instance along with it. Keeping effort beside the model also means a model switch and
+    its matching effort are ONE edit in ONE file and cannot drift apart: Opus 5.5 at an effort level
+    inherited from Opus 5 is a different (more expensive) machine than intended.
+    """
+    try:
+        effort = json.loads(CLAUDE_MODEL_CONFIG_FILE.read_text()).get("effort", "")
+        effort = str(effort).strip().lower()
+        if effort in _VALID_EFFORTS:
+            return effort
+    except Exception:
+        pass
+    return INSTANCE_EFFORT
+
+
 def load_codex_model() -> str:
     """Read Codex model per request to allow hot-switching without restart."""
     try:
@@ -1807,9 +1830,12 @@ async def run_claude_streaming(
     for _d in INSTANCE_ADD_DIRS:
         cmd.extend(["--add-dir", _d])
 
-    if INSTANCE_EFFORT:
-        # Per-instance reasoning depth (overrides the global effortLevel for this instance).
-        cmd.extend(["--effort", INSTANCE_EFFORT])
+    _effort = load_claude_effort()
+    if _effort:
+        # Reasoning depth for this turn (overrides the global effortLevel). Read per request from
+        # model_config.json, so it switches with the model and without a restart — see
+        # load_claude_effort() for why it is not the env var alone.
+        cmd.extend(["--effort", _effort])
 
     if session_id:
         cmd.extend(["--resume", session_id])

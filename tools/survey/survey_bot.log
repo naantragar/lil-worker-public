@@ -223,3 +223,6 @@ getUpdates: {"ok":false,"error_code":502,"description":"Bad Gateway"}
 бот: oongomanaganada_bot
 msg from 323182394: '/status'
 update 494732032: оброблено за 3.5s
+бот: oongomanaganada_bot
+btn from 395539341: 'lg:ok:2'
+  login 'TEST_krevetka' -> approved by 395539341 (changed=True)
