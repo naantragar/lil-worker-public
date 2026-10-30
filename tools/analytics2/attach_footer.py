@@ -148,6 +148,14 @@ def main() -> None:
     if not marker:
         raise SystemExit("у звіті немає рядка `---` - нема що замінювати")
     before, after = doc[:marker.start()], doc[marker.end():]
+    # The report ends with a few empty lines before `---`. When its last page is nearly full they
+    # spill over, and the section-break paragraph below lands ALONE on a fresh page — a blank sheet
+    # between the report and the footer (РЕР_20.10.2026, page 12). The section break already starts
+    # the footer on a new page, so those spacer lines carry nothing; they go.
+    empty_p = re.compile(r'<w:p>(?:(?!</w:p>)(?!<w:t[ >])(?!<w:tbl)(?!<w:drawing).)*</w:p>\s*$', re.S)
+    while (m := empty_p.search(before)):
+        before = before[:m.start()]
+    marker_and_spacers = doc[len(before):marker.end()]
 
     # Two sections. Everything up to here keeps the report's own page (portrait A4) by carrying its
     # sectPr on a paragraph of its own; the footer then gets the page it was cut from — landscape,
@@ -165,7 +173,7 @@ def main() -> None:
 
     # The report itself must come through untouched: everything except the marker paragraph.
     kept = _body(doc).replace(frag, "").replace(keep, "")
-    if kept != body_before.replace(marker.group(0), ""):
+    if kept != body_before.replace(marker_and_spacers, ""):
         raise SystemExit("тіло звіту змінилося - зупиняюсь")
 
     parts["word/document.xml"] = doc.encode()

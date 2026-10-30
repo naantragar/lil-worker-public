@@ -1,0 +1,14 @@
+[
+  {
+    "id": "cve-2026-98432",
+    "title": "Уязвимость ядра CVE-2026-98432",
+    "cve": "CVE-2026-98432",
+    "summary": "use-after-free in the IPv4 TCP SYN path when the SYN carries IP options; network-reachable, Ubuntu priority high",
+    "package": "linux",
+    "release": "noble",
+    "meta": "linux-image-virtual",
+    "fixed": "6.8.0-149",
+    "stopgap_unit": "ipv4-options-drop.service",
+    "stopgap_note": "nft rule drops inbound IPv4 TCP with IP options (upstream-system ops/server, ipv4-options-drop.service); remove with: systemctl disable --now ipv4-options-drop.service"
+  }
+]

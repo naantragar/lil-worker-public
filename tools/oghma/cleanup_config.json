@@ -1,0 +1,9 @@
+{
+  "_readme": [
+    "The off switch for the report's third pass (tools/upstream/report_cleanup.py).",
+    "enabled=false -> the pass does nothing and says so, and the report cycle is exactly what it",
+    "was before the pass existed: run.py -> my A/B check -> report_audit.py -> my fixes.",
+    "Nothing else depends on this file. Flip it back to true to get the pass again; no restart."
+  ],
+  "enabled": true
+}

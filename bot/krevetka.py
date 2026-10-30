@@ -26,6 +26,7 @@ import threading
 import subprocess
 import time
 import tomllib
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -232,6 +233,137 @@ def load_claude_effort() -> str:
     except Exception:
         pass
     return INSTANCE_EFFORT
+
+
+# ── Billing switch: subscription login <-> API key (2026-10-14) ────────────────────────────────
+# Max 20x carries $200/month of API credits, and `claude -p` run with a key from the linked Console
+# org is billed against them instead of the weekly subscription limit. The CLI picks
+# ANTHROPIC_API_KEY over the subscription login whenever it is set, so the whole switch is: put the
+# key into the child's env, or make sure it is NOT there.
+#
+# Read per request, like model_config.json: switching is instant and needs no restart. Per
+# instance (DATA_DIR), so the main bot and `game` switch independently. Default and every failure
+# path is "subscription" — a broken switch must degrade to the way things always worked.
+# The key lives outside the repo (secrets dir, 600) and is never logged.
+AUTH_CONFIG_FILE = DATA_DIR / "auth_config.json"
+API_KEY_FILE = Path(os.environ.get("KREVETKA_API_KEY_FILE",
+                                   "/root/.krevetka-secrets/anthropic_api_key"))
+COST_LOG_FILE = DATA_DIR / "cost_log.jsonl"
+COST_STATE_FILE = DATA_DIR / "cost_state.json"   # session id -> last seen running total
+AUTH_SUB, AUTH_API = "subscription", "api"
+
+# Phrases that mean "the KEY was refused", not "the task failed". Only these trigger the automatic
+# retry on the subscription, so an ordinary error is never silently paid twice.
+_AUTH_FAILURE_MARKERS = (
+    "credit balance", "insufficient", "invalid x-api-key", "invalid api key",
+    "authentication_error", "permission_error", "not scoped to a workspace",
+    "api error: 401", "api error: 403", "api error: 402",
+)
+
+
+def load_api_key() -> str:
+    try:
+        return API_KEY_FILE.read_text().strip()
+    except Exception:
+        return ""
+
+
+def load_auth_mode() -> str:
+    """Configured mode; "api" only if a key actually exists, otherwise the subscription."""
+    try:
+        mode = str(json.loads(AUTH_CONFIG_FILE.read_text()).get("mode", AUTH_SUB)).strip().lower()
+    except Exception:
+        return AUTH_SUB
+    if mode == AUTH_API and load_api_key():
+        return AUTH_API
+    return AUTH_SUB
+
+
+def save_auth_mode(mode: str) -> None:
+    tmp = AUTH_CONFIG_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"mode": mode}) + "\n")
+    tmp.replace(AUTH_CONFIG_FILE)
+
+
+def apply_auth_env(env: dict, mode: str) -> str:
+    """Set the child env for `mode`; returns the mode actually applied."""
+    # Never inherit a key from the bot's own environment: the switch, not the shell, decides.
+    env.pop("ANTHROPIC_API_KEY", None)
+    if mode == AUTH_API:
+        key = load_api_key()
+        if key:
+            env["ANTHROPIC_API_KEY"] = key
+            return AUTH_API
+    return AUTH_SUB
+
+
+def looks_like_auth_failure(text: str) -> bool:
+    low = (text or "").lower()
+    return any(m in low for m in _AUTH_FAILURE_MARKERS)
+
+
+def record_turn_cost(mode: str, model: str, cost, session_id: str | None = None) -> None:
+    """One line per turn, holding the cost OF THAT TURN.
+
+    `total_cost_usd` in the CLI's result event is the RUNNING TOTAL OF THE WHOLE SESSION, not the
+    price of this turn — and since every turn resumes the same session, it only ever grows. The
+    first version of this function logged that number raw and the summary added the totals to each
+    other, so three turns of a long session reported $906 (2026-10-14). Keep the per-session
+    high-water mark and store the DELTA; the raw total goes in beside it so a wrong delta can
+    always be recomputed from the log."""
+    try:
+        total = float(cost or 0)
+    except (TypeError, ValueError):
+        return
+    key = session_id or "_"
+    try:
+        state = json.loads(COST_STATE_FILE.read_text())
+    except Exception:
+        state = {}
+    prev = float(state.get(key) or 0.0)
+    # A total below the mark means a different session behind the same key (or a reset): the whole
+    # total is this turn's, not a negative delta.
+    delta = total - prev if total >= prev else total
+    state[key] = total
+    try:
+        tmp = COST_STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state))
+        tmp.replace(COST_STATE_FILE)
+    except Exception:
+        logger.warning("could not write cost state", exc_info=True)
+    try:
+        with COST_LOG_FILE.open("a") as f:
+            f.write(json.dumps({"ts": datetime.now().isoformat(timespec="seconds"),
+                                "mode": mode, "model": model, "usd": round(delta, 6),
+                                "session_total": round(total, 6)}) + "\n")
+    except Exception:
+        logger.warning("could not write cost log", exc_info=True)
+
+
+def cost_summary(mode: str = AUTH_API) -> tuple[float, int, float, int]:
+    """(usd today, turns today, usd this month, turns this month) for `mode`."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    month = today[:7]
+    d_usd = m_usd = 0.0
+    d_n = m_n = 0
+    try:
+        for line in COST_LOG_FILE.read_text().splitlines():
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if r.get("mode") != mode:
+                continue
+            ts = str(r.get("ts", ""))
+            if ts.startswith(month):
+                m_usd += float(r.get("usd") or 0)
+                m_n += 1
+                if ts.startswith(today):
+                    d_usd += float(r.get("usd") or 0)
+                    d_n += 1
+    except FileNotFoundError:
+        pass
+    return d_usd, d_n, m_usd, m_n
 
 
 def load_codex_model() -> str:
@@ -1737,6 +1869,7 @@ async def run_claude_streaming(
     _is_retry: bool = False,
     lang: str = "Russian",
     user_id: int | None = None,
+    _force_subscription: bool = False,
 ) -> tuple[str, str | None, list[str]]:
     """
     Run Claude CLI with --output-format stream-json.
@@ -1762,8 +1895,12 @@ async def run_claude_streaming(
     for _leak in ("KREVETKA_INLINE_BASH", "KREVETKA_JOB_ID"):
         env.pop(_leak, None)
 
+    _auth_mode = apply_auth_env(env, AUTH_SUB if _force_subscription else load_auth_mode())
+    _turn_cost = None
+    is_error = False
+
     _current_model = load_claude_model()
-    logger.info(f"Model config: {_current_model}")
+    logger.info(f"Model config: {_current_model}, auth={_auth_mode}")
 
     use_stream_input = bool(files)
 
@@ -1939,6 +2076,8 @@ async def run_claude_streaming(
         _POLL_INTERVAL = 30        # check process every 30s
         _hb_last = 0.0
         _cpu_last = None           # (timestamp, cpu ticks) of the previous liveness poll
+        _last_line_t = [time.monotonic()]   # last line the CLI printed — set in the read loop
+        _LINE_FRESH = 600          # a CLI line within 10 min = alive (subagent waits print nothing)
 
         def _tree_cpu() -> int:
             """CPU ticks burned by the claude process AND everything it spawned.
@@ -1982,6 +2121,11 @@ async def run_claude_streaming(
             longer, never kill a working one.
             """
             nonlocal _cpu_last
+            # The CLI printed something recently: alive, whatever the CPU says. On 16.10.2026
+            # `game` printed tool notes at 22:17 and was killed at 22:22 as «silent» — it was
+            # waiting on a subagent, which burns network time, not CPU.
+            if time.monotonic() - _last_line_t[0] < _LINE_FRESH:
+                return True
             cpu = _tree_cpu()
             if cpu < 0:
                 return True
@@ -1992,8 +2136,13 @@ async def run_claude_streaming(
             sid = new_session_id or session_id
             if sid:
                 try:
-                    for tr in (Path.home() / ".claude" / "projects").glob(f"*/{sid}.jsonl"):
-                        if time.time() - tr.stat().st_mtime < _WF_LIVENESS_WINDOW:
+                    base = Path.home() / ".claude" / "projects"
+                    # the main transcript AND everything under <sid>/ (subagent transcripts,
+                    # workflow journals) — a subagent working is the turn working
+                    paths = list(base.glob(f"*/{sid}.jsonl")) + list(base.glob(f"*/{sid}/**/*.jsonl"))
+                    now = time.time()
+                    for tr in paths:
+                        if now - tr.stat().st_mtime < _LINE_FRESH:
                             return True
                 except Exception:                       # noqa: BLE001
                     return True
@@ -2031,16 +2180,21 @@ async def run_claude_streaming(
                     )
                     break
                 elapsed = time.monotonic() - _stream_start
-                _busy()          # sampled every poll, so the CPU delta is against 30s ago
+                # ONE sample per poll, so the CPU delta is always against 30 s ago. It used to be
+                # called twice here — the second call compared CPU against a sample taken a
+                # millisecond earlier, so past the cap the CPU signal was always «no growth».
+                busy_now = _busy()
                 if elapsed > _SILENCE_CAP:
-                    alive = _wf_alive() or _busy()
+                    alive = _wf_alive() or busy_now
                     if alive and elapsed < _HARD_CEILING:
                         # a swarm, a build, a test run — something is actually working. Extend.
                         if time.monotonic() - _hb_last > 120:
                             _hb_last = time.monotonic()
                             logger.info(f"Claude silent {int(elapsed)}s but the process tree is working — extending (hard cap {_HARD_CEILING}s)")
                         continue
-                    reason = (f"⏱ Timeout: Claude молчал {_SILENCE_CAP // 60} мин без единого признака работы."
+                    reason = (f"⏱ Timeout: ход идёт больше {_SILENCE_CAP // 60} мин, а последние "
+                              f"{_LINE_FRESH // 60} мин не было ни строки от Claude, ни нагрузки, "
+                              f"ни записи в сессию."
                               if elapsed < _HARD_CEILING
                               else f"⏱ Timeout: жёсткий потолок {_HARD_CEILING // 3600}ч исчерпан.")
                     logger.error(f"Claude killed at {int(elapsed)}s (wf_alive={alive})")
@@ -2063,6 +2217,15 @@ async def run_claude_streaming(
             except json.JSONDecodeError:
                 logger.debug(f"Non-JSON line: {line[:80]}")
                 continue
+
+            # Liveness + session, taken from EVERY event, not only the final one (16.10.2026).
+            # A line from the CLI is proof the turn is alive; and the session id is known from the
+            # first `system/init` event. Before this, a fresh session (right after /new) had no id
+            # until the `result` event, so the transcript check could never fire AND a turn killed
+            # mid-way was never saved — `game` lost an hour of context that way.
+            _last_line_t[0] = time.monotonic()
+            if not new_session_id and event.get("session_id"):
+                new_session_id = event.get("session_id")
 
             etype = event.get("type")
 
@@ -2116,10 +2279,13 @@ async def run_claude_streaming(
                 final_result = event.get("result", "")
                 new_session_id = event.get("session_id")
                 is_error = event.get("is_error", False)
+                _turn_cost = event.get("total_cost_usd")
                 logger.info(
                     f"Stream result: {len(final_result)} chars, "
-                    f"session={new_session_id}, error={is_error}"
+                    f"session={new_session_id}, error={is_error}, "
+                    f"auth={_auth_mode}, cost_usd={_turn_cost}"
                 )
+                record_turn_cost(_auth_mode, _current_model, _turn_cost, new_session_id)
 
         await proc.wait()
         stderr_data = await proc.stderr.read()
@@ -2151,11 +2317,28 @@ async def run_claude_streaming(
         except asyncio.CancelledError:
             pass
 
+    # The KEY was refused (no credits, revoked, wrong scope): answer this turn on the subscription
+    # instead of leaving the owner with an error. Once per turn; the switch itself is not touched —
+    # he decides with /auth whether to stay on the key.
+    if _auth_mode == AUTH_API and is_error and looks_like_auth_failure(final_result):
+        logger.warning(f"API key refused ({final_result[:200]!r}) → retrying on subscription")
+        try:
+            await reply_msg.answer(
+                "⚠️ API-ключ не сработал, отвечаю по подписке. Подробности: /auth"
+            )
+        except Exception:
+            pass
+        return await run_claude_streaming(
+            prompt, session_id, reply_msg, bot, files,
+            _is_retry=_is_retry, lang=lang, user_id=user_id, _force_subscription=True,
+        )
+
     # If we got nothing and had a session — retry fresh (stale session)
     if not final_result and session_id and not _is_retry:
         logger.warning("Empty result with session → retrying without session")
         return await run_claude_streaming(
-            prompt, None, reply_msg, bot, files, _is_retry=True
+            prompt, None, reply_msg, bot, files, _is_retry=True,
+            _force_subscription=_force_subscription,
         )
 
     return final_result or "Не получил ответ от модели. Попробуй ещё раз.", new_session_id, streamed_files
@@ -2509,6 +2692,42 @@ async def cmd_provider(message: Message):
 
     set_active_provider(user_id, requested)
     await message.answer(f"✅ Provider switched to: <code>{requested}</code>", parse_mode="HTML")
+
+
+@router.message(Command("auth"))
+async def cmd_auth(message: Message):
+    """Billing switch, handled HERE and not by Claude: it must work even when every Claude call
+    is failing — that is exactly when it is needed. Takes effect on the next message, no restart."""
+    if not is_allowed(message.from_user.id):
+        return
+    parts = (message.text or "").strip().split(maxsplit=1)
+    arg = parts[1].strip().lower() if len(parts) > 1 else ""
+
+    if arg in ("api", "key", "ключ"):
+        if not load_api_key():
+            await message.answer(f"❌ Ключа нет в {API_KEY_FILE}. Остаюсь на подписке.")
+            return
+        save_auth_mode(AUTH_API)
+        await message.answer("✅ Со следующего сообщения работаю на API-ключе (кредиты).")
+        return
+    if arg in ("sub", "subscription", "подписка"):
+        save_auth_mode(AUTH_SUB)
+        await message.answer("✅ Со следующего сообщения работаю на подписке.")
+        return
+    if arg:
+        await message.answer("Использование: /auth · /auth api · /auth sub")
+        return
+
+    mode = load_auth_mode()
+    d_usd, d_n, m_usd, m_n = cost_summary(AUTH_API)
+    label = "API-ключ (кредиты)" if mode == AUTH_API else "подписка"
+    await message.answer(
+        f"🔑 Сейчас: {label}\n"
+        f"Ключ в файле: {'есть' if load_api_key() else 'нет'}\n"
+        f"На ключе сегодня: ${d_usd:.2f} за {d_n} ход(ов)\n"
+        f"На ключе за месяц: ${m_usd:.2f} за {m_n} ход(ов)\n"
+        f"Переключить: /auth api · /auth sub"
+    )
 
 
 
@@ -3053,9 +3272,19 @@ async def handle_message(message: Message, bot: Bot):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def _job_read(p: Path) -> str:
+    """Read a job artefact. NEVER raises: a job's output is arbitrary bytes produced by an
+    arbitrary command, and a report must not be lost because of how that command happened to cut
+    its own output.
+
+    `errors="replace"` and the broad except are both load-bearing (2026-10-14). Three `game`
+    reports sat undelivered from 08.10 and 11.10, retried every 20 s forever, because their
+    result.txt was truncated mid-Cyrillic-character (a two-byte letter split by a byte-counting
+    cut). Strict decoding raised UnicodeDecodeError, which is a ValueError — NOT an OSError — so
+    the old handler let it through, the notify loop caught it as a failed send, and the job was
+    never marked delivered. A damaged byte is worth one "?" in the text, never a lost report."""
     try:
-        return p.read_text().strip()
-    except OSError:
+        return p.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception:
         return ""
 
 

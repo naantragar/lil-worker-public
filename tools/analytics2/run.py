@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Intercept analytics v2 — a window of intercepts → the daily report, in one pass.
 
-    python3 tools/analytics2/run.py --from '2026-08-23 15:00' --to '2026-08-24 15:00' \
+    python3 tools/analytics2/run.py --from '2026-08-23 14:30' --to '2026-08-24 14:30' \
         --band 'ЗАЛІЗНИЧНЕ-ЗАГІРНЕ' --out ZVIT_24.08
 
 Deliberately a clean rewrite; v1 lives on in tools/analytics_*.py and its rules are archived under
@@ -61,20 +61,21 @@ MARGIN_HOURS = 6          # how far past the window to look for late POSTINGS
 # outside the next window's lead-in, i.e. lost from every report: 30 min → 6 of 12 798; 60 min → 0;
 # 120 min → 0. An hour closes the hole completely, so there is no reason to pay for two.
 WINDOW_LEAD_IN_MIN = 60
-# "A report FOR the 20th" is the 24 hours ending on the 20th. TWO different hours live here and
-# they are deliberately not the same number (owner's decision, 09.10.2026):
+# "A report FOR the 20th" is the 24 hours ending on the 20th. Two constants, and since 16.10.2026
+# they are the SAME hour again — the owner's decision: the report is now made on 14:30, and the
+# paper says the hour it was actually made for.
 #
-#   WINDOW_CUT   — where the 24 hours actually start and end. Moved 15:00 → 14:45 so the run can
-#                  begin before the analysts' own cut instead of racing it.
-#   REPORT_STAMP — what the document SAYS on its third line. Stays 15:00, because that is the hour
-#                  the recipients read the situation as being reported at.
+#   WINDOW_CUT   — where the 24 hours actually start and end.
+#   REPORT_STAMP — what the document SAYS on its third line.
 #
-# So the real window is 14:45 → 14:45 and the paper says «на 15:00». This is not a bug and must not
-# be "fixed" by making them equal: the owner asked for exactly this, and asked that it be written
-# down loudly so neither of us later reads one as the other. The fifteen minutes between them are
-# covered anyway — WINDOW_LEAD_IN_MIN reads an hour before the window starts.
-WINDOW_CUT = "14:45"
-REPORT_STAMP = "15:00"
+# History, because it explains why these are two names and not one: from 09.10 to 16.10 they were
+# deliberately different — the window had been moved back to 14:45 so the run could begin before the
+# analysts' own cut instead of racing it, while the paper kept saying «на 15:00», the hour the
+# recipients read the situation as being reported at. That split is over, but the two constants stay
+# separate so the same thing can be done again without touching anything else. **If they ever differ
+# again, the run's first line is what tells them apart — it prints both, every time.**
+WINDOW_CUT = "14:30"
+REPORT_STAMP = "14:30"
 DEFAULT_BAND = "ЗАЛІЗНИЧНЕ-ЗАГІРНЕ"
 MAX_CHUNK_CHARS = 16000   # estimated body; renders to ~19k, the size band with the best yield
 OVERLAP = 3               # intercepts repeated across a seam so a straddling event stays whole
@@ -2405,7 +2406,8 @@ def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
     styled: list[tuple[str, bool, bool]] = [("Про результати аналізу радіоперехоплень", False, True)]
     if band:
         styled.append((f"у смузі {band}", False, True))
-    # The PRINTED hour is REPORT_STAMP (15:00), not the real window end (14:45) - see the constants.
+    # The PRINTED hour is REPORT_STAMP; equal to the window end since 16.10.2026, but they are
+    # still two constants and the run's first line prints both - see them at the top.
     styled += [(f"на {REPORT_STAMP} {datetime.strptime(dt_to, '%Y-%m-%d %H:%M'):%d.%m.%Y}",
                 False, True), ("", False, False)]
 
@@ -2547,16 +2549,16 @@ def snapshot() -> str:
 def main() -> None:
     ap = argparse.ArgumentParser()
     # `--day 2026-08-20` IS the normal way to call this. "Звіт на 20 серпня" means one fixed thing —
-    # 19.08 15:00 → 20.08 15:00 — and computing that by hand every time is an invitation to get the
+    # 19.08 14:30 → 20.08 14:30 — and computing that by hand every time is an invitation to get the
     # window, the stamp or the filename out of step with each other. Given the day, all three are
     # derived from one number and cannot disagree.
     ap.add_argument("--day", help="report day, YYYY-MM-DD or DD.MM.YYYY: window is the 24 h ending "
-                                  "at 15:00 of that day")
+                                  "at 14:30 of that day")
     ap.add_argument("--from", dest="dt_from")
     ap.add_argument("--to", dest="dt_to")
     ap.add_argument("--band", default=DEFAULT_BAND)
     ap.add_argument("--out")
-    ap.add_argument("--model", default="claude-sonnet-5")
+    ap.add_argument("--model", default="claude-opus-5-5")
     ap.add_argument("--effort", default="medium")
     # One pass is the standard. Multi-pass union was inherited from v1, where a single call read a
     # 40–80 KB thread and skimmed it, so passes disagreed and adding them up recovered real material
@@ -2583,7 +2585,7 @@ def main() -> None:
     ap.add_argument("--render-only", action="store_true",
                     help="rebuild the files from an existing <out>_events.json, no model calls")
     # The collector lags 25-30 minutes behind the group, so the last half hour of a window closing at
-    # 15:00 has usually not arrived when the report is made. The answer is not a gate that asks
+    # 14:30 has usually not arrived when the report is made. The answer is not a gate that asks
     # whether to proceed — it is to start the window half an hour EARLIER than it says. What the
     # previous report missed off its end, this one picks up off its start. Nothing is lost, the price
     # is that consecutive reports can repeat an event from that overlap, and that is the cheaper

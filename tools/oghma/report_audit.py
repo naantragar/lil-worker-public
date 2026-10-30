@@ -18,7 +18,7 @@ day. That is what makes a second pass cheap enough to be routine.
 **It only reports. It never edits the report.** A second opinion that can edit is a second source of
 invention; the verdicts come back to me and I decide.
 
-    python3 tools/upstream/report_audit.py 05.10 [--events <path>] [--model claude-sonnet-5]
+    python3 tools/upstream/report_audit.py 05.10 [--events <path>] [--model claude-opus-5-5]
                                               [--workers 6] [--limit N] [--flagged]
 
 Writes `AUDIT_<day>.md` next to the report. Stdlib only.
@@ -83,7 +83,7 @@ def speech_block(src: dict, refs: list) -> str:
 def ask(model: str, prompt: str) -> str:
     env = {k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")}
     try:
-        p = subprocess.run(["claude", "-p", "--model", model, prompt],
+        p = subprocess.run(["claude", "-p", "--model", model, "--effort", "medium", prompt],
                            capture_output=True, text=True, timeout=180, env=env)
         return (p.stdout or p.stderr or "").strip()
     except subprocess.TimeoutExpired:
@@ -99,7 +99,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="second model pass over a built report")
     ap.add_argument("day")
     ap.add_argument("--events")
-    ap.add_argument("--model", default="claude-opus-5")
+    ap.add_argument("--model", default="claude-opus-5-5")
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--limit", type=int, default=0, help="audit only the first N lines (testing)")
     ap.add_argument("--flagged", action="store_true",

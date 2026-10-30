@@ -93,8 +93,10 @@ def main() -> None:
     ap.add_argument("run")
     ap.add_argument("--instance", default="helper")
     ap.add_argument("--level", default="red", choices=["red", "yellow", "log", "all"])
-    ap.add_argument("--source", default="all", choices=["ours", "patagonia", "all"],
-                    help="ours = Invisible Hand + AllInARow; patagonia = решта")
+    ap.add_argument("--source", default="all",
+                    choices=["ours", "patagonia", "all", "invisible_hand"],
+                    help="ours = Invisible Hand + AllInARow; patagonia = решта; "
+                         "invisible_hand = ЛИШЕ Invisible Hand (для денного звіту 15:00)")
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--state", default="",
                     help="sqlite зі вже надісланими id; з ним повтори не йдуть")
@@ -107,10 +109,18 @@ def main() -> None:
     # РОЗВЕДЕННЯ ЗА ДЖЕРЕЛОМ. Наш ефір і Патагонія йдуть у РІЗНІ боти, бо увага до них різна:
     # червоне наше - у червоний, жовте наше - у жовтий, червоне з Патагонії - у сірий, а жовте
     # з Патагонії не доставляється взагалі (модель його все одно оцінює й пише в прогін).
-    if a.source != "all":
+    if a.source == "invisible_hand":
+        # Денний звіт 15:00 (власник, 15.10.2026): у червоний бот іде ТІЛЬКИ Invisible Hand,
+        # не AllInARow і не Патагонія. Точна назва джерела в прогоні - «Invisible Hand».
+        alerts = [x for x in alerts if str(x.get("src") or "") == "Invisible Hand"]
+    elif a.source != "all":
         want_ours = a.source == "ours"
         alerts = [x for x in alerts if (str(x.get("src") or "") in OURS) == want_ours]
-    alerts.sort(key=lambda x: x.get("hhmmss", ""))
+    # CHRONOLOGY by the full publication instant (ms), not by «HH:MM:SS»: a daily window spans two
+    # calendar days, and sorting the bare clock put yesterday's 19:05 after today's 09:00 (owner,
+    # 16.10.2026). Publication time is on every row and in one format; the air time inside the text
+    # is free-form or missing, so it would sort worse. Old run files without `ts` fall back to clock.
+    alerts.sort(key=lambda x: (x.get("ts") or 0, x.get("hhmmss", "")))
     if not alerts:
         print("нема чого слати")
         return
@@ -177,8 +187,9 @@ def main() -> None:
         src_line = SRC_NAME.get(src, src or "джерело невідоме")
         if x.get("escalated"):
             src_line += f" · у червоний за {x['escalated']}"
+        day = time.strftime("%d.%m", time.localtime(x["ts"] / 1000)) + " " if x.get("ts") else ""
         head = (f"{mark} <b>{html.escape(CLASS_RU.get(x.get('class'), str(x.get('class'))))}</b> · "
-                f"{html.escape(str(x.get('hhmmss')))} · {html.escape(str(x.get('freq')))}\n"
+                f"{day}{html.escape(str(x.get('hhmmss')))} · {html.escape(str(x.get('freq')))}\n"
                 f"<b>{html.escape(src_line)}</b>\n"
                 f"{html.escape(str(x.get('why') or ''))}")
         msg = (head + "\n\n<pre><code class=\"language-plaintext\">"

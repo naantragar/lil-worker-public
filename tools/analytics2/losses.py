@@ -58,8 +58,19 @@ NAME_RE = re.compile(
     # the capture used to stop at РОВ, so the real callsign was swallowed and the casualty counted as
     # nameless. The optional group steps over it, and backtracks when nothing follows (`в\с РОВ (300)`
     # is still a man with no callsign).
-    r"(?:в[\\/]с|о[\\/]с|гр|пораненого|трьохсотим|двохсотим|союзник\w*)\s+(?:(?:РОВ|СОУ)\s+)?(?:\(ім\s+)?((?:[А-ЯЁЇІЄ][А-ЯЁЇІЄ0-9'’-]{2,})(?:\s*,\s*[А-ЯЁЇІЄ][А-ЯЁЇІЄ0-9'’-]{2,})*)"
+    #
+    # `позивний` is in the prefix list because the air often names a man that way and the report
+    # copies it: `поранений о\с з «п'ятдесят сьомої», позивний МОРЯК - доповів в\с МАЛОЙ`. Without
+    # it МОРЯК was not a candidate at all, the only name left in the line was МАЛОЙ — the man who
+    # radioed it in — and he was counted as the casualty (13.10.2026).
+    r"(?:в[\\/]с|о[\\/]с|гр|пораненого|трьохсотим|двохсотим|союзник\w*|позивний)\s+(?:(?:РОВ|СОУ)\s+)?(?:\(ім\s+)?((?:[А-ЯЁЇІЄ][А-ЯЁЇІЄ0-9'’-]{2,})(?:\s*,\s*[А-ЯЁЇІЄ][А-ЯЁЇІЄ0-9'’-]{2,})*)"
     r"|(?:^|[;,]\s*)([А-ЯЁЇІЄ][А-ЯЁЇІЄ0-9'’-]{2,})(?=\s*(?:\([^)]*\))?\s*[-—–]\s*(?:ім\s*)?\b[23]00\b)")
+
+# One place for "the report itself says this casualty is unidentified". Used twice below: to kill the
+# lone-candidate rule for the whole line, and to block the distance match for a single marker.
+DISCLAIM_RE = re.compile(
+    r"приналежність\s+(?:не\s+встановлен|н\\в)|позивн\w*\s+не\s+встановлен|особа\s+не\s+встановлен",
+    re.I)
 
 DRONE_SOU_RE = re.compile(r"(?:бпла|фпв|борт|дрон|вампір|бабка|баба\s*яга|ждун|мавік|мавик)\s*[^,;]{0,18}соу", re.I)
 ALLY_RE = re.compile(r"союзник", re.I)
@@ -132,6 +143,7 @@ def collect(events: list[dict]) -> dict:
 
         found: list[tuple[str, int, str]] = []        # (name, pos, state)
         seen_spans: set[tuple[int, int]] = set()
+        disclaimed = False
 
         def add_unnamed(state: str, at: int) -> None:
             """A casualty nobody named. One per distinct state and time, with a body multiplier."""
@@ -156,10 +168,44 @@ def collect(events: list[dict]) -> dict:
                  if any(p.strip() not in NOT_A_CALLSIGN
                         for p in re.split(r"\s*,\s*", nm.group(1) or nm.group(2) or ""))]
         lone = cands[0] if len(cands) == 1 else None
+        # ... EXCEPT when the line itself says the casualty is unidentified. On 11.10.2026
+        # `переміщення в\с СТАРЕЦ через перехрестя ... тіло поруч з вантажівкою (200, приналежність
+        # н\в)` made СТАРЕЦ a dead man: he is the only callsign in the sentence, so the lone rule
+        # handed him a corpse he was merely walking past. A living man passing a body is an everyday
+        # shape here, and no wording of the line can fix it - the fix belongs where the ambiguity is
+        # resolved, and the report already resolves it in words. When it says the ownership or the
+        # callsign is NOT established, that statement outranks any name standing in the same line.
+        if DISCLAIM_RE.search(text):
+            lone = None
 
         for mk in MARKER_RE.finditer(text):
             state = "200" if re.match(r"200|двохсот|загиб|тіло|вбит", mk.group(0), re.I) else "300"
             best = None
+            # The disclaimer has to outrank DISTANCE too, not only the lone-candidate rule. Killing
+            # `lone` alone left the commonest shape of all still broken: a living man standing beside
+            # the code and inside NEAR of it wins on distance and takes the casualty. In four days it
+            # made БАРНАУЛ, who handed a body over for removal, into the body; ГРАНИТ, who was
+            # ordered to prepare one, into the dead man; and ВАЛУН, who was asked to carry a wounded
+            # man out, into the wounded. Each time the report already said in words that the casualty
+            # was unidentified, and each time I worked around it by reshuffling the sentence.
+            #
+            # Scoped to THIS marker, not the line: `200 (приналежність н\в) та 300 в\с ІВАН` must
+            # still name Іван. The disclaimer counts when it sits with the code - same bracket or
+            # just after it - which is where the report actually puts it.
+            if DISCLAIM_RE.search(text[mk.start(): mk.start() + 48]):
+                disclaimed = True
+                if found:
+                    continue
+                add_unnamed(state, mk.start())
+                continue
+
+            # A line that already disclaimed one casualty usually RESTATES it later in bare words —
+            # `2 300 (позивні не встановлені) у в\с ШОУ; … - поранені лишаються на позиції`. That
+            # trailing «поранені» is the same two men, but it sits near a living bystander and handed
+            # ВАЛУН, the man asked to carry one of them out, a wound of his own. After a disclaimer,
+            # a later marker may only be named by a callsign standing right on it, which is what a
+            # genuinely separate casualty looks like (`тіло (200, н\в) поруч; 300 в\с ІВАН`).
+            tight = 12 if disclaimed else NEAR
             # Deliberately ALL matches compete, abbreviations included. An `о\с РОВ` standing next
             # to the digits means "a casualty with no callsign" and must BLOCK the marker — letting
             # only real names compete was tried on 08.10.2026 and immediately mis-fired the other
@@ -168,7 +214,7 @@ def collect(events: list[dict]) -> dict:
             # LINE (write the callsign beside the number), never here.
             for nm in NAME_RE.finditer(text):
                 pos = nm.start(1) if nm.group(1) is not None else nm.start(2)
-                if abs(pos - mk.start()) > NEAR:
+                if abs(pos - mk.start()) > tight:
                     continue
                 before = text[max(0, nm.start() - 22): nm.start()].lower()
                 if NOT_SUBJECT_RE.search(before):

@@ -120,6 +120,9 @@ def norm(s: str) -> str:
     return re.sub(r"[^а-яіїєґa-z0-9]+", "", s.lower())
 
 
+OURS_SRC = {"Invisible Hand", "AllInARow", "All in a Row"}  # те саме, що OURS у push_tg.py
+
+
 def load_day(day: str, hours: int = 0, minutes: int = 0) -> list[dict]:
     """A calendar day, or — with `hours` — the last N hours ending now. The alerting system runs on
     fresh traffic, so the rolling window is the real shape; the calendar day exists for the
@@ -355,12 +358,19 @@ def main() -> None:
                     help="sqlite стану: читати лише вікна з непрочитаним")
     ap.add_argument("--doctrine", default="v7", help="версія правил: v1 | v2 | v3")
     ap.add_argument("--tag", default="")
+    ap.add_argument("--src", default="all", choices=["all", "ours"],
+                    help="ours = читати ЛИШЕ Invisible Hand + AllInARow, Патагонію не читати")
     a = ap.parse_args()
 
     if not a.day and not a.hours and not a.minutes:
         sys.exit("потрібен --day, --hours або --minutes")
     label = a.day or (f"last{a.hours}h" if a.hours else f"last{a.minutes}m")
     rows = load_day(a.day, a.hours, a.minutes)
+    if a.src == "ours":
+        # Денний звіт (15.10.2026) доставляє лише наш напрямок, а Патагонія - це ~2/3 усього
+        # ефіру за добу (1504 з 2360). Читати її моделлю заради звіту, куди вона не потрапляє, -
+        # чиста витрата підписки. Відсіюємо ДО вікон, щоб її не було навіть у контексті.
+        rows = [r for r in rows if r["src"] in OURS_SRC]
     kept, dropped = dedup(rows)
     wins = windows(kept, a.size, a.overlap)
     skipped = 0
@@ -418,7 +428,7 @@ def main() -> None:
     for mid, al in best.items():
         r = by_id.get(mid)
         if r:
-            al["hhmmss"], al["freq"], al["src"] = r["hhmmss"], r["freq"], r["src"]
+            al["hhmmss"], al["freq"], al["src"], al["ts"] = r["hhmmss"], r["freq"], r["src"], r["ts"]
             # ЗНАК ОПЕРАТОРА ПЕРЕВАЖАЄ ВЕРДИКТ МОДЕЛІ. Червоний знак оклику, який аналітик
             # ставить у коментарі, - це людина, що знає контекст, і вона помиляється рідко.
             # 30.09.2026 перехоплення з ❗❗❗ пішло в жовтий канал за нашою оцінкою; власник
