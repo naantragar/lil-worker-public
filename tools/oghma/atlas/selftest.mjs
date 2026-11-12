@@ -2,6 +2,10 @@
 // compare what is ACTUALLY on the map with what the data says should be there.
 //
 //   node tools/upstream/atlas/selftest.mjs [/root/upstream-maps/MAP_DD.MM.html] [--shots DIR]
+//   node tools/upstream/atlas/selftest.mjs --live http://127.0.0.1:5179   # upstream's «Мапа» (stand.mjs or the site)
+//
+// --live logs in like page_view.mjs does (ordinary POST /api/auth/login + TOTP, ONE attempt — the server
+// locks an IP after failures) and clicks the same controls in the upstream panel (#o-atlas…).
 //
 // Owner, 12.11.2026: «то якась галочка не працювала, то щось ще» — so the map is not shipped on a
 // guess. Expected counts are computed HERE from DATA, independently of the page's own logic; the
@@ -9,13 +13,42 @@
 // viewport. Prints a JSON report; exit code 1 if any check failed.
 import { chromium } from '~/.krevetka-browser/node_modules/playwright/index.mjs';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 
 const argv = process.argv.slice(2);
 const opt = (n, d) => { const i = argv.indexOf(`--${n}`); return i >= 0 ? argv[i + 1] : d; };
 const file = argv.find(a => !a.startsWith('--') && a !== opt('shots')) ||
   fs.readdirSync('/root/upstream-maps').filter(f => /^MAP_.*\.html$/.test(f)).map(f => '/root/upstream-maps/' + f)
     .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0];
-const SHOTS = opt('shots', '/tmp/atlas_selftest');
+const LIVE = opt('live', null);
+const SHOTS = opt('shots', LIVE ? '/tmp/atlas_selftest_live' : '/tmp/atlas_selftest');
+// the two panels differ only in names
+const S = LIVE
+  ? { panel: '#o-atlas', body: 'o-atlas-body', toggle: '#o-atlas-toggle', closed: 'is-closed', allOn: '#o-atlas-allOn', allOff: '#o-atlas-allOff',
+      tLayers: '#o-atlas-tLayers', tRef: '#o-atlas-tRef', ref: '.o-atlas__ref', refT: '.o-atlas__ref-t', open: 'is-open', row: '.o-atlas__bat' }
+  : { panel: '#panel', body: 'body', toggle: '#toggle', closed: 'closed', allOn: '#allOn', allOff: '#allOff',
+      tLayers: '#tLayers', tRef: '#tRef', ref: '.ref', refT: '.t', open: 'open', row: '.bat' };
+let STATE = null;
+if (LIVE) {
+  const b32 = s => { const A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'; let bits = 0, v = 0; const o = [];
+    for (const c of s.replace(/=+$/, '').toUpperCase()) { v = (v << 5) | A.indexOf(c); bits += 5; if (bits >= 8) { o.push((v >>> (bits - 8)) & 255); bits -= 8; } } return Buffer.from(o); };
+  const totp = sec => { const buf = Buffer.alloc(8); buf.writeBigUInt64BE(BigInt(Math.floor(Date.now() / 30000)));
+    const h = crypto.createHmac('sha1', b32(sec)).update(buf).digest(), o = h[h.length - 1] & 15;
+    return String((((h[o] & 127) << 24) | (h[o + 1] << 16) | (h[o + 2] << 8) | h[o + 3]) % 1e6).padStart(6, '0'); };
+  const prof = JSON.parse(fs.readFileSync('/root/.krevetka-secrets/upstream.json', 'utf8'));
+  const br = await chromium.launch(), ctx = await br.newContext();
+  const res = await ctx.request.post(`${LIVE}/api/auth/login`, { data: { username: prof.username, password: prof.password, totp: totp(prof.totp_secret) } });
+  if (!res.ok()) { console.log(JSON.stringify({ failed: 1, errors: [`login ${res.status()}`] })); process.exit(1); }
+  STATE = '/tmp/atlas_live_state.json';
+  await ctx.storageState({ path: STATE }); fs.chmodSync(STATE, 0o600);
+  // the session cookie is Secure; a local http stand would never get it back — test-only, never the site
+  if (LIVE.startsWith('http://')) {
+    const st = JSON.parse(fs.readFileSync(STATE, 'utf8'));
+    st.cookies.forEach(c => { c.secure = false; });
+    fs.writeFileSync(STATE, JSON.stringify(st), { mode: 0o600 });
+  }
+  await br.close();
+}
 fs.mkdirSync(SHOTS, { recursive: true });
 
 const VIEWPORTS = { desktop: { width: 1440, height: 900 }, phone: { width: 390, height: 844, isMobile: true, hasTouch: true } };
@@ -42,12 +75,16 @@ function expected(D, st) {
 
 async function run(name, vp) {
   const browser = await chromium.launch();
-  const page = await browser.newPage({ viewport: { width: vp.width, height: vp.height }, isMobile: !!vp.isMobile, hasTouch: !!vp.hasTouch });
+  const ctx = await browser.newContext({ viewport: { width: vp.width, height: vp.height }, isMobile: !!vp.isMobile, hasTouch: !!vp.hasTouch,
+    ...(STATE ? { storageState: STATE } : {}) });
+  const page = await ctx.newPage();
   page.on('pageerror', e => report.errors.push(`${name}: ${e.message}`));
   page.on('console', m => { if (m.type() === 'error') report.errors.push(`${name}: console ${m.text()}`); });
-  await page.goto('file://' + file, { timeout: 60000 });
+  await page.goto(LIVE ? `${LIVE}/map` : 'file://' + file, { timeout: 60000 });
   await page.waitForFunction(() => window.__atlas, null, { timeout: 60000 });
-  const D = await page.evaluate(() => DATA);
+  await page.waitForTimeout(800);
+  const D = await page.evaluate(() => (window.__atlas.data ? window.__atlas.data() : DATA));
+  const isClosed = () => page.evaluate(([p, c]) => document.querySelector(p).classList.contains(c), [S.panel, S.closed]);
   const shot = async tag => { const p = `${SHOTS}/${name}_${tag}.png`; await page.screenshot({ path: p }); report.shots.push(p); };
 
   const verify = async (label) => {
@@ -68,14 +105,12 @@ async function run(name, vp) {
     check(name, `${label}: галочки бригад = стан`, !brigBad.length, brigBad);
     return st;
   };
-  const openPanel = async () => {
-    if (await page.evaluate(() => document.getElementById('panel').classList.contains('closed'))) await page.click('#toggle');
-  };
+  const openPanel = async () => { if (await isClosed()) await page.click(S.toggle); };
   const click = async sel => { await openPanel(); await page.locator(sel).first().scrollIntoViewIfNeeded(); await page.click(sel); };
 
   // 1. first view
   if (vp.isMobile) {
-    check(name, 'на телефоні панель спершу згорнута (видно мапу)', await page.evaluate(() => document.getElementById('panel').classList.contains('closed')));
+    check(name, 'на телефоні панель спершу згорнута (видно мапу)', await isClosed());
     await shot('0_start_closed');
   }
   {
@@ -92,18 +127,18 @@ async function run(name, vp) {
   await shot('1_start');
 
   // 2. all off / all on
-  await click('#allOff');
+  await click(S.allOff);
   st = await verify('«Усе викл»');
   const total = o => Object.values(o).reduce((a, b) => a + b, 0);
   check(name, '«Усе викл»: на мапі нічого', total(await page.evaluate(() => window.__atlas.shown())) === 0);
   await shot('2_all_off');
-  await click('#allOn');
+  await click(S.allOn);
   st = await verify('«Усе вкл»');
 
   // 3. each brigade alone, then each battalion alone
   const brigs = [...new Set(D.battalions.map(b => b.formation))];
   for (const f of brigs) {
-    await click('#allOff');
+    await click(S.allOff);
     await click(`input[data-brig="${f}"]`);
     st = await verify(`лише бригада ${f}`);
     const onKeys = Object.keys(st.on).filter(k => st.on[k]);
@@ -112,7 +147,7 @@ async function run(name, vp) {
     if (f === brigs[1]) await shot('3_one_brigade');
   }
   for (const b of D.battalions) {
-    await click('#allOff');
+    await click(S.allOff);
     await click(`input[data-bat="${b.key}"]`);
     st = await verify(`лише ${b.key}`);
     check(name, `лише ${b.key}: увімкнено один`, Object.values(st.on).filter(Boolean).length === 1 && st.on[b.key]);
@@ -120,7 +155,7 @@ async function run(name, vp) {
   // 4. a brigade box with part of it on: «частково», a click turns the whole brigade on, the next one off
   const f38 = brigs.find(f => D.battalions.filter(b => b.formation === f).length > 1);
   if (f38) {
-    await click('#allOff');
+    await click(S.allOff);
     await click(`input[data-bat="${D.battalions.find(b => b.formation === f38).key}"]`);
     await verify(`частково ${f38}`);
     await click(`input[data-brig="${f38}"]`);
@@ -131,7 +166,7 @@ async function run(name, vp) {
     check(name, `бригада ${f38}: другий клік вимикає`, D.battalions.filter(b => b.formation === f38).every(b => !st.on[b.key]));
   }
   // 5. what to show: places / points / other stations
-  await click('#allOn');
+  await click(S.allOn);
   for (const k of ['zones', 'places', 'points', 'other', 'pow']) {
     await click(`input[data-kind="${k}"]`);
     await verify(`перемкнув «${k}»`);
@@ -163,7 +198,8 @@ async function run(name, vp) {
   await click('input[data-kind="pow"]');
   const powOk = await page.evaluate(() => window.__atlas.shown()['__pow:points']);
   check(name, `полонені: на мапі ${powOk} з ${D.pow.length}`, powOk === D.pow.length);
-  check(name, 'полонені: у кожної точки є протокол і опис', D.pow.every(p => p.doc && p.what.length));
+  check(name, 'полонені: у кожної точки є протокол і опис', D.pow.every(p => (p.doc || p.doc_d) && p.what.length));
+  if (LIVE) check(name, 'полонені: імен полонених у даних Огми немає', D.pow.every(p => !('doc' in p)));
   await shot('4b_pow');
   await click('input[data-kind="pow"]');
   // 6. every period
@@ -178,7 +214,7 @@ async function run(name, vp) {
   await click('input[data-kind="other"]');
   await click('button[data-p="30"]');
   // 7. zoom buttons move the map and break nothing
-  await click('#allOn');
+  await click(S.allOn);
   for (const b of D.battalions) {
     await click(`button[data-zoom="${b.key}"]`);
     await page.waitForTimeout(500);
@@ -189,44 +225,65 @@ async function run(name, vp) {
     check(name, `наблизити ${b.key}: видно всі його села й зону (${seen} з ${pts.length})`, seen === pts.length && !report.errors.length,
       report.errors.slice(-2));
     if (vp.isMobile) check(name, `наблизити ${b.key}: на телефоні панель згорнулась`,
-      await page.evaluate(() => document.getElementById('panel').classList.contains('closed')));
+      await isClosed());
     if (b === D.battalions[1]) await shot('7_zoomed');
   }
   // 8. reference tab: open a card, «show only it»
   await openPanel();
-  await page.click('#tRef');
+  await page.click(S.tRef);
   const k0 = D.battalions[0].key;
-  await page.click(`.ref[data-b="${k0}"] .t`);
-  check(name, 'довідник: картка розгортається', await page.evaluate(k => document.querySelector(`.ref[data-b="${k}"]`).classList.contains('open'), k0));
+  await page.click(`${S.ref}[data-b="${k0}"] ${S.refT}`);
+  check(name, 'довідник: картка розгортається',
+    await page.evaluate(([r, k, o]) => document.querySelector(`${r}[data-b="${k}"]`).classList.contains(o), [S.ref, k0, S.open]));
   await shot('5_reference');
   await page.click(`button[data-only="${k0}"]`);
   await page.waitForTimeout(300);
   st = await page.evaluate(() => window.__atlas.state());
   check(name, 'довідник: «показати лише його»', Object.values(st.on).filter(Boolean).length === 1 && st.on[k0]);
   await openPanel();
-  await page.click('#tLayers');
+  await page.click(S.tLayers);
   await verify('після довідника, вкладка шари');
   await shot('6_only_one');
   // 9. collapse / expand
-  await page.click('#toggle');
-  check(name, 'панель згортається', await page.evaluate(() => getComputedStyle(document.getElementById('body')).display === 'none'));
-  await page.click('#toggle');
-  check(name, 'панель розгортається', await page.evaluate(() => getComputedStyle(document.getElementById('body')).display !== 'none'));
+  const bodyShown = () => page.evaluate(b => { const e = document.getElementById(b); return !!e && getComputedStyle(e).display !== 'none'; }, S.body);
+  await page.click(S.toggle);
+  check(name, 'панель згортається', !(await bodyShown()));
+  await page.click(S.toggle);
+  check(name, 'панель розгортається', await bodyShown());
   // 10. layout
-  const lay = await page.evaluate(() => {
-    const p = document.getElementById('panel').getBoundingClientRect();
-    const small = [...document.querySelectorAll('#panel button, #panel input[type=checkbox]')]
+  const lay = await page.evaluate((P) => {
+    const p = document.querySelector(P).getBoundingClientRect();
+    const small = [...document.querySelectorAll(`${P} button, ${P} input[type=checkbox]`)]
       .filter(x => x.offsetParent).map(x => x.getBoundingClientRect()).filter(r => r.height < 18 || r.width < 18).length;
     return { overflowX: document.documentElement.scrollWidth > window.innerWidth, panelH: p.height / window.innerHeight,
              panelW: p.width / window.innerWidth, small };
-  });
+  }, S.panel);
   check(name, 'немає горизонтальної прокрутки', !lay.overflowX);
+  if (LIVE) {
+    // nothing of the page's own may sit under or over the atlas panel (the add button did, 12.11)
+    const hit = await page.evaluate((P) => {
+      const a = document.querySelector(P).getBoundingClientRect();
+      return [...document.querySelectorAll('.o-map__tools, .o-map__panel')].filter(e => e.offsetParent).map(e => e.getBoundingClientRect())
+        .filter(b => b.width && b.height && a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom).length;
+    }, S.panel);
+    check(name, 'панель батальйонів не перетинається з кнопкою й панеллю об\'єктів', hit === 0, hit);
+    // theme: dark ⇄ light, remembered
+    await page.click('#o-atlas-theme');
+    await page.waitForTimeout(1500);
+    const light = await page.evaluate(() => [document.querySelector('.o-map').classList.contains('is-light'), localStorage.getItem('upstream.map.theme')]);
+    check(name, 'тема: світла вмикається і запам\'ятовується', light[0] && light[1] === 'light', light);
+    await shot('8_light');
+    await page.click('#o-atlas-theme');
+    await page.waitForTimeout(500);
+    const dark = await page.evaluate(() => [document.querySelector('.o-map').classList.contains('is-light'), localStorage.getItem('upstream.map.theme')]);
+    check(name, 'тема: назад на темну', !dark[0] && dark[1] === 'dark', dark);
+  }
   check(name, `панель не закриває мапу (${Math.round(lay.panelH * 100)}% висоти, ${Math.round(lay.panelW * 100)}% ширини)`,
     vp.isMobile ? lay.panelH <= 0.47 : lay.panelW <= 0.3);
   check(name, 'немає надто дрібних кнопок/галочок', lay.small === 0, lay.small);
   if (vp.isMobile) {
-    const tap = await page.evaluate(() => [...document.querySelectorAll('#panel .bat, #panel button')].filter(x => x.offsetParent)
-      .map(x => x.getBoundingClientRect().height).filter(h => h < 36).length);
+    const tap = await page.evaluate(([P, R]) => [...document.querySelectorAll(`${P} ${R}, ${P} button`)].filter(x => x.offsetParent)
+      .map(x => x.getBoundingClientRect().height).filter(h => h < 36).length, [S.panel, S.row]);
     check(name, 'на телефоні рядки й кнопки ≥ 36 px під палець', tap === 0, tap);
   }
   await browser.close();
@@ -236,6 +293,6 @@ for (const [name, vp] of Object.entries(VIEWPORTS)) {
   try { await run(name, vp); } catch (e) { report.errors.push(`${name}: ${e.message.split('\n')[0]}`); }
 }
 const failed = report.checks.filter(c => !c.ok);
-console.log(JSON.stringify({ file: report.file, zones30: report.zones, passed: report.checks.length - failed.length, failed: failed.length,
+console.log(JSON.stringify({ file: LIVE || report.file, zones30: report.zones, passed: report.checks.length - failed.length, failed: failed.length,
   failures: failed, errors: report.errors, shots: report.shots }, null, 1));
 process.exit(failed.length || report.errors.length ? 1 : 0);

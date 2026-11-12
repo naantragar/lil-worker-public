@@ -109,7 +109,10 @@ def main() -> None:
     ap.add_argument("--out-dir", default="/root/upstream-maps")
     ap.add_argument("--no-map", action="store_true", help="reference only, skip the HTML")
     ap.add_argument("--map-only", action="store_true", help="re-render the HTML from the last run, no corpus read")
+    ap.add_argument("--export", metavar="PATH", help="write the data drop for upstream's «Мапа» from the last run")
     a = ap.parse_args()
+    if a.export:
+        return export(Path(a.export))
     if a.map_only:
         return map_only(Path(a.out_dir))
 
@@ -332,6 +335,29 @@ def render_map(ref: dict, points: list, area: Path, out: Path, now: datetime) ->
     path.write_text(html, encoding="utf-8")
     print(f"\n→ map {path} ({path.stat().st_size / 1e6:.1f} MB), {len(points)} positions")
     return path
+
+
+def export(path: Path) -> None:
+    """The data drop for upstream's «Мапа» (owner 12.11.2026): data only, from the last run's cache.
+
+    upstream reads this one file (nginx, behind the «Мапа» page check) and never imports anything from this
+    repo — AGENTS.md §4. Prisoners' NAMES do not go there: upstream has operators, the debrief names stay in
+    the owner's own map; a point carries the prisoner's formation and the debrief date instead.
+    """
+    cache = Path("/root/upstream-maps/.cache")
+    ref = json.loads((REF_DIR / "atlas.json").read_text(encoding="utf-8"))
+    points = json.loads((cache / "points.json").read_text(encoding="utf-8"))
+    pows = []
+    for p in pow_points():
+        m = re.search(r"(\d{2,4})\s*(омсбр|мсп|омбр|мсбр|абр|мсд|отбр|обр)", p["doc"], re.I)
+        pows.append({k: v for k, v in p.items() if k != "doc"} | {"fm": f"{m.group(1)} {m.group(2).lower()}" if m else "?"})
+    data = dict(ref, points=points, pow=pows, bbox=BBOX, maxzoom=MAXZOOM, schema=1)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    tmp.chmod(0o644)
+    tmp.replace(path)                                  # atomic: nginx never serves half a file
+    print(f"→ {path} ({path.stat().st_size / 1e3:.0f} KB): {len(ref['battalions'])} battalions, "
+          f"{len(points)} positions, {len(pows)} POW points")
 
 
 def map_only(out: Path) -> None:
