@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Батальйони — мапа</title>
+<style>/*LEAFLET_CSS*/</style>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; font: 14px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #e8e6e3; }
+  #map { position: absolute; inset: 0; background: #1b1b1d; }
+  #panel { position: absolute; z-index: 1000; top: 10px; right: 10px; width: 340px; max-height: calc(100% - 20px);
+           display: flex; flex-direction: column; background: rgba(22,22,24,.95); border: 1px solid #333; border-radius: 10px;
+           box-shadow: 0 4px 18px rgba(0,0,0,.5); }
+  #panel.closed #body { display: none; }
+  #head { display: flex; gap: 6px; align-items: center; padding: 8px 10px; border-bottom: 1px solid #333; }
+  button { background: #2a2a2e; color: #e8e6e3; border: 1px solid #444; border-radius: 6px; padding: 5px 9px; font: inherit; cursor: pointer; min-height: 32px; }
+  button.on { background: #ffb000; color: #111; border-color: #ffb000; }
+  #toggle { margin-left: auto; min-width: 36px; }
+  #body { overflow-y: auto; padding: 8px 10px 12px; overscroll-behavior: contain; }
+  .row { display: flex; flex-wrap: wrap; gap: 5px; margin: 2px 0 8px; align-items: center; }
+  .row .lbl { color: #9a978f; font-size: 12px; width: 100%; }
+  .muted { color: #9a978f; font-size: 12px; }
+  .kinds label { display: inline-flex; gap: 5px; align-items: center; margin-right: 12px; cursor: pointer; min-height: 30px; }
+  .brig { border-top: 1px solid #2c2c2f; padding: 6px 0 4px; }
+  .brig > label { display: flex; gap: 8px; align-items: center; font-weight: 700; cursor: pointer; min-height: 32px; }
+  .bat { display: flex; align-items: center; gap: 6px; margin-left: 22px; min-height: 32px; }
+  .bat label { display: flex; gap: 7px; align-items: center; cursor: pointer; flex: 1; min-width: 0; }
+  .bat .nm { overflow: hidden; text-overflow: ellipsis; }
+  .bat .cnt { color: #9a978f; font-size: 12px; white-space: nowrap; }
+  .bat button { padding: 2px 7px; min-height: 28px; font-size: 13px; }
+  input[type=checkbox] { width: 18px; height: 18px; margin: 0; accent-color: #ffb000; flex: none; }
+  .sw { width: 12px; height: 12px; border-radius: 50%; flex: none; border: 1px solid rgba(255,255,255,.4); }
+  .note { margin-top: 10px; border-top: 1px solid #2c2c2f; padding-top: 8px; }
+  .card { margin: 4px 0 2px 19px; font-size: 12.5px; display: none; }
+  .ref.open .card { display: block; }
+  .ref { border-top: 1px solid #2c2c2f; padding: 7px 0; }
+  .ref .t { display: flex; align-items: center; gap: 7px; font-weight: 600; cursor: pointer; min-height: 30px; }
+  .card b { color: #fff; font-weight: 600; }
+  .card div { margin: 3px 0; }
+  .leaflet-popup-content-wrapper, .leaflet-tooltip { background: #1e1e21; color: #eee; border: 1px solid #444; }
+  .leaflet-popup-tip { background: #1e1e21; }
+  .leaflet-popup-content { margin: 9px 12px; font-size: 13px; }
+  .leaflet-container a { color: #ffb000; }
+  #loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; z-index: 2000; background: #111; color: #aaa; }
+  @media (max-width: 600px) {
+    body { font-size: 15px; }
+    #panel { top: auto; bottom: 0; right: 0; left: 0; width: auto; max-height: 46%; border-radius: 12px 12px 0 0; }
+    button { min-height: 38px; padding: 6px 11px; }
+    .bat, .brig > label { min-height: 40px; }
+    .bat button { min-height: 36px; padding: 4px 10px; }
+    input[type=checkbox] { width: 22px; height: 22px; }
+    .leaflet-bottom.leaflet-left { bottom: 52px; }
+  }
+</style>
+</head>
+<body>
+<div id="loading">Розгортаю мапу…</div>
+<div id="map"></div>
+<div id="panel">
+  <div id="head">
+    <button id="tLayers" class="on">Шари</button>
+    <button id="tRef">Довідник</button>
+    <button id="toggle" aria-label="згорнути">▾</button>
+  </div>
+  <div id="body"></div>
+</div>
+<script>/*LEAFLET_JS*/</script>
+<script>/*PMTILES_JS*/</script>
+<script>/*PROTOMAPS_JS*/</script>
+<script>const DATA = /*DATA*/;</script>
+<script>const TILES_B64 = "/*TILES_B64*/";</script>
+<script>
+(function () {
+  // --- the base map: our own OSM extract, decoded in memory, no network ---
+  const bin = atob(TILES_B64), u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  const source = { getKey: () => 'area', getBytes: (o, l) => Promise.resolve({ data: u8.buffer.slice(o, o + l) }) };
+  const pm = new pmtiles.PMTiles(source);
+  const [w, s, e, n] = DATA.bbox;
+  const map = L.map('map', { zoomControl: false, maxBounds: [[s - .3, w - .5], [n + .3, e + .5]], minZoom: 8, maxZoom: 17 });
+  L.control.zoom({ position: 'topleft' }).addTo(map);
+  map.createPane('zones').style.zIndex = 350;      // under the circles (overlayPane = 400), so they stay clickable
+  L.control.scale({ imperial: false, position: 'bottomleft' }).addTo(map);
+  protomapsL.leafletLayer({ url: pm, flavor: 'dark', lang: 'uk', maxDataZoom: DATA.maxzoom,
+    attribution: '© OpenStreetMap · Protomaps' }).addTo(map);
+  document.getElementById('loading').remove();
+
+  const today = DATA.window[1];
+  const dayMinus = k => { const d = new Date(today + 'T12:00:00'); d.setDate(d.getDate() - k); return d.toISOString().slice(0, 10); };
+  const PERIODS = [[3, '3 дні'], [7, '7 днів'], [14, '14 днів'], [30, '30 днів'], [9999, 'усе']];
+  const ZOOM_ICON = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" style="display:block"><circle cx="6.5" cy="6.5" r="4.5"/><path d="M10 10l4.5 4.5"/></svg>';
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const BAT = Object.fromEntries(DATA.battalions.map((b, i) => [b.key, Object.assign(b, { i })]));
+  // brigades in the order their first battalion appears
+  const BRIG = [];
+  DATA.battalions.forEach(b => { let g = BRIG.find(x => x.f === b.formation); if (!g) BRIG.push(g = { f: b.formation, keys: [] }); g.keys.push(b.key); });
+
+  // The whole visible state is these three things; every control writes here and calls apply().
+  let period = 30;
+  const on = Object.fromEntries(DATA.battalions.map(b => [b.key, true]));
+  const kinds = { zones: true, places: true, points: true, other: false, pow: false };
+
+  const from = () => period >= 9999 ? '0000' : dayMinus(period - 1);
+  const groups = {};                      // key + ':places' | ':points' | ':zones', '__other:points', '__pow:points' -> layerGroup
+  const zoneOf = {};                      // key -> the zone polygon ring for the current period (self-test reads it)
+  const POW_ICON = L.divIcon({ className: '', html: '<div style="width:10px;height:10px;background:#fff;border:2px solid #111;transform:rotate(45deg)"></div>', iconSize: [14, 14], iconAnchor: [7, 7] });
+
+  // A battalion's zone: the 2-sigma ellipse of its villages weighted by intercepts (≈86% of the weight
+  // for a normal spread). A floor of 0.8 km per axis keeps a one- or two-village battalion a small oval.
+  function zone(rows) {
+    if (!rows.length) return null;
+    const W = rows.reduce((a, r) => a + r.n, 0);
+    const lat0 = rows.reduce((a, r) => a + r.p.lat * r.n, 0) / W, lon0 = rows.reduce((a, r) => a + r.p.lon * r.n, 0) / W;
+    const kx = 111.32 * Math.cos(lat0 * Math.PI / 180), ky = 110.57;
+    let sxx = 0, syy = 0, sxy = 0;
+    rows.forEach(r => { const x = (r.p.lon - lon0) * kx, y = (r.p.lat - lat0) * ky; sxx += r.n * x * x; syy += r.n * y * y; sxy += r.n * x * y; });
+    sxx = sxx / W + 0.64; syy = syy / W + 0.64; sxy /= W;
+    const tr = sxx + syy, det = sxx * syy - sxy * sxy, d = Math.sqrt(Math.max(0, tr * tr / 4 - det));
+    const l1 = tr / 2 + d, l2 = tr / 2 - d, th = Math.atan2(l1 - sxx, sxy || 1e-9);
+    const a = 2 * Math.sqrt(l1), b = 2 * Math.sqrt(Math.max(l2, 0.01));
+    const ring = [];
+    for (let i = 0; i < 72; i++) {
+      const t = i / 72 * 2 * Math.PI, x = a * Math.cos(t), y = b * Math.sin(t);
+      ring.push([lat0 + (x * Math.sin(th) + y * Math.cos(th)) / ky, lon0 + (x * Math.cos(th) - y * Math.sin(th)) / kx]);
+    }
+    return { ring, a: 2 * a, b: 2 * b };
+  }
+
+  function otherColor(fm) {
+    let h = 0; for (const c of fm) h = (h * 31 + c.charCodeAt(0)) % 360;
+    return `hsl(${h},18%,62%)`;
+  }
+
+  // Build the layers for the current period. Visibility is NOT decided here — apply() does that.
+  function build() {
+    Object.values(groups).forEach(g => map.removeLayer(g));
+    for (const k in groups) delete groups[k];
+    const f = from();
+    DATA.battalions.forEach(b => {
+      const g = groups[b.key + ':places'] = L.layerGroup();
+      const rows = b.places.map(p => ({ p, n: Object.entries(p.days).filter(([d]) => d >= f).reduce((a, [, v]) => a + v, 0) }))
+        .filter(x => x.n > 0);
+      const max = Math.max(1, ...rows.map(x => x.n));
+      // battalions sharing a village sit on a small ring around it, so every circle stays visible
+      const ang = b.i / DATA.battalions.length * 2 * Math.PI, dl = 0.0055 * Math.sin(ang), dn = 0.0082 * Math.cos(ang);
+      rows.forEach(({ p, n }) => {
+        L.circleMarker([p.lat + dl, p.lon + dn], { radius: 6 + 16 * Math.sqrt(n / max), color: b.color, weight: 2,
+          fillColor: b.color, fillOpacity: .18 })
+          .bindPopup(`<b>${esc(p.name)}</b><br>${esc(b.key)}<br>${n} перехоплень за період (усього у вікні ${p.n})`)
+          .bindTooltip(`${esc(p.name)} · ${n}`, { direction: 'top' })
+          .addTo(g);
+      });
+      groups[b.key + ':points'] = L.layerGroup();
+      groups[b.key + ':zones'] = L.layerGroup();
+      const z = zone(rows);
+      if (z) {
+        zoneOf[b.key] = z.ring;
+        L.polygon(z.ring, { pane: 'zones', color: b.color, weight: 2, dashArray: '7 5', fillColor: b.color, fillOpacity: .07, interactive: true })
+          .bindTooltip(esc(b.key), { sticky: true })
+          .bindPopup(`<b>${esc(b.key)}</b><br>зона: тут ~86% його перехоплень за період<br>сіл ${rows.length}, ` +
+                     `осі ${z.a.toFixed(1)} × ${z.b.toFixed(1)} км<br><span class="muted">із шапок аналітиків — район мережі, не позиції людей</span>`)
+          .addTo(groups[b.key + ':zones']);
+      } else delete zoneOf[b.key];
+    });
+    groups['__pow:points'] = L.layerGroup();
+    DATA.pow.forEach(p => {
+      L.marker([p.lat, p.lon], { icon: POW_ICON, keyboard: false })
+        .bindPopup(`<b>Зі слів полоненого</b><br>${p.what.map(esc).join('<br>')}<br><span class="muted">${esc(p.mgrs)}` +
+                   `${p.unit ? ' · ' + esc(p.unit) : ''}<br>протокол: ${esc(p.doc)}${p.d && p.d !== p.doc_d ? '<br>подія: ' + esc(p.d) : ''}</span>`)
+        .addTo(groups['__pow:points']);
+    });
+    groups['__other:points'] = L.layerGroup();
+    DATA.points.forEach(pt => {
+      if (pt.d < f) return;
+      const key = pt.b && BAT[pt.b] ? pt.b : '__other';
+      const col = key === '__other' ? otherColor(pt.fm) : BAT[key].color;
+      L.circleMarker([pt.lat, pt.lon], { radius: pt.core ? 6 : 4, color: pt.core ? '#fff' : col, weight: pt.core ? 1.5 : 1,
+        fillColor: col, fillOpacity: .9 })
+        .bindPopup(`<b>${esc(pt.cs)}</b> · ${esc(pt.f)}<br>${esc(pt.d)} ${esc(pt.t)}<br><span class="muted">${esc(pt.h)}</span>` +
+          (key === '__other' ? `<br>${esc(pt.fm)}` : `<br>${esc(key)}`))
+        .addTo(groups[key + ':points']);
+    });
+  }
+
+  function wanted(gk) {
+    const [k, l] = gk.split(':');
+    if (k === '__other') return kinds.other;
+    if (k === '__pow') return kinds.pow;
+    return on[k] && kinds[l];
+  }
+
+  // Put on the map exactly what the state says, then redraw the panel so every box shows the truth.
+  function apply() {
+    for (const [gk, g] of Object.entries(groups)) {
+      const want = wanted(gk);
+      if (want && !map.hasLayer(g)) g.addTo(map);
+      if (!want && map.hasLayer(g)) map.removeLayer(g);
+    }
+    renderPanel();
+  }
+
+  const count = (k, l) => groups[k + ':' + l] ? groups[k + ':' + l].getLayers().length : 0;
+
+  // padding that keeps fitted points out from under the open panel (right column / bottom sheet)
+  function freeArea() {
+    const p = document.getElementById('panel');
+    // phones get thin margins: with whole-step zoom a wide margin drops the fit one full level
+    if (p.classList.contains('closed')) return { padding: window.innerWidth < 600 ? [8, 8] : [40, 40] };
+    const r = p.getBoundingClientRect();
+    return window.innerWidth < 600 ? { paddingTopLeft: [30, 30], paddingBottomRight: [30, r.height + 20] }
+                                    : { paddingTopLeft: [40, 40], paddingBottomRight: [r.width + 30, 40] };
+  }
+
+  function zoomTo(keys) {
+    const f = from();
+    const ll = keys.flatMap(k => BAT[k].places.filter(p => Object.keys(p.days).some(d => d >= f)).map(p => [p.lat, p.lon])
+      .concat(DATA.points.filter(p => p.b === k && p.d >= f).map(p => [p.lat, p.lon]))
+      .concat(kinds.zones && zoneOf[k] ? zoneOf[k] : []));
+    if (!ll.length) return;
+    // on a phone the panel is a bottom sheet: fold it so the battalion is not hidden under it
+    if (window.innerWidth < 600) setClosed(true);
+    map.fitBounds(ll, Object.assign({ maxZoom: 13 }, freeArea()));
+  }
+
+  let tab = 'layers';
+  function renderPanel() {
+    const body = document.getElementById('body');
+    const keep = body.scrollTop;
+    let h = '<div class="row per">' + PERIODS.map(([k, t]) => `<button data-p="${k}" class="${k === period ? 'on' : ''}">${t}</button>`).join('') + '</div>';
+    if (tab === 'layers') {
+      h += `<div class="row"><button id="allOn">Усе вкл</button><button id="allOff">Усе викл</button></div>`;
+      h += `<div class="row kinds"><span class="lbl">що показувати</span>
+        <label><input type="checkbox" data-kind="zones" ${kinds.zones ? 'checked' : ''}>зони</label>
+        <label><input type="checkbox" data-kind="places" ${kinds.places ? 'checked' : ''}>села</label>
+        <label><input type="checkbox" data-kind="points" ${kinds.points ? 'checked' : ''}>позиції</label>
+        <label><input type="checkbox" data-kind="other" ${kinds.other ? 'checked' : ''}>інші станції (${count('__other', 'points')})</label>
+        <label><input type="checkbox" data-kind="pow" ${kinds.pow ? 'checked' : ''}>зі слів полонених (${DATA.pow.length})</label></div>`;
+      BRIG.forEach(g => {
+        h += `<div class="brig"><label><input type="checkbox" data-brig="${esc(g.f)}">${esc(g.f)}</label>`;
+        g.keys.forEach(k => {
+          const b = BAT[k], nm = k.split(' / ').slice(1).join(' / ');
+          h += `<div class="bat"><label><input type="checkbox" data-bat="${esc(k)}" ${on[k] ? 'checked' : ''}>
+            <span class="sw" style="background:${b.color}"></span><span class="nm">${esc(nm)}</span></label>
+            <span class="cnt">${count(k, 'places')} с · ${count(k, 'points')} п</span>
+            <button data-zoom="${esc(k)}" title="наблизити до батальйону" aria-label="наблизити">${ZOOM_ICON}</button></div>`;
+        });
+        h += '</div>';
+      });
+      h += `<div class="note muted">Пунктирна зона — де ~86% перехоплень батальйону за період (за селами з шапок, вага = перехоплення).
+        Кола — самі села (розмір = скільки перехоплень); «с» — сіл, «п» — позицій за період.
+        Білі ромби — точки з протоколів опитування полонених (усі дати; дата протоколу у підказці).
+        Позиції — станції з MGRS від Патагонії (біла обводка — людина з ядра батальйону). Патагонія перестала писати MGRS після 29.10,
+        у жовтні це лише чужі мережі, наші — серпень-вересень («усе» = з ${esc(DATA.points_from)}).
+        Село — це район, яким аналітик підписав мережу, а не місце, де стоїть людина.</div>`;
+    } else {
+      h += `<div class="muted">Вікно ${esc(DATA.window[0])} .. ${esc(DATA.window[1])}. Натисни батальйон — розгорнеться картка.</div>`;
+      DATA.battalions.forEach(b => {
+        const heard = b.people.filter(p => p.n);
+        h += `<div class="ref" data-b="${esc(b.key)}"><div class="t"><span class="sw" style="background:${b.color}"></span>${esc(b.key)}</div>
+        <div class="card">
+          <div class="muted">востаннє: ${esc(b.last || 'у вікні не звучали')}</div>
+          <div><b>Люди:</b> ${heard.map(p => esc(p.cs) + (p.roles.length ? ` <span class="muted">(${esc(p.roles.join(', '))})</span>` : '') + ` ${p.n}`).join('; ') || '—'}</div>
+          <div><b>Частоти:</b> ${b.freqs.map(f => `${esc(f.f)} <span class="muted">${f.ours}/${f.pata}, ${esc(f.first.slice(5))}..${esc(f.last.slice(5))}</span>`).join('; ') || 'основних не знайдено'}</div>
+          ${b.visits.length ? `<div><b>Епізодично:</b> ${b.visits.map(v => `${esc(v.f)} <span class="muted">${v.with_people} з ${v.all}</span>`).join('; ')}</div>` : ''}
+          <div><b>Райони:</b> ${b.places.slice(0, 8).map(p => `${esc(p.name)} ${p.n}`).join('; ') || '—'}</div>
+          <div><button data-only="${esc(b.key)}">Показати лише його на мапі</button></div>
+        </div></div>`;
+      });
+      if (DATA.shared.length) h += `<div class="ref open"><b>Спільні частоти</b>` + DATA.shared.map(s =>
+        `<div class="card">${esc(s.f)} — ${s.bats.map(([b, n]) => esc(b) + ' ' + n).join('; ')}</div>`).join('') + '</div>';
+    }
+    body.innerHTML = h;
+    body.scrollTop = keep;
+
+    // a brigade box shows checked / unchecked / «частково» (indeterminate) from its battalions
+    body.querySelectorAll('input[data-brig]').forEach(x => {
+      const ks = BRIG.find(g => g.f === x.dataset.brig).keys, n = ks.filter(k => on[k]).length;
+      x.checked = n === ks.length; x.indeterminate = n > 0 && n < ks.length;
+      x.onchange = () => { const v = n < ks.length; ks.forEach(k => on[k] = v); apply(); };
+    });
+    body.querySelectorAll('input[data-bat]').forEach(x => x.onchange = () => { on[x.dataset.bat] = x.checked; apply(); });
+    body.querySelectorAll('input[data-kind]').forEach(x => x.onchange = () => { kinds[x.dataset.kind] = x.checked; apply(); });
+    body.querySelectorAll('button[data-p]').forEach(x => x.onclick = () => { period = +x.dataset.p; build(); apply(); });
+    body.querySelectorAll('button[data-zoom]').forEach(x => x.onclick = () => zoomTo([x.dataset.zoom]));
+    const allOn = body.querySelector('#allOn'), allOff = body.querySelector('#allOff');
+    if (allOn) allOn.onclick = () => { Object.keys(on).forEach(k => on[k] = true); kinds.zones = kinds.places = kinds.points = true; apply(); };
+    if (allOff) allOff.onclick = () => { Object.keys(on).forEach(k => on[k] = false); kinds.other = kinds.pow = false; apply(); };
+    body.querySelectorAll('.ref[data-b] .t').forEach(x => x.onclick = () => x.parentElement.classList.toggle('open'));
+    body.querySelectorAll('button[data-only]').forEach(x => x.onclick = () => {
+      Object.keys(on).forEach(k => on[k] = k === x.dataset.only); kinds.zones = kinds.places = kinds.points = true;
+      apply(); zoomTo([x.dataset.only]);
+    });
+  }
+
+  function setClosed(v) {
+    document.getElementById('panel').classList.toggle('closed', v);
+    document.getElementById('toggle').textContent = v ? '▴' : '▾';
+  }
+  document.getElementById('tLayers').onclick = () => { tab = 'layers'; setTabs(); setClosed(false); renderPanel(); };
+  document.getElementById('tRef').onclick = () => { tab = 'ref'; setTabs(); setClosed(false); renderPanel(); };
+  document.getElementById('toggle').onclick = () => setClosed(!document.getElementById('panel').classList.contains('closed'));
+  function setTabs() {
+    document.getElementById('tLayers').classList.toggle('on', tab === 'layers');
+    document.getElementById('tRef').classList.toggle('on', tab === 'ref');
+  }
+
+  if (window.innerWidth < 600) setClosed(true);
+  build(); apply();
+  // first view: every village, out from under the panel; on a desktop also every zone whole. A phone
+  // would need one more whole zoom step for the zones and everything turns tiny — the villages win there.
+  const phone = window.innerWidth < 600;
+  const all = DATA.battalions.flatMap(b => b.places.map(p => [p.lat, p.lon]).concat(phone ? [] : zoneOf[b.key] || []));
+  if (all.length) map.fitBounds(all, freeArea()); else map.setView(DATA.centre, 11);
+
+  // Read-only window for the self-test (tools/upstream/atlas/selftest.mjs): what is ACTUALLY on the map.
+  window.__atlas = {
+    state: () => ({ period, on: { ...on }, kinds: { ...kinds } }),
+    shown: () => {
+      const r = {};
+      for (const [gk, g] of Object.entries(groups)) r[gk] = map.hasLayer(g) ? g.getLayers().length : 0;
+      return r;
+    },
+    built: () => Object.fromEntries(Object.entries(groups).map(([gk, g]) => [gk, g.getLayers().length])),
+    from,
+    // which of these [lat, lon] are inside the visible map (the self-test asks it after «наблизити»)
+    // …and NOT under the open panel: a point hidden by the panel is not «seen»
+    inView: pts => {
+      const sz = map.getSize(), p = document.getElementById('panel');
+      const r = p.classList.contains('closed') ? null : p.getBoundingClientRect();
+      return pts.filter(ll => {
+        const c = map.latLngToContainerPoint(ll);
+        if (c.x < 0 || c.y < 0 || c.x > sz.x || c.y > sz.y) return false;
+        return !(r && c.x >= r.left && c.x <= r.right && c.y >= r.top && c.y <= r.bottom);
+      }).length;
+    },
+    zoom: () => map.getZoom(),
+    zones: () => JSON.parse(JSON.stringify(zoneOf)),
+  };
+})();
+</script>
+</body>
+</html>

@@ -1193,6 +1193,122 @@ def assign_registers(freqs_of: dict[str, list[str]]) -> dict[str, tuple[list, li
 
 CALLSIGN_NOTES = Path(__file__).with_name("callsign_notes.json")
 
+# Our own role register «хто є хто» (tools/identity/roles_db.py + posady.py, 03.11.2026). The archive
+# roster froze with the analyst's last report on 24.08 while the nets doubled, so headers emptied.
+# Tested on 03.11 and switched ON by the owner on 04.11.2026: every report from then on prints it.
+# Setting the constant back to False is the whole rollback (`--roles-register` still forces it on).
+ROLES_REGISTER = True   # ON since 04.11.2026 (owner, after the 03.11 test)
+ROLES_DB = REPO / "knowledge" / "upstream" / "identity" / "roles.db"
+# Owner, 08.11.2026: a callsign with no role says nothing to the reader («ША», «МАРК» with the stale
+# role cleared) — the header lists only men whose role we know. This reverses the 21.08 decision to
+# print bare names (see `_pull_register`); False here brings them back.
+PRINT_BARE_CALLSIGNS = False
+ROLE_WORDS = {"komsklad": "ком склад", "nakopych": "накопичувач", "bpla_log": "БпЛА логістики"}
+
+
+@lru_cache(maxsize=1)
+def our_roles() -> tuple:
+    """Every role the register holds that the owner has NOT removed, one record per man and unit.
+
+    Each record carries the channels its evidence was heard on: a man is printed only under a block
+    that owns one of them — the lesson of БОРЕЦ landing in eleven nets of his brigade at once.
+    """
+    if not ROLES_DB.exists():
+        return ()
+    try:
+        con = sqlite3.connect(f"file:{ROLES_DB}?mode=ro", uri=True)
+        rows = con.execute(
+            "SELECT v.role, v.callsign, v.unit, COALESCE(v.title, ''), e.src_refs FROM verdict v "
+            "JOIN evidence e USING(role, callsign, unit) "
+            "WHERE v.machine='active' AND COALESCE(v.owner, '') != 'no'").fetchall()
+    except sqlite3.Error as e:
+        print(f"реєстр ролей не прочитався: {e!r}", file=sys.stderr)
+        return ()
+    men: dict[tuple[str, str], dict] = {}
+    for role, cs, unit, title, refs in rows:
+        m = men.setdefault((cs, unit), {"callsign": cs, "unit": unit, "posts": [], "roles": [],
+                                        "freqs": set()})
+        if role == "posada":
+            if title and title not in m["posts"]:
+                m["posts"].append(title)
+        elif ROLE_WORDS.get(role) and ROLE_WORDS[role] not in m["roles"]:
+            m["roles"].append(ROLE_WORDS[role])
+        for ref in json.loads(refs or "[]"):
+            f = ref.split()[-1]
+            if _is_float(f):
+                m["freqs"].add(float(f))
+    return tuple(men.values())
+
+
+def _unit_in_head(unit: str, head: str) -> bool:
+    """The register's unit (`60 омсбр`, `1198 мсп`, `189 полк`) must stand in the block header.
+    `част <freq>` is a unit we could not name; the frequency check alone carries it."""
+    if unit.startswith("част "):
+        return True
+    h = " ".join(re.sub(r"[\"'«»()]", " ", head).casefold().split())
+    return " ".join(unit.casefold().split()) in h
+
+
+def overlay_roles(head: str, freqs: list[str], roster: list, heard: tuple[set[str], str]) -> list:
+    """Add our register's men to one block's roster, or give a role to a man printed without one.
+
+    A man qualifies when (1) his unit is in this block's header, (2) at least one piece of his
+    evidence was heard on one of this block's channels, (3) he is still on the air within
+    COMMAND_ACTIVE_DAYS (the window the header already uses for command staff). The archive's own
+    role is never overwritten — the difference is only logged, for the owner to compare.
+    """
+    mine = [float(x) for x in freqs if _is_float(x)]
+    names, blob = heard
+    out = list(roster)
+    idx = {}
+    for i, row in enumerate(out):
+        for v in _variants(str(row[0])):
+            idx.setdefault(_fold(v), i)
+    # One man can stand in the register under two keys (БАЙКАЛ: ком склад under 70 мсп, комбат under
+    # 42 мсд — the same net's header names both). Grouped by the folded callsign; a post he was heard
+    # to hold joins him wherever he qualifies under a unit of this header, whatever channel it was
+    # said on — the post belongs to the man, the channel test is only about WHERE to print him.
+    qual: dict[str, dict] = {}
+    for m in our_roles():
+        if not _unit_in_head(m["unit"], head):
+            continue
+        g = qual.setdefault(_fold(m["callsign"]), {"callsign": m["callsign"], "posts": [], "roles": [],
+                                                    "here": False})
+        g["posts"] += [p for p in m["posts"] if p not in g["posts"]]
+        if any(abs(f - x) * 1000 <= FREQ_TOL_KHZ for f in m["freqs"] for x in mine):
+            g["here"] = True
+            g["roles"] += [r for r in m["roles"] if r not in g["roles"]]
+    for g in qual.values():
+        if not g["here"]:
+            continue
+        if (names or blob) and not still_active(g["callsign"], names, blob):
+            continue
+        # A post heard on air already says he commands people; «ком склад» beside «командир роти»
+        # is the same fact twice (owner, 03.11.2026). «накопичувач» is a different function and stays.
+        rest = [r for r in g["roles"] if not (g["posts"] and r == ROLE_WORDS["komsklad"])]
+        role = ", ".join(g["posts"] + rest)
+        hit = next((idx[_fold(v)] for v in _variants(g["callsign"]) if _fold(v) in idx), None)
+        if hit is None:
+            out.append((g["callsign"], role, False))
+            idx[_fold(g["callsign"])] = len(out) - 1
+            print(f"реєстр ролей: {g['callsign']} ДОДАНО до {netlabel(head, 40)} - {role}",
+                  file=sys.stderr)
+        elif not str(out[hit][1] or "").strip():
+            out[hit] = (out[hit][0], role, out[hit][2])
+            print(f"реєстр ролей: {out[hit][0]} у {netlabel(head, 40)} роль «{role}»", file=sys.stderr)
+        else:
+            # The archive's wording stays; what we learned that it does not say is APPENDED — ДОК is
+            # «ком склад» in the archive and flies the net's delivery drone. «ком склад» itself is never
+            # appended to an archive role: whatever the analyst wrote there is already more specific.
+            was = str(out[hit][1])
+            extra = [r for r in g["posts"] + rest
+                     if r != ROLE_WORDS["komsklad"] and r.casefold() not in was.casefold()]
+            if extra:
+                out[hit] = (out[hit][0], was + ", " + ", ".join(extra), out[hit][2])
+                print(f"реєстр ролей: {out[hit][0]} у {netlabel(head, 40)} «{was}» + «{', '.join(extra)}»",
+                      file=sys.stderr)
+    return out
+
 
 @lru_cache(maxsize=1)
 def external_notes() -> tuple:
@@ -1281,6 +1397,12 @@ def apply_external_notes(net: str, reg: tuple, freqs: list[str] | None = None) -
             _log_note(f"{rec.get('callsign')} ДОДАНО до {netlabel(net, 40)} - {role}")
         else:
             was = str(roster[hit][1] or "")
+            # `clear_role: true` — the owner's word that an archive role is stale (МАРК «накопичувач(?)»:
+            # true in August, a rifleman sent around by ГУСЕЙН by October; owner 08.11.2026).
+            if rec.get("clear_role"):
+                roster[hit] = (roster[hit][0], "", roster[hit][2])
+                _log_note(f"{roster[hit][0]} у {netlabel(net, 40)} роль «{was}» знято")
+                continue
             # An empty role in a note is deliberate - it says "this man exists, we do NOT know his
             # job" (ША). It must never wipe a role the archive does have.
             if not role:
@@ -2482,6 +2604,10 @@ def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
                           f"за {COMMAND_ACTIVE_DAYS} — ком склад: "
                           f"{', '.join(shown)}{tail})", file=sys.stderr)
                 roster = kept
+        if ROLES_REGISTER:
+            roster = overlay_roles(head, fr, roster, heard_on(active_cmd or active or {}, fr))
+        if not PRINT_BARE_CALLSIGNS:
+            roster = [r for r in roster if str(r[1] or "").strip()]
         for cs, role, _older in roster:
             styled.append((f"{cs} - {role}" if role else cs, False, False))
         # Our own readings join the legend of THIS network only if its own lines use the word — a
@@ -2582,6 +2708,8 @@ def main() -> None:
     # events instead: same facts, new presentation.
     ap.add_argument("--allow-stale", action="store_true",
                     help="зібрати звіт, навіть якщо корпус не покриває вікно (за замовчуванням - відмова)")
+    ap.add_argument("--roles-register", action="store_true",
+                    help="add our role register (roles.db) to the block headers for this run")
     ap.add_argument("--render-only", action="store_true",
                     help="rebuild the files from an existing <out>_events.json, no model calls")
     # The collector lags 25-30 minutes behind the group, so the last half hour of a window closing at
@@ -2593,6 +2721,10 @@ def main() -> None:
     ap.add_argument("--lead-in", type=int, default=WINDOW_LEAD_IN_MIN,
                     help="minutes to extend the START of the window by (0 disables)")
     a = ap.parse_args()
+    if a.roles_register:
+        global ROLES_REGISTER
+        ROLES_REGISTER = True
+        print("реєстр ролей «хто є хто»: УВІМКНЕНО для цього прогону", file=sys.stderr)
 
     if a.day:
         for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m"):

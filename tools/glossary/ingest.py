@@ -102,6 +102,8 @@ def db() -> sqlite3.Connection:
 
 
 def _load_run():
+    # run.py imports its siblings (losses) as a script would; loaded from here, its dir is not on the path
+    sys.path.insert(0, str(REPO / "tools" / "analytics2"))
     spec = importlib.util.spec_from_file_location("analytics2_run", REPO / "tools" / "analytics2" / "run.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

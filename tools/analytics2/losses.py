@@ -107,7 +107,9 @@ def _side(text: str, at: int) -> str:
     at = max(at, 0)
     before = text[max(0, at - 20): at]
     after = text[at:]
-    if re.search(r"союзник\w*\s*$", before, re.I) \
+    # «поранення «союзника» в\\с СВАРЩИК» (04.11.2026): the closing quote and the prefix stand between
+    # the side word and the man, and the plain `союзник\w*\s*$` missed it and counted him as theirs.
+    if re.search(r"союзник\w*»?\s*(?:(?:в|о)[\\/]с\s+)?$", before, re.I) \
             or re.match(r"[А-ЯЁЇІЄ0-9'’-]*\s*\([^)]{0,12}союзник", after, re.I):
         return "ally"
     if re.search(r"(?:в[\\/]с|о[\\/]с|гр|бійц\w*)\s+СОУ\s*$", before, re.I) \
