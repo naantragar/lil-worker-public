@@ -35,11 +35,40 @@
   },
   {
    "callsign": "ГРИНЧ",
-   "formation": "1 шр 38 омсбр",
-   "role": "лейтенант, заступник командира 1 шр \"V\"",
-   "source": "живий аналітик",
-   "date": "2026-09-06",
-   "archive_said": "ком склад (на мережах БпЛА 38 омсбр)",
+   "formation": "38 омсбр",
+   "role": "командир взводу",
+   "source": "допит 08.11.2026",
+   "date": "2026-11-08",
+   "archive_said": "ком склад (на мережах БпЛА 38 омсбр); живий аналітик 06.09.2026: лейтенант, заступник командира 1 шр \"V\"",
+   "why": "POW debrief (Харін, 38 омсбр, 08.11.2026): «командир взводу на позивний Гринч» formed the new arrivals into groups of 4 at Суженка, 16.02.2026. Owner 12.11.2026: debriefs outrank the older analyst note. Formation widened from «1 шр 38 омсбр» to «38 омсбр» so it reaches the 435/443 net where he is actually heard. Pinned to the 435/443 net with add_to_net: he is not in the archive roster there, and without it the roles register inserted him first as plain «ком склад».",
+   "freqs": [
+    "435.0700",
+    "435.0750",
+    "437.0650",
+    "443.0700",
+    "443.0710",
+    "445.0710",
+    "461.0710"
+   ],
+   "add_to_net": true
+  },
+  {
+   "callsign": "ПСИХ",
+   "formation": "38 омсбр",
+   "role": "командир 2 шв",
+   "source": "допит 08.11.2026",
+   "date": "2026-11-08",
+   "archive_said": "ком склад",
+   "why": "POW debrief (Харін, 38 омсбр, 08.11.2026): «командир 2 шв на позивний Псих» met the group at Пологи and sent it on the route (February 2026). On air he is the voice that leads groups on 435/443 (11-12.11.2026). Owner 12.11.2026: debriefs outrank older notes. Pinned to the 435/443 net with add_to_net: he is not in the archive roster there, and without it the roles register inserted him first as plain «ком склад».",
+   "freqs": [
+    "435.0700",
+    "435.0750",
+    "437.0650",
+    "443.0700",
+    "443.0710",
+    "445.0710",
+    "461.0710"
+   ],
    "add_to_net": true
   },
   {
@@ -93,6 +122,154 @@
    "date": "2026-11-08",
    "archive_said": "накопичувач(?) - звіти аналітика 14.08-24.08",
    "why": "Серпень-вересень: старший точки (розміщував людей, ставив чергування). Жовтень: рядовий, його водять («карандаши Марк і Леший» до ТОЛСТОГО, 26.10). Архівна роль застаріла, власник наказав зняти."
+  },
+  {
+   "callsign": "ВУЛКАН",
+   "formation": "1198 мсп",
+   "freqs": [
+    "467.2251",
+    "467.2252"
+   ],
+   "role": "командир батальйону (?)",
+   "source": "ефір 16.11.2026, власник",
+   "date": "2026-11-16",
+   "archive_said": "немає",
+   "add_to_net": true,
+   "why": "16.11 14:36 on 467.2251: «Историк стал комбатом? Он командир седьмой роты, комбат у нас Вулкан вроде бы» - one hearsay mention with «вроде бы». Owner 16.11.2026: print the post, but with (?) until it is confirmed; ІСТОРИК (командир 7 роти) is clear and goes in without a mark via the roles register."
+  },
+  {
+   "formation": "1198 мсп",
+   "freqs": [
+    "467.2251",
+    "467.2252"
+   ],
+   "source": "ефір 16.11.2026, власник",
+   "date": "2026-11-16",
+   "archive_said": "немає",
+   "add_to_net": true,
+   "callsign": "СУХОЙ",
+   "role": "командир роти (?)",
+   "why": "16.11 09:36 «командир Сухой» and 21:29 «ротный получается у нас Сухой… если я правильно понял». Owner 17.11.2026: with (?). Namesake СУХОЙ on 38 омсбр 425.8250 (9-10.11) is another man - pinned by freqs."
+  },
+  {
+   "formation": "1198 мсп",
+   "freqs": [
+    "467.2251",
+    "467.2252"
+   ],
+   "source": "ефір 16.11.2026, власник",
+   "date": "2026-11-16",
+   "archive_said": "немає",
+   "add_to_net": true,
+   "callsign": "КРАТОС",
+   "role": "заступник командира роти (замполіт) (?)",
+   "why": "16.11 21:29 «замполит Кратос… если я правильно понял». Owner 17.11.2026: with (?)."
+  },
+  {
+   "formation": "1198 мсп",
+   "freqs": [
+    "467.2251",
+    "467.2252"
+   ],
+   "source": "ефір 16.11.2026, власник",
+   "date": "2026-11-16",
+   "archive_said": "немає",
+   "add_to_net": true,
+   "callsign": "ИСТОРИК",
+   "role": "командир роти (7 рота)",
+   "why": "16.11 14:36 «Он командир седьмой роты» - clear (owner 16.11.2026: no mark). The register files him under unit «7 рота», which no header carries, so without this note he never printed. Namesake ИСТОРИК on 60 омсбр nets - pinned by freqs."
+  },
+  {
+   "callsign": "ЧЕРКЕС",
+   "formation": "1198 мсп",
+   "role": "командир 1 мср 1 мсб",
+   "source": "допит 19.11.2026",
+   "date": "2026-11-19",
+   "archive_said": "немає",
+   "why": "POW debriefs 19-20.11.2026 (Ремінний «Муром», Хілік «Август», Безуглов «Тёра», 1 мср 1 мсб 1198 мсп, captured 18.11 near Преображенка). Owner 21.11.2026: add the posts; debriefs outrank older notes. Named «капітан, командир 1 мср 1 мсб» by all three. He sent the group to point 316 and wrote the drone-dropped note with their orders. Heard on 445.5000; namesake on 38 омсбр nets - pinned by freqs.",
+   "freqs": [
+    "445.5000",
+    "164.7250",
+    "164.7249"
+   ],
+   "add_to_net": true
+  },
+  {
+   "callsign": "ОЛИМП",
+   "formation": "1198 мсп",
+   "role": "командир 1 мсб",
+   "source": "допит 19.11.2026",
+   "date": "2026-11-19",
+   "archive_said": "немає",
+   "why": "POW debriefs 19-20.11.2026 (Ремінний «Муром», Хілік «Август», Безуглов «Тёра», 1 мср 1 мсб 1198 мсп, captured 18.11 near Преображенка). Owner 21.11.2026: add the posts; debriefs outrank older notes. «майор, командир 1 мсб» (Хілік), «командир 1 мсб» (Ремінний). On air 18.11 03:42 on 445.5000 he called НАЗАР/ТЕРА himself.",
+   "freqs": [
+    "445.5000",
+    "164.7250",
+    "164.7249",
+    "467.2251",
+    "467.2252"
+   ],
+   "add_to_net": true
+  },
+  {
+   "callsign": "ВИНЧЕСТЕР",
+   "formation": "1198 мсп",
+   "role": "заступник командира 1 мср 1 мсб",
+   "source": "допит 19.11.2026",
+   "date": "2026-11-19",
+   "archive_said": "немає",
+   "why": "POW debriefs 19-20.11.2026 (Ремінний «Муром», Хілік «Август», Безуглов «Тёра», 1 мср 1 мсб 1198 мсп, captured 18.11 near Преображенка). Owner 21.11.2026: add the posts; debriefs outrank older notes. Named by all three; held the position the group was sent to (ймовірно лейтенант). 300 since 17.11 (stepped on an explosive, half a foot torn off) - already in ZVIT_18.11 from the air.",
+   "freqs": [
+    "445.5000",
+    "164.7250",
+    "164.7249"
+   ],
+   "add_to_net": true
+  },
+  {
+   "callsign": "ЕРМАК",
+   "formation": "1198 мсп",
+   "role": "командир полку",
+   "source": "допит 19.11.2026",
+   "date": "2026-11-19",
+   "archive_said": "немає",
+   "why": "POW debriefs 19-20.11.2026 (Ремінний «Муром», Хілік «Август», Безуглов «Тёра», 1 мср 1 мсб 1198 мсп, captured 18.11 near Преображенка). Owner 21.11.2026: add the posts; debriefs outrank older notes. «полковник, командир полку» (Ремінний, Безуглов). Named on 1198 net 142.5000 on 06.11; the ЕРМАК heard on 38 омсбр nets is not bound - pinned by freqs.",
+   "freqs": [
+    "142.5000",
+    "142.5001"
+   ],
+   "add_to_net": true
+  },
+  {
+   "callsign": "ВОЛГА",
+   "formation": "1198 мсп",
+   "role": "командир 3 мср (?)",
+   "source": "допит 19.11.2026",
+   "date": "2026-11-19",
+   "archive_said": "немає",
+   "why": "POW debriefs 19-20.11.2026 (Ремінний «Муром», Хілік «Август», Безуглов «Тёра», 1 мср 1 мсб 1198 мсп, captured 18.11 near Преображенка). Owner 21.11.2026: add the posts; debriefs outrank older notes. «імовірно командир 3 мср» in all three - hence (?). Pinned to 1198 мсп nets only; 433.4172 is also signed 38 омсбр by some analysts.",
+   "freqs": [
+    "445.5000",
+    "164.7249",
+    "164.7250",
+    "433.4150",
+    "433.4172",
+    "433.4200"
+   ],
+   "add_to_net": true
+  },
+  {
+   "callsign": "МИРОН",
+   "formation": "1198 мсп",
+   "role": "заступник командира роти (замполіт) (?)",
+   "source": "допит 19.11.2026",
+   "date": "2026-11-19",
+   "archive_said": "немає",
+   "why": "POW debriefs 19-20.11.2026 (Ремінний «Муром», Хілік «Август», Безуглов «Тёра», 1 мср 1 мсб 1198 мсп, captured 18.11 near Преображенка). Owner 21.11.2026: add the posts; debriefs outrank older notes. Хілік: «заступник командира з політичної роботи однієї з мср 1198 мсп» - which company is not known, hence (?). Heard on 445.5000; the МИРОН on 445.0710/461.0710 (38 омсбр) is not bound.",
+   "freqs": [
+    "445.5000"
+   ],
+   "add_to_net": true
   }
  ],
  "codes": [
@@ -127,6 +304,166 @@
    "date": "2026-10-01",
    "evidence": "25.09 «над нами висит заяц чужой»; 27.09 «наш заяц справа от тебя, висит над океаном, смотрит за вами»; 28.09 «чей Заяц пролетел?»; 29.09 «заяц Союзный»; 01.10 «наш заяц за тобой наблюдает»",
    "note": "на 437.0650 (1198 мсп) ЗАЯЦ - це людина (старший проміжного укриття), не борт | У звіт іде коротке читання; що буває «наш», «союзний» і «чужий» - лишається в knowledge/upstream/callsign-observations.md, у рядок легенди не йде."
+  },
+  {
+   "code": "ВОЗДУХ-1111",
+   "meaning": "противник (СОУ) завдає повітряного удару",
+   "formation": "60 омсбр",
+   "when_used": true,
+   "source": "таблиця сигналів 60 омсбр, фото 18.11.2026 (трансфер), glossary.db",
+   "date": "2026-11-18"
+  },
+  {
+   "code": "КУПОЛ-37",
+   "meaning": "циркулярний сигнал",
+   "formation": "60 омсбр",
+   "when_used": true,
+   "source": "таблиця сигналів 60 омсбр, фото 18.11.2026 (трансфер), glossary.db",
+   "date": "2026-11-18"
+  },
+  {
+   "code": "130",
+   "meaning": "доповідь про готовність до роботи",
+   "formation": "60 омсбр",
+   "when_used": true,
+   "source": "таблиця сигналів 60 омсбр, фото 18.11.2026 (трансфер), glossary.db",
+   "date": "2026-11-18"
+  },
+  {
+   "code": "44",
+   "meaning": "доповісти обстановку",
+   "formation": "60 омсбр",
+   "when_used": true,
+   "source": "таблиця сигналів 60 омсбр, фото 18.11.2026 (трансфер), glossary.db",
+   "date": "2026-11-18"
+  },
+  {
+   "code": "55",
+   "meaning": "обстановка спокійна",
+   "formation": "60 омсбр",
+   "when_used": true,
+   "source": "таблиця сигналів 60 омсбр, фото 18.11.2026 (трансфер), glossary.db",
+   "date": "2026-11-18"
+  },
+  {
+   "code": "54",
+   "meaning": "обстановка напружена",
+   "formation": "60 омсбр",
+   "when_used": true,
+   "source": "таблиця сигналів 60 омсбр, фото 18.11.2026 (трансфер), glossary.db",
+   "date": "2026-11-18"
+  },
+  {
+   "code": "66",
+   "meaning": "виявив БпЛА «Баба-Яга»",
+   "formation": "60 омсбр",
+   "when_used": true,
+   "source": "таблиця сигналів 60 омсбр, фото 18.11.2026 (трансфер), glossary.db",
+   "date": "2026-11-18"
+  },
+  {
+   "code": "67",
+   "meaning": "виявив БпЛА FPV",
+   "formation": "60 омсбр",
+   "when_used": true,
+   "source": "таблиця сигналів 60 омсбр, фото 18.11.2026 (трансфер), glossary.db",
+   "date": "2026-11-18"
+  },
+  {
+   "code": "69",
+   "meaning": "виявив БпЛА літакового типу",
+   "formation": "60 омсбр",
+   "when_used": true,
+   "source": "таблиця сигналів 60 омсбр, фото 18.11.2026 (трансфер), glossary.db",
+   "date": "2026-11-18"
+  },
+  {
+   "code": "222",
+   "meaning": "відпрацював по повітряній цілі",
+   "formation": "60 омсбр",
+   "when_used": true,
+   "source": "таблиця сигналів 60 омсбр, фото 18.11.2026 (трансфер), glossary.db",
+   "date": "2026-11-18"
+  },
+  {
+   "code": "333",
+   "meaning": "відпрацював по повітряній цілі, не збив",
+   "formation": "60 омсбр",
+   "when_used": true,
+   "source": "таблиця сигналів 60 омсбр, фото 18.11.2026 (трансфер), glossary.db",
+   "date": "2026-11-18"
+  },
+  {
+   "code": "88",
+   "meaning": "готовність №1 (зустрічайте ВВСТ)",
+   "formation": "60 омсбр",
+   "when_used": true,
+   "source": "таблиця сигналів 60 омсбр, фото 18.11.2026 (трансфер), glossary.db",
+   "date": "2026-11-18"
+  },
+  {
+   "code": "501",
+   "meaning": "рух ВВСТ",
+   "formation": "60 омсбр",
+   "when_used": true,
+   "source": "таблиця сигналів 60 омсбр, фото 18.11.2026 (трансфер), glossary.db",
+   "date": "2026-11-18"
+  },
+  {
+   "code": "502",
+   "meaning": "рух о\\с",
+   "formation": "60 омсбр",
+   "when_used": true,
+   "source": "таблиця сигналів 60 омсбр, фото 18.11.2026 (трансфер), glossary.db",
+   "date": "2026-11-18"
+  },
+  {
+   "code": "510",
+   "meaning": "ВВСТ пройшло пост",
+   "formation": "60 омсбр",
+   "when_used": true,
+   "source": "таблиця сигналів 60 омсбр, фото 18.11.2026 (трансфер), glossary.db",
+   "date": "2026-11-18"
+  },
+  {
+   "code": "520",
+   "meaning": "о\\с пройшов пост",
+   "formation": "60 омсбр",
+   "when_used": true,
+   "source": "таблиця сигналів 60 омсбр, фото 18.11.2026 (трансфер), glossary.db",
+   "date": "2026-11-18"
+  },
+  {
+   "code": "404",
+   "meaning": "витрачено боєприпаси",
+   "formation": "60 омсбр",
+   "when_used": true,
+   "source": "таблиця сигналів 60 омсбр, фото 18.11.2026 (трансфер), glossary.db",
+   "date": "2026-11-18"
+  },
+  {
+   "code": "112",
+   "meaning": "потрібна медична допомога",
+   "formation": "60 омсбр",
+   "when_used": true,
+   "source": "таблиця сигналів 60 омсбр, фото 18.11.2026 (трансфер), glossary.db",
+   "date": "2026-11-18"
+  },
+  {
+   "code": "621",
+   "meaning": "СОУ відпрацювали по ВВСТ",
+   "formation": "60 омсбр",
+   "when_used": true,
+   "source": "таблиця сигналів 60 омсбр, фото 18.11.2026 (трансфер), glossary.db",
+   "date": "2026-11-18"
+  },
+  {
+   "code": "613",
+   "meaning": "СОУ відпрацювали по о\\с",
+   "formation": "60 омсбр",
+   "when_used": true,
+   "source": "таблиця сигналів 60 омсбр, фото 18.11.2026 (трансфер), glossary.db",
+   "date": "2026-11-18"
   }
  ]
 }

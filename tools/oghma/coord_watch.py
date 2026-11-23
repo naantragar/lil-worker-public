@@ -69,12 +69,38 @@ NUM_MGRS = re.compile(r"\b\d{2}\s?[A-ZА-Я]{1,3}\s?\d{4,6}\s?\d{4,6}\b")
 NOT_COORD = re.compile(r"\b(?:200|300|400|450|202|303|412|415|55|44|54|33|22|11)\b")
 # A Russian mobile number dictated on air («продиктую… 8 914 017 47 7») is not a map reading; kept in
 # step with tools/alerts/safety_net.py, where it raised a false «координати» on 21.10.2026.
-PHONE = re.compile(r"(?<!\d)(?:\+7|8)[ \-]?\(?9\d{2}\)?(?:[ \-]?\d){5,8}(?!\d)")
+# Second form, added 20.11.2026: the same number dictated WITHOUT the 8 («923 509 83 98») — exactly
+# ten digits starting with 9. It raised four false «координати» in 60 days; no map reading in this
+# corpus has that shape (grids start 5x/6x/7x, degrees 4x/3x).
+PHONE = re.compile(r"(?<!\d)(?:(?:\+7|8)[ \-]?\(?9\d{2}\)?(?:[ \-]?\d){5,8}"
+                   r"|9\d{2}(?:[ \-]?\d){7})(?!\d)")
+# A speech line that is plainly about a phone or a messenger carries no coordinates, whatever the
+# digits look like — unless it ALSO names the coordinate procedure itself.
+PHONE_CTX = re.compile(r"номер|телефон|звони|позвон|вконтакт|одноклас|ватсап|whatsapp|телег", re.I)
+COORD_STRONG = re.compile(r"координат|харитон|ульян|прив['’я]?язк", re.I)
+
+
+def strip_phones(text: str) -> str:
+    """Remove phone numbers, line by line, before any coordinate test."""
+    out = []
+    for line in (text or "").split("\n"):
+        if PHONE_CTX.search(line) and not COORD_STRONG.search(line):
+            line = re.sub(r"\d", " ", line)
+        # the same number said twice, once with a word for a digit («Двятьсот 50 289 33 22,
+        # дублирую 8 950 289 33 22») — a digit run inside a phone on the same line is that phone
+        phones = [re.sub(r"\D", "", m.group(0)) for m in PHONE.finditer(line)]
+        line = PHONE.sub(" ", line)
+        if phones:
+            line = re.sub(r"\d[\d \-]{4,}\d",
+                          lambda m: " " if any(re.sub(r"\D", "", m.group(0)) in p for p in phones)
+                          else m.group(0), line)
+        out.append(line)
+    return "\n".join(out)
 
 
 def digit_groups(text: str) -> list[str]:
     out = []
-    text = PHONE.sub(" ", text or "")
+    text = strip_phones(text)
     for rx in (NUM_MGRS, NUM_TRIPLE, NUM_PAIR):
         for m in rx.finditer(text):
             s = m.group(0).strip()
@@ -121,7 +147,7 @@ def candidates(lo: datetime, hi: datetime) -> list[dict]:
     found: dict[str, dict] = {}
     for group, body in rows:
         for rec in parse_message(body):
-            speech = " ".join(rec.get("speech") or [])
+            speech = "\n".join(rec.get("speech") or [])
             marks = " ".join([rec.get("comment_above") or ""] + (rec.get("marks") or []))
             nums = digit_groups(speech)
             if not nums:

@@ -125,6 +125,7 @@ def main() -> int:
     a = ap.parse_args()
 
     events = json.loads((OUT / f"ZVIT_{a.day}_events.json").read_text(encoding="utf-8"))
+    events = [e for e in events if not e.get("_carryover_dropped")]  # lines dropped from the report as yesterday's repeats (run.py drop_carryover) are not checked
     src = json.loads((OUT / f"ZVIT_{a.day}_sources.json").read_text(encoding="utf-8"))
 
     picked = []

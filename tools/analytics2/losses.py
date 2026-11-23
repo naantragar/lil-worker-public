@@ -136,6 +136,11 @@ def collect(events: list[dict]) -> dict:
     n_lines = 0
 
     for e in events:
+        # A man already counted in an earlier day's report whose state is merely re-reported today
+        # (ГУФ, БАЙКАЛ, 17.11.2026). Set by hand in the check pass; the owner does not want one
+        # wound counted on two days.
+        if e.get("_counted_before"):
+            continue
         raw = str(e.get("text") or "")
         # measurements are blanked here, once, so every pattern below sees only real codes
         text = _strip_measures(raw)

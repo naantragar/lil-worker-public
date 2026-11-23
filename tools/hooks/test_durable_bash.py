@@ -14,6 +14,9 @@ MUST_CONVERT = [
     "python3 tools/analytics_sense.py --from A --to B",
     "python3 tools/analytics2/movement_count.py --freq 445.5000 --days 2026-08-28",
     "nohup python3 tools/analytics2/run.py --day 2026-08-30",
+    # a loop / if body: the 23.11.2026 gap, a five-day report_pow loop ran inline
+    "for d in 19.11 20.11; do python3 tools/upstream/report_pow.py $d; done",
+    "if true; then python3 tools/analytics2/run.py --day 2026-11-23; fi",
 ]
 
 MUST_NOT_CONVERT = [
@@ -35,6 +38,9 @@ MUST_NOT_CONVERT = [
     # unrelated commands
     "python3 tools/memory_search.py search 'upstream'",
     "bot/run.sh restart",
+    "for f in x; do cat tools/analytics2/run.py; done",
+    "for d in a; do echo python3 tools/upstream/report_pow.py; done",
+    "for d in a; do python3 tools/upstream/report_pow.py $d --detect-only; done",
 ]
 
 # Services, not tasks. These must stay inline even when asked for in the background: a durable job

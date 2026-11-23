@@ -14,6 +14,7 @@ matrix/bot/matrix-bridge.pid
 matrix/logs/
 # Python
 bot/.venv/
+.venv/
 __pycache__/
 *.pyc
 # Logs & runtime

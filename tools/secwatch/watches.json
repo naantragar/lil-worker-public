@@ -10,5 +10,17 @@
     "fixed": "6.8.0-149",
     "stopgap_unit": "ipv4-options-drop.service",
     "stopgap_note": "nft rule drops inbound IPv4 TCP with IP options (upstream-system ops/server, ipv4-options-drop.service); remove with: systemctl disable --now ipv4-options-drop.service"
+  },
+  {
+    "id": "kernel-148-local-root",
+    "title": "Уязвимости ядра CVE-2026-74469 / 80844 / 81000 (получение root изнутри)",
+    "cve": "CVE-2026-74469",
+    "summary": "three local privilege escalations with public exploits: SCTP diag (no namespaces needed), IPv6 AH and TUN (need user namespaces, softened by AppArmor); all fixed in 6.8.0-148",
+    "package": "linux",
+    "release": "noble",
+    "meta": "linux-image-virtual",
+    "fixed": "6.8.0-148",
+    "stopgap_file": "/etc/modprobe.d/cve-2026-74469-sctp.conf",
+    "stopgap_note": "modprobe refuses sctp/sctp_diag (/etc/modprobe.d/cve-2026-74469-sctp.conf, upstream-system ops/server); remove after 148+ runs. The other two have no stopgap beyond AppArmor's userns restriction."
   }
 ]

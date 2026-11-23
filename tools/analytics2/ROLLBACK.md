@@ -90,3 +90,46 @@ in `build_report()` that print the frequency line and the net name. Nothing else
 
 - `20260831-8cc98690` — the same rules, before the log-truncation fix. No reason to go back this far.
 - Older ids under `.versions/` correspond to the register/footer work of 24-30.08.
+
+## Lead-in repeats dropped (13.11.2026, owner)
+
+The 60-minute lead-in re-read yesterday's tail, so every report repeated 3-5 of yesterday's lines
+(11-13.11), and a repeated 300 was counted in two days' losses. `drop_carryover()` removes from the
+REPORT (not from the events file) a line timed before the window start whose every `_src_ref` was
+already under a line of yesterday's report. A line with one new intercept stays; a fact yesterday
+missed stays. Dropped lines are flagged `_carryover_dropped` and listed in `_dubli.txt`; the
+check/audit/cleanup/focus passes skip them. Rollback: `CARRYOVER_DROP = False` in run.py.
+First run (13.11): РЕПЧИК 300, КЛИМ, ШКЕТ dropped; ДОЦЕНТ 300 removed by hand (partial repeat).
+
+## Posts learned from the air stay in the header for 30 days (17.11.2026, owner)
+
+Commanders are talked about, not heard («ротный у нас Сухой», «замполит Кратос», «комбат у нас
+Вулкан вроде бы»), so the activity filter dropped them from the header the day after. Now a post from
+the roles register (`posada`, dated by its evidence refs) and a dated post in `callsign_notes.json`
+are kept for `POST_KEEP_DAYS` (30, cut to 14 the same day) after we learned them, on the block their evidence was heard on.
+Rollback: `POST_KEEP_DAYS = 0`. Also `losses.py` skips an event flagged `_counted_before` (a wounded
+man already counted in an earlier day's report; set by hand in the check pass).
+
+## Signal tables from the owner reach the report legend (18.11.2026)
+
+The 60 омсбр signal table (20 codes, photo via the transfer group) lives in glossary.db AND in
+`callsign_notes.json` → `codes` with `"when_used": true`, formation-scoped. Such a code corrects an
+existing legend line at once («54»/«55» «стан справ» → «обстановка напружена/спокійна») and is ADDED
+to a block's legend only when that block's own lines use it (`used_external_codes`), so a brigade
+table does not dump twenty codes under every net. Rollback: delete those entries from `codes`.
+How we add the next table: read it, write glossary.db (ingest.write_entries) + the same codes here.
+
+## Leader dominance over «накопичувач» (owner, 23.11.2026)
+
+`LEADER_DOMINANCE = 5` in run.py: when a man's «ком склад» evidence in roles.db outnumbers his
+«накопичувач» evidence 5:1 or more, the block header prints only «ком склад». Reason: men who lead
+others dozens of times (КОВБОЙ 53 / УРАЛ 49 episodes, 70 мсп) crossed the accumulator threshold (3)
+only because people walk to THEIR position - a command post, not a gathering point. Header-only;
+roles.db keeps both verdicts. At introduction it changed КОВБОЙ and УРАЛ; ПЧЕЛА (19:8) and ШИП (5:7)
+keep both. Rollback: `LEADER_DOMINANCE = 0`.
+
+## «ком склад (?)» beside «накопичувач» (owner, 23.11.2026)
+
+`DOUBLE_ROLE_MARK = True` in run.py: when a header row still carries both «ком склад» and
+«накопичувач» after the dominance rule, «ком склад» is printed «ком склад (?)» - the man may be an
+accumulator who also leads a platoon or squad. First case: ПЧЕЛА (70 мсп, 19:8). Rollback: False.

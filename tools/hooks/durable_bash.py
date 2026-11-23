@@ -164,6 +164,7 @@ def _never(command: str) -> dict | None:
 #    that is being RUN always has one of those in front of it.
 RE_INVOKED = re.compile(
     r"(?:^|[;&|]+|\n)\s*"                                  # start of a command segment
+    r"(?:(?:do|then|else|\{|\(|!)\s+)*"                     # loop/if bodies: `; do python3 X` (23.11.2026)
     r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"                  # VAR=value prefixes
     r"(?:(?:timeout|sudo|nice|ionice|nohup|env|time|stdbuf|setsid)\s+"
     r"(?:-\S+\s+|\d+(?:\.\d+)?[smhd]?\s+)*)*"              # wrappers with their own flags
@@ -197,6 +198,7 @@ READ_ONLY_VERBS = {
 }
 RE_SEGMENT_HEAD = re.compile(
     r"(?:^|[;&|]+|\n)\s*"
+    r"(?:(?:do|then|else|\{|\(|!)\s+)*"
     r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"
     r"(?:(?:timeout|sudo|nice|ionice|nohup|env|time|stdbuf|setsid)\s+"
     r"(?:-\S+\s+|\d+(?:\.\d+)?[smhd]?\s+)*)*"
@@ -316,8 +318,13 @@ def main() -> None:
     # wake turn, because the check is only as good as the context behind it.
     argv = [sys.executable, str(JOB_CTL), "launch", "--cmd", command,
             "--label", label[:40], "--cwd", str(cwd), "--wake"]
-    followup = ((entry or {}).get("followup") or "").strip()
-    if followup:
+    # `"followup": false` = the wake report is the whole answer; without it job_ctl adds its generic
+    # "розкажи, що це означає" turn, which for a plain status job repeated the wake report word for
+    # word (after_footer.sh, owner noticed 14.11.2026).
+    raw_followup = (entry or {}).get("followup")
+    if raw_followup is False:
+        argv += ["--no-followup"]
+    elif (followup := str(raw_followup or "").strip()):
         argv += ["--followup", followup]
     try:
         res = subprocess.run(

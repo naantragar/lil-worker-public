@@ -86,7 +86,10 @@ def observe_kernel_cve(w: dict) -> dict:
     # without the package list the advice would blame the kernel for it.
     pkgs = Path("/var/run/reboot-required.pkgs")
     o["reboot_pkgs"] = sorted(set(pkgs.read_text().split()))[:10] if o["reboot_required"] and pkgs.exists() else []
-    o["stopgap_active"] = sh("systemctl", "is-active", w["stopgap_unit"]).strip() == "active"
+    if w.get("stopgap_unit"):
+        o["stopgap_active"] = sh("systemctl", "is-active", w["stopgap_unit"]).strip() == "active"
+    else:  # a stopgap that is a config file (e.g. a modprobe block), not a unit
+        o["stopgap_active"] = Path(w["stopgap_file"]).exists()
     return o
 
 
@@ -186,6 +189,95 @@ KEYS = ("ubuntu_status", "ubuntu_version", "meta_candidate", "newest_installed_i
         "reboot_required", "stopgap_active")
 
 
+KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+KEV_MATCH = HERE / "kev_match.json"
+
+
+def check_kev(state: dict, dry: bool) -> None:
+    """Daily: new entries in CISA's Known Exploited Vulnerabilities list that name software we run.
+    First run = baseline only. A match gets model advice (are we affected, what to do), else silence."""
+    st = state.setdefault("_kev", {})
+    today = datetime.now().strftime("%Y-%m-%d")
+    if st.get("checked") == today and not dry:
+        return
+    try:
+        req = urllib.request.Request(KEV_URL, headers={"User-Agent": "krevetka-secwatch"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            vulns = json.load(r).get("vulnerabilities", [])
+    except Exception as e:
+        log(f"kev: fetch failed {type(e).__name__}")
+        return
+    ids = {v["cveID"] for v in vulns}
+    seen = set(st.get("seen", []))
+    cfg = json.loads(KEV_MATCH.read_text(encoding="utf-8"))
+    pats = [re.compile(p, re.I) for p in cfg["patterns"]]
+    new = [v for v in vulns if v["cveID"] not in seen] if seen else []
+    hits = [v for v in new if any(p.search(f"{v.get('vendorProject')} {v.get('product')}") for p in pats)]
+    # Ask Ubuntu about each hit: an entry already fixed on this box is not news, stay silent about it.
+    open_hits = []
+    for v in hits:
+        v["_ubuntu"] = ubuntu_verdict(v["cveID"])
+        if not v["_ubuntu"].startswith("уже исправлено"):
+            open_hits.append(v)
+    log(f"kev: {len(vulns)} total, {len(new)} new, {len(hits)} match ours, {len(open_hits)} not fixed here")
+    hits = open_hits
+    if hits:
+        lines = "\n".join(f"- {v['cveID']}: {v.get('vendorProject')} {v.get('product')} - {v.get('vulnerabilityName')}"
+                          f" [Ubuntu 24.04: {v['_ubuntu']}]" for v in hits[:8])
+        prompt = (
+            "Ты помощник администратора сервера Ubuntu 24.04. CISA добавила в список РЕАЛЬНО эксплуатируемых "
+            "уязвимостей записи, которые касаются программ, установленных на сервере. Напиши владельцу 3-6 "
+            "коротких строк по-русски простыми словами: что это, насколько вероятно, что сервер затронут, "
+            "и что разумно сделать (обновление пакетов обычно ставится само ночью; ядро требует перезагрузки). "
+            "Не выдумывай версий и фактов. Только обычные дефисы, без markdown.\n\n"
+            f"Наше ПО: {cfg['ours']}\n\nНовые записи KEV:\n{lines}\n")
+        text = model_text(prompt) or "Проверить вручную: спросите основного бота."
+        msg = f"{HEAD}\nНовое в списке реально эксплуатируемых уязвимостей (CISA KEV):\n{lines}\n\n{text}"
+        if dry:
+            print(msg + "\n---")
+        elif not send(msg):
+            return  # not delivered -> keep old state, retry next run
+    if not dry:
+        st["seen"], st["checked"] = sorted(ids), today
+
+
+def ubuntu_verdict(cve: str) -> str:
+    """One line from Ubuntu's own CVE data for noble, checked against what is installed/running here."""
+    try:
+        req = urllib.request.Request(f"https://ubuntu.com/security/cves/{cve}.json",
+                                     headers={"User-Agent": "krevetka-secwatch"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            d = json.load(r)
+    except Exception:
+        return "нет данных Ubuntu"
+    out = []
+    for p in d.get("packages", []):
+        for s in p.get("statuses", []):
+            if s.get("release_codename") != "noble" or s.get("status") in ("DNE", "not-affected", "ignored"):
+                continue
+            name, st, ver = p.get("name"), s.get("status"), s.get("description") or ""
+            if name == "linux" and st == "released" and ver_tuple(os.uname().release) >= ver_tuple(ver):
+                return f"уже исправлено (ядро {ver}, у нас {os.uname().release})"
+            if st == "released":
+                inst = sh("dpkg-query", "-W", "-f=${Version}", name).strip()
+                if inst and subprocess.run(["dpkg", "--compare-versions", inst, "ge", ver]).returncode == 0:
+                    return f"уже исправлено ({name} {ver}, у нас {inst})"
+            out.append(f"{name}: {st} {ver}".strip())
+    return "; ".join(out[:3]) or "Ubuntu не считает 24.04 затронутой"
+
+
+def model_text(prompt: str) -> str:
+    try:
+        p = subprocess.run(["claude", "-p", "--model", "claude-opus-5-5", "--effort", "medium",
+                            "--disallowedTools", "Bash", "Edit", "Write", "Read", "Glob", "Grep",
+                            "WebFetch", "WebSearch", "Task"],
+                           input=prompt, capture_output=True, text=True, timeout=240, cwd="/tmp")
+        text = (p.stdout or "").strip().replace("—", "-").replace("–", "-")
+        return text if p.returncode == 0 and 20 < len(text) < 1500 else ""
+    except Exception:
+        return ""
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry", action="store_true")
@@ -240,6 +332,8 @@ def main() -> int:
         if a.dry:
             print(json.dumps({"stage": stage, **o}, ensure_ascii=False, indent=1))
 
+    if not a.test:
+        check_kev(state, a.dry)
     if not a.dry and not a.test:
         STATE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
     return 0

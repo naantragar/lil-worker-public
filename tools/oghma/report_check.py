@@ -61,8 +61,12 @@ FORBIDDEN = [
      "«крестик» - це ПЕРЕХРЕСТЯ лісосмуг/доріг, загальна назва, а не ім'я точки (1904 перехоплення, "
      "координат нема ні однієї; вони кажуть «на наступному перекрестку» і в множині). Пишеться "
      "«перехрестя», ніколи «ор КРЕСТИК» чи «т крестик»"),
+    # Narrowed 18.11.2026 (owner): in the artillery fire-mission net «открытка» is the set of digits
+    # dictated after the target («Цель Пегас 3… открытку готов записать? - 540 8 32 6»), not a field.
+    # A line naming a «ціль» and carrying digits right after «открытк…» is that case and passes.
     (r"открытк",
-     "«открытка» - це ВІДКРИТА МІСЦЕВІСТЬ, поле, а не точка. «т «открытка»» - вигаданий пункт"),
+     "«открытка» - це ВІДКРИТА МІСЦЕВІСТЬ, поле, а не точка. «т «открытка»» - вигаданий пункт "
+     "(виняток - мережа вогневих задач: «открытка» + цифри поруч з «ціль»)"),
     (r"\bнорк",
      "«норка» - це УКРИТТЯ або ЯМА, кличка нічого не додає"),
     (r"полочк",
@@ -219,6 +223,7 @@ def main() -> int:
     ev_path = Path(a.events) if a.events else OUT / f"ZVIT_{a.day}_events.json"
     src_path = OUT / f"ZVIT_{a.day}_sources.json"
     events = json.loads(ev_path.read_text(encoding="utf-8"))
+    events = [e for e in events if not e.get("_carryover_dropped")]  # yesterday's repeats, not in the report
     src = json.loads(src_path.read_text(encoding="utf-8"))
 
     corpus = corpus_vocab()
@@ -244,6 +249,8 @@ def main() -> int:
         sev = 0
 
         for f_re, why in FORBIDDEN:
+            if f_re == r"открытк" and "ціл" in low and re.search(r"открытк\w*»?[^\d]{0,6}\d{3}", low):
+                continue        # fire-mission «открытка» + digits next to a «ціль» (18.11.2026)
             if re.search(f_re, low):
                 reasons.append("ЗАБОРОНЕНЕ ФОРМУЛЮВАННЯ: " + why)
                 sev += 9

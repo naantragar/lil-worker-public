@@ -59,13 +59,35 @@ NOT_COORD = re.compile(r"\b(?:200|300|400|450|202|303|412|415|55|44|54|33|22|11)
 # A Russian mobile number dictated on air («продиктую… 8 914 017 47 7») — 8 / +7, then 9xx, then the
 # rest; 9-11 digits in total because the transcript drops one. Stripped before the coordinate test:
 # on 21.10.2026 it fired the net as «координати» (both models had read it right as a phone number).
-PHONE = re.compile(r"(?<!\d)(?:\+7|8)[ \-]?\(?9\d{2}\)?(?:[ \-]?\d){5,8}(?!\d)")
+# 20.11.2026: also the bare ten-digit form without the 8 («923 509 83 98»), and a line that is
+# plainly about a phone/messenger is dropped whole — same as coord_watch.strip_phones().
+PHONE = re.compile(r"(?<!\d)(?:(?:\+7|8)[ \-]?\(?9\d{2}\)?(?:[ \-]?\d){5,8}"
+                   r"|9\d{2}(?:[ \-]?\d){7})(?!\d)")
+PHONE_CTX = re.compile(r"номер|телефон|звони|позвон|вконтакт|одноклас|ватсап|whatsapp|телег", re.I)
+COORD_STRONG = re.compile(r"координат|харитон|ульян|прив['’я]?язк", re.I)
+
+
+def _strip_phones(text: str) -> str:
+    out = []
+    for line in (text or "").split("\n"):
+        if PHONE_CTX.search(line) and not COORD_STRONG.search(line):
+            line = re.sub(r"\d", " ", line)
+        # the same number said twice, once with a word for a digit («Двятьсот 50 289 33 22,
+        # дублирую 8 950 289 33 22») — a digit run inside a phone on the same line is that phone
+        phones = [re.sub(r"\D", "", m.group(0)) for m in PHONE.finditer(line)]
+        line = PHONE.sub(" ", line)
+        if phones:
+            line = re.sub(r"\d[\d \-]{4,}\d",
+                          lambda m: " " if any(re.sub(r"\D", "", m.group(0)) in p for p in phones)
+                          else m.group(0), line)
+        out.append(line)
+    return "\n".join(out)
 
 
 def _coord_hit(text: str) -> bool:
     if not FRAME.search(text):
         return False
-    probe = NOT_COORD.sub(" ", PHONE.sub(" ", text))
+    probe = NOT_COORD.sub(" ", _strip_phones(text))
     return bool(NUM_TRIPLE.search(probe) or NUM_PAIR.search(probe))
 
 

@@ -258,7 +258,9 @@ def cmd_launch(args: argparse.Namespace) -> None:
         # chat context); a follow-up like "перепроверь отчёт" is worthless without that context —
         # the whole value of the owner typing it by hand is that I remember what we changed today.
         # So this one runs in the live session instead. Empty = nothing happens (the default).
-        "followup": (args.followup or "").strip() or _default_followup(),
+        # --no-followup: the wake report says everything; the generic fallback would only repeat it.
+        "followup": "" if getattr(args, "no_followup", False)
+                    else ((args.followup or "").strip() or _default_followup()),
     }
     # spec.json + status MUST exist before the runner starts — run_job.sh reads the command out of
     # spec.json as its first action.
@@ -384,6 +386,8 @@ def main() -> None:
     p.add_argument("--force", action="store_true", help="launch even if another job is active")
     p.add_argument("--followup", help="text injected into the owner's LIVE chat session once the "
                                       "job's report has landed (as if he had typed it)")
+    p.add_argument("--no-followup", action="store_true",
+                   help="no follow-up turn at all, not even the generic fallback")
     p.add_argument("--wake", action="store_true",
                    help="on completion, wake an isolated claude turn to REPORT the result (v1)")
     p.set_defaults(func=cmd_launch)

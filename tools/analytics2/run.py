@@ -1203,7 +1203,21 @@ ROLES_DB = REPO / "knowledge" / "upstream" / "identity" / "roles.db"
 # role cleared) — the header lists only men whose role we know. This reverses the 21.08 decision to
 # print bare names (see `_pull_register`); False here brings them back.
 PRINT_BARE_CALLSIGNS = False
+# Owner, 13.11.2026: a line of the lead-in hour that yesterday's report already printed does not go
+# into today's (see `drop_carryover`). False brings the repeats back.
+CARRYOVER_DROP = True
+# Owner, 17.11.2026: a POST learned from the air («ротный у нас Сухой», «замполит Кратос») stays in
+# the block header for this many days after we learned it (30 -> 14 on 17.11.2026, owner), even if the man himself never keys the mic
+# - commanders are talked about, not heard. 0 = back to the plain activity filter.
+POST_KEEP_DAYS = 14
+_REPORT_TO: datetime | None = None   # set by build_report; the clock POST_KEEP_DAYS counts against
 ROLE_WORDS = {"komsklad": "ком склад", "nakopych": "накопичувач", "bpla_log": "БпЛА логістики"}
+# Owner, 23.11.2026: a man who LEADS people dozens of times (КОВБОЙ 53, УРАЛ 49 episodes) also
+# crossed the accumulator threshold (3) only because people walk to HIS position - his command post,
+# not a gathering point. When the «ком склад» evidence outweighs «накопичувач» this many times, the
+# header prints only «ком склад». The register itself keeps both. 0 = print both, as before.
+LEADER_DOMINANCE = 5
+DOUBLE_ROLE_MARK = True   # «ком склад (?)» beside «накопичувач» (owner, 23.11.2026); see overlay_roles
 
 
 @lru_cache(maxsize=1)
@@ -1227,16 +1241,23 @@ def our_roles() -> tuple:
     men: dict[tuple[str, str], dict] = {}
     for role, cs, unit, title, refs in rows:
         m = men.setdefault((cs, unit), {"callsign": cs, "unit": unit, "posts": [], "roles": [],
-                                        "freqs": set()})
+                                        "freqs": set(), "post_seen": [], "n": {}})
+        m["n"][role] = m["n"].get(role, 0) + 1
         if role == "posada":
             if title and title not in m["posts"]:
                 m["posts"].append(title)
+            m["post_seen"] += [r.split()[0] for r in json.loads(refs or "[]") if r.split()]
         elif ROLE_WORDS.get(role) and ROLE_WORDS[role] not in m["roles"]:
             m["roles"].append(ROLE_WORDS[role])
         for ref in json.loads(refs or "[]"):
             f = ref.split()[-1]
             if _is_float(f):
                 m["freqs"].add(float(f))
+    if LEADER_DOMINANCE:
+        for m in men.values():
+            lead, acc = m["n"].get("komsklad", 0), m["n"].get("nakopych", 0)
+            if acc and lead >= LEADER_DOMINANCE * acc and ROLE_WORDS["nakopych"] in m["roles"]:
+                m["roles"].remove(ROLE_WORDS["nakopych"])
     return tuple(men.values())
 
 
@@ -1247,6 +1268,45 @@ def _unit_in_head(unit: str, head: str) -> bool:
         return True
     h = " ".join(re.sub(r"[\"'«»()]", " ", head).casefold().split())
     return " ".join(unit.casefold().split()) in h
+
+
+def _ddmm_to_date(ddmm: str, ref: datetime) -> datetime | None:
+    """`16.11` (a ref's day, no year) -> the latest such date not after `ref`."""
+    try:
+        d = datetime.strptime(f"{ddmm}.{ref.year}", "%d.%m.%Y")
+    except ValueError:
+        return None
+    return d.replace(year=ref.year - 1) if d > ref + timedelta(days=1) else d
+
+
+def _post_fresh(days: list[str]) -> bool:
+    """True when a post was learned within POST_KEEP_DAYS of this report's end."""
+    if not POST_KEEP_DAYS or _REPORT_TO is None:
+        return False
+    seen = [d for d in (_ddmm_to_date(x, _REPORT_TO) for x in days) if d]
+    return bool(seen) and (_REPORT_TO - max(seen)).days <= POST_KEEP_DAYS
+
+
+def fresh_note_posts(net: str, freqs: list[str] | None) -> set[str]:
+    """Callsigns whose live-analyst/owner note for THIS block carries a post dated within
+    POST_KEEP_DAYS - kept through the activity filter like a register post (ВУЛКАН, 16.11)."""
+    out = set()
+    if not POST_KEEP_DAYS or _REPORT_TO is None:
+        return out
+    mine = [float(x) for x in (freqs or []) if _is_float(x)]
+    for rec in external_notes():
+        if not str(rec.get("role") or "").strip() or not _formation_matches(rec.get("formation", ""), net):
+            continue
+        if want := rec.get("freqs"):
+            if not any(abs(float(w) - m) * 1000 <= FREQ_TOL_KHZ for w in want if _is_float(w) for m in mine):
+                continue
+        try:
+            d = datetime.strptime(str(rec.get("date") or ""), "%Y-%m-%d")
+        except ValueError:
+            continue
+        if 0 <= (_REPORT_TO - d).days <= POST_KEEP_DAYS:
+            out.add(str(rec.get("callsign") or "").upper())
+    return out
 
 
 def overlay_roles(head: str, freqs: list[str], roster: list, heard: tuple[set[str], str]) -> list:
@@ -1273,15 +1333,17 @@ def overlay_roles(head: str, freqs: list[str], roster: list, heard: tuple[set[st
         if not _unit_in_head(m["unit"], head):
             continue
         g = qual.setdefault(_fold(m["callsign"]), {"callsign": m["callsign"], "posts": [], "roles": [],
-                                                    "here": False})
+                                                    "here": False, "post_seen": []})
         g["posts"] += [p for p in m["posts"] if p not in g["posts"]]
+        g["post_seen"] += m.get("post_seen", [])
         if any(abs(f - x) * 1000 <= FREQ_TOL_KHZ for f in m["freqs"] for x in mine):
             g["here"] = True
             g["roles"] += [r for r in m["roles"] if r not in g["roles"]]
     for g in qual.values():
         if not g["here"]:
             continue
-        if (names or blob) and not still_active(g["callsign"], names, blob):
+        if (names or blob) and not still_active(g["callsign"], names, blob) \
+                and not _post_fresh(g.get("post_seen") or []):
             continue
         # A post heard on air already says he commands people; «ком склад» beside «командир роти»
         # is the same fact twice (owner, 03.11.2026). «накопичувач» is a different function and stays.
@@ -1307,6 +1369,15 @@ def overlay_roles(head: str, freqs: list[str], roster: list, heard: tuple[set[st
                 out[hit] = (out[hit][0], was + ", " + ", ".join(extra), out[hit][2])
                 print(f"реєстр ролей: {out[hit][0]} у {netlabel(head, 40)} «{was}» + «{', '.join(extra)}»",
                       file=sys.stderr)
+    if DOUBLE_ROLE_MARK:
+        # Owner, 23.11.2026: a man who is BOTH «ком склад» and «накопичувач» after the dominance rule
+        # (ПЧЕЛА 19:8, ШИП 5:7) may be an accumulator who is also a platoon/squad leader - the
+        # «ком склад» half is a guess, so it is printed «ком склад (?)». False = print it plain.
+        for i, row in enumerate(out):
+            parts = [p.strip() for p in str(row[1] or "").split(",")]
+            if ROLE_WORDS["komsklad"] in parts and any(p.startswith(ROLE_WORDS["nakopych"]) for p in parts):
+                parts = [ROLE_WORDS["komsklad"] + " (?)" if p == ROLE_WORDS["komsklad"] else p for p in parts]
+                out[i] = (row[0], ", ".join(parts), *row[2:])
     return out
 
 
@@ -1445,9 +1516,35 @@ def _apply_external_codes(net: str, legend: list, freqs: list[str] | None) -> li
                 legend[i] = (c, meaning)
                 break
         else:
+            # `when_used`: a brigade-wide signal table (60 омсбр, 18.11.2026) would put twenty codes
+            # under every block of the brigade. Such a code only CORRECTS a legend line that already
+            # exists here; it is added fresh only by build_report, when the block's own lines use it.
+            if rec.get("when_used"):
+                continue
             legend.append((code, meaning))
             _log_note(f"код «{code}» ДОДАНО до {netlabel(net, 40)} - {meaning}")
     return legend
+
+
+def used_external_codes(net: str, freqs: list[str] | None, blob: str, have: set[str]) -> list:
+    """`when_used` codes of this block's formation that its own event lines actually mention."""
+    out = []
+    for rec in external_codes():
+        if not rec.get("when_used") or not _formation_matches(rec.get("formation", ""), net):
+            continue
+        if want := rec.get("freqs"):
+            mine = [float(x) for x in (freqs or []) if _is_float(x)]
+            if not any(abs(float(w) - m) * 1000 <= FREQ_TOL_KHZ
+                       for w in want if _is_float(w) for m in mine):
+                continue
+        code = str(rec.get("code") or "").strip()
+        meaning = " ".join(str(rec.get("meaning") or "").split())
+        if not code or not meaning or (_variants(code) & have):
+            continue
+        if re.search(rf"(?<![\d\w]){re.escape(code.lower())}(?![\d\w])", blob):
+            out.append((code, meaning))
+            have |= _variants(code)
+    return out
 
 
 _NOTE_LOGGED: set[str] = set()
@@ -1677,6 +1774,9 @@ def build_carryover_section(events: list[dict], dt_from: str) -> str:
 
     So the second pass is worth more than it costs, and the honest tool is visibility: name the
     lines, let the reader decide. Nothing here changes the report.
+
+    Since 13.11.2026 the narrow, safe part of this IS dropped — see `drop_carryover()`. This section
+    still lists every such line, and says which ones were dropped.
     """
     try:
         d = datetime.strptime(str(dt_from)[:10], "%Y-%m-%d")
@@ -1708,11 +1808,68 @@ def build_carryover_section(events: list[dict], dt_from: str) -> str:
     for e in twins:
         same = " ".join(str(e.get("text") or "").split()) in prev_text
         out.append(f"{e.get('time')} {e.get('text')}")
+        gone = " | ПРИБРАНО зі звіту (уже є у вчорашньому)" if e.get("_carryover_dropped") else ""
         out.append(f"    {'дослівно як учора' if same else 'формулювання ІНШЕ, ніж учора'}"
-                   f" | мережа: {netlabel(str(e.get('_net')))}")
+                   f" | мережа: {netlabel(str(e.get('_net')))}{gone}")
         out.append(f"    перехоплення: {', '.join((e.get('_src_ref') or [])[:4])}")
         out.append("")
     return "\n".join(out) + "\n"
+
+
+def event_dt(e: dict) -> datetime | None:
+    """`12.11.2026, 13:50` -> datetime; None when the model wrote the time some other way."""
+    m = re.search(r"(\d{2})\.(\d{2})\.(\d{4})\D+(\d{1,2}):(\d{2})", str(e.get("time") or ""))
+    if not m:
+        return None
+    d, mo, y, h, mi = map(int, m.groups())
+    try:
+        return datetime(y, mo, d, h, mi)
+    except ValueError:
+        return None
+
+
+def drop_carryover(events: list[dict], dt_from: str) -> tuple[list[dict], list[dict]]:
+    """Lines of the lead-in hour that yesterday's report already printed. Owner, 13.11.2026.
+
+    The lead-in (WINDOW_LEAD_IN_MIN) exists for intercepts that were posted too late for yesterday's
+    run. It also re-reads everything that was NOT late, so every report repeated 3-5 of yesterday's
+    lines (measured 11-13.11.2026) - and a repeated 300 is counted in two days' losses.
+
+    A line is dropped only when ALL of these hold, which is what keeps the September objections
+    (see `build_carryover_section`) out: it sits before the window start; every intercept under it
+    is one yesterday's LINES were built on (not merely read - so a fact yesterday missed survives).
+    Not keyed on the net label: the same intercept is filed under different header variants on
+    different days (ШКЕТ, 12/13.11), and a shared intercept address already means the same net.
+    A line with even one new intercept stays. Yesterday's line is already checked, audited and
+    cleaned, so keeping it over today's re-reading loses nothing. Dropped lines stay in the events
+    file and are named in `_dubli.txt`. `CARRYOVER_DROP = False` is the rollback.
+    """
+    if not CARRYOVER_DROP:
+        return events, []
+    try:
+        start = datetime.strptime(str(dt_from), "%Y-%m-%d %H:%M")
+        prev_path = OUT_DIR / f"ZVIT_{start:%d.%m}_events.json"
+        prev = json.loads(prev_path.read_text(encoding="utf-8")) if prev_path.exists() else []
+    except (ValueError, json.JSONDecodeError, OSError) as e:
+        print(f"звірка з учорашнім звітом для прибирання повторів не вийшла: {e!r}", file=sys.stderr)
+        return events, []
+    by_net: dict[str, set[str]] = defaultdict(set)
+    for p in prev:
+        if p.get("_carryover_dropped"):
+            continue
+        by_net[str(p.get("_net"))].update(p.get("_src_ref") or [])
+    seen = set().union(*by_net.values()) if by_net else set()
+    kept, dropped = [], []
+    for e in events:
+        e.pop("_carryover_dropped", None)
+        refs = set(e.get("_src_ref") or [])
+        t = event_dt(e)
+        if refs and t is not None and t < start and refs <= seen:
+            e["_carryover_dropped"] = True
+            dropped.append(e)
+        else:
+            kept.append(e)
+    return kept, dropped
 
 
 def build_sibling_nets_section(events: list[dict], freqs_of: dict[str, list[str]],
@@ -2520,6 +2677,8 @@ def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
     in time: the first is a normal line, the rest are indented under it. That is much easier to scan,
     and it costs the model nothing because it happens after it has finished.
     """
+    global _REPORT_TO
+    _REPORT_TO = datetime.strptime(dt_to, "%Y-%m-%d %H:%M")
     by_net: dict[str, list[dict]] = defaultdict(list)
     for e in events:
         by_net[e.get("_net") or "(без шапки)"].append(e)
@@ -2577,7 +2736,11 @@ def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
             cmd_names, cmd_blob = (heard_on(active_cmd, fr) if active_cmd else (names, blob))
             if names or blob:        # fail open: an empty lookup must not touch the register
                 kept, dropped = [], []
+                keep_notes = fresh_note_posts(net, fr)
                 for cs, role, older in roster:
+                    if str(cs).upper() in keep_notes:
+                        kept.append((cs, role, older))
+                        continue
                     if COMMAND_ROLE_RE.search(role or ""):
                         alive = still_active(cs, cmd_names, cmd_blob)
                     else:
@@ -2618,6 +2781,8 @@ def build_report(events: list[dict], freqs_of: dict[str, list[str]], band: str,
             if _stem(code) in blob_ev and _stem(code) not in have:
                 legend = list(legend) + [(code, meaning)]
                 have.add(_stem(code))
+        legend = list(legend) + used_external_codes(net, fr, blob_ev,
+                                                    set().union(*(_variants(c) for c, _ in legend)) if legend else set())
         for code, meaning in legend:
             styled.append((f"«{code}» - {meaning}" if meaning else f"«{code}»", False, False))
         # The analyst's own network-level remarks close the block, on their own lines — which is
@@ -2869,12 +3034,34 @@ def finish(a, recs: list[dict], units: list[dict], events: list[dict],
     if seam:
         print(f"злиття швів: -{len(seam)} → {len(events)} подій", file=sys.stderr)
 
+    # A line placed by hand under a net the clusterer folded elsewhere (15.11.2026: Patagonia signed
+    # the «Пегас 3» fire missions «38 омсбр», the clusterer merged them into the unsigned arty net) has
+    # no entry in freqs_of, and its block printed with no frequency line. Take the channels from its
+    # own intercept addresses instead.
+    freqs_of = dict(freqs_of)
+    for e in events:
+        net = e.get("_net")
+        if net and net not in freqs_of:
+            got = sorted({str(r).split()[-1] for r in (e.get("_src_ref") or []) if str(r).split()})
+            if got:
+                freqs_of[net] = got
+
+    # Yesterday's lines re-read through the lead-in hour. Dropped from the REPORT only: `events`
+    # keeps them (flagged), so the events file, the sources file and `_dubli.txt` still show them.
+    shown, carried = drop_carryover(events, a.dt_from)
+    for e in carried:
+        print(f"повтор учорашнього прибрано: {e.get('time')} {str(e.get('text'))[:70]}",
+              file=sys.stderr)
+    if carried:
+        print(f"повтори з години перекриття: -{len(carried)} (довідка у {a.out}_dubli.txt)",
+              file=sys.stderr)
+
     # On COPIES, deliberately. A layout reassigns `_net` to its own block keys, and the first
     # version of this wrote those keys straight into `<out>_events.json` — the next `--render-only`
     # then had no real network names left to group by and produced an empty report. The events file
     # is the record of what the model found; a presentation option must not be able to touch it.
     report_events, report_freqs, titles, order = apply_layout(
-        getattr(a, "layout", "current"), [dict(e) for e in events], recs, dict(freqs_of))
+        getattr(a, "layout", "current"), [dict(e) for e in shown], recs, dict(freqs_of))
     styled = build_report(report_events, report_freqs, a.band, a.dt_to,
                           activity_index(a.dt_to), titles, order,
                           activity_index(a.dt_to, COMMAND_ACTIVE_DAYS))
