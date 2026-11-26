@@ -111,6 +111,24 @@ SCRIPTS = [
      r'^MODEL = "([^"]+)"', r'^EFFORT = "([^"]+)"'),
     ("dream stories: gen.py", "~/dream_story_bot/gen.py",
      r'"--model", default="([^"]+)"', r'"--effort", default="([^"]+)"'),
+    # Hand-run upstream tools (twins start them on request). Listed since 26.11.2026: six of them sat on
+    # Sonnet 5 and two on Opus 5/high for weeks after everything else moved, because nothing looked.
+    ("tool: reading documents (glossary/ingest)", "tools/glossary/ingest.py",
+     r'"--model", default="([^"]+)"', r'"--effort", default="([^"]+)"'),
+    ("tool: code-word presort (glossary/beta)", "tools/glossary/beta.py",
+     r'def presort\(model: str = "([^"]+)"', r'effort: str = "([^"]+)"'),
+    ("tool: unsigned-net scanner", "tools/identity/unsigned_scan.py",
+     r'"--model-id", default="([^"]+)"', r'"--effort", default="([^"]+)"'),
+    ("tool: identity observations", "tools/identity/extract_observations.py",
+     r'"--model", default="([^"]+)"', r'"--effort", default="([^"]+)"'),
+    ("tool: who-leads verdicts", "tools/identity/guide_verdicts.py",
+     r'"--model", default="([^"]+)"', r'"--effort", default="([^"]+)"'),
+    ("tool: callsign roles", "tools/callsign_roles/infer_role.py",
+     r'"--model", default="([^"]+)"', r'"--effort", default="([^"]+)"'),
+    ("tool: net window reading", "tools/identity/net_read.py",
+     r'"--model", default="([^"]+)"', r'"--effort", default="([^"]+)"'),
+    ("tool: movement count", "tools/analytics2/movement_count.py",
+     r'^MODEL, EFFORT = "([^"]+)"', r'^MODEL, EFFORT = "[^"]+", "([^"]+)"'),
 ]
 
 

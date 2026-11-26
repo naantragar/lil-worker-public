@@ -420,7 +420,7 @@ def main() -> int:
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--model", action="store_true", help="run stage B (reads every intercept)")
     ap.add_argument("--workers", type=int, default=6)
-    ap.add_argument("--model-id", default="claude-sonnet-5")
+    ap.add_argument("--model-id", default="claude-opus-5-5")
     ap.add_argument("--effort", default="medium")
     ap.add_argument("--recalibrate", action="store_true")
     ap.add_argument("--out", help="directory to write the report into")

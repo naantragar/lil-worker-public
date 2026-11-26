@@ -141,7 +141,7 @@ def main():
     ap.add_argument("--only", nargs="*", help="these callsigns (default: candidates with no role)")
     ap.add_argument("--gold-set", action="store_true",
                     help="run over the callsigns the analyst HAS described (calibration)")
-    ap.add_argument("--model", default="claude-sonnet-5")
+    ap.add_argument("--model", default="claude-opus-5-5")
     ap.add_argument("--effort", default="medium")
     ap.add_argument("-o", "--out", default=str(HERE / "verdicts.json"))
     args = ap.parse_args()

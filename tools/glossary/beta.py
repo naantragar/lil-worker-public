@@ -210,7 +210,7 @@ PRESORT_SYSTEM = """Ти прибираєш ОЧЕВИДНИЙ шум зі сп�
 PROTECTED = {"ф"}
 
 
-def presort(model: str = "claude-sonnet-5", effort: str = "medium", limit: int = 60) -> None:
+def presort(model: str = "claude-opus-5-5", effort: str = "medium", limit: int = 60) -> None:
     """Take the obvious noise off the list before it reaches the owner's phone.
 
     This pass can ONLY dismiss. There is no branch in it that writes a code, by construction and

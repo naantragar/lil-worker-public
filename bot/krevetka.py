@@ -1986,6 +1986,7 @@ async def run_claude_streaming(
     typing_task = asyncio.create_task(keep_typing(bot, reply_msg.chat.id, stop_typing))
 
     final_result = ""
+    _results: list[str] = []      # every `result` of the turn, in order - see the result branch
     new_session_id = None
     last_notif_t = 0.0
     streamed_files: list[str] = []  # [FILE] markers seen in intermediate text
@@ -2276,7 +2277,18 @@ async def run_claude_streaming(
                                     pass
 
             elif etype == "result":
-                final_result = event.get("result", "")
+                # ONE `claude -p` turn can end more than once. When a background task finishes after
+                # the model's answer (a Bash the CLI moved to the background at its 120 s limit, a
+                # background agent), the CLI wakes the model with a <task-notification> and a SECOND
+                # result follows. Keeping only the last one silently dropped the real answer and
+                # delivered just the short follow-up («the full answer is above») - 12 times on twin,
+                # 83 on game (found 25.11.2026). So every result of the turn is kept, in order.
+                _r = event.get("result", "") or ""
+                if _r.strip() and (not _results or _results[-1] != _r):
+                    _results.append(_r)
+                final_result = "\n\n".join(_results)
+                if len(_results) > 1:
+                    logger.info(f"Turn produced {len(_results)} results; delivering all of them")
                 new_session_id = event.get("session_id")
                 is_error = event.get("is_error", False)
                 _turn_cost = event.get("total_cost_usd")
@@ -3579,6 +3591,17 @@ async def main():
 
     # Write own PID file — reliable even when run.sh gets killed mid-restart
     pid_file = DATA_DIR / "lil_worker.pid"
+    if validate_startup:
+        # The dry-run (validate.sh --deep) runs NEXT TO the live bot, in the same DATA_DIR. It used
+        # to overwrite the live bot's pid file, heartbeat and runtime state and then DELETE the pid
+        # file on exit; within 5 min the cron supervisor saw no pid file, judged the live bot dead
+        # and restarted it (25.11.2026: «бот запущен» out of nowhere after a validation). A dry-run
+        # now keeps all three of its files in a private temp dir and never touches the live ones.
+        global STATE_FILE, HEARTBEAT_FILE
+        import tempfile
+        _vdir = Path(tempfile.mkdtemp(prefix="krevetka-validate-"))
+        pid_file, STATE_FILE, HEARTBEAT_FILE = (_vdir / "lil_worker.pid", _vdir / "bot_runtime_state.json",
+                                                _vdir / "bot_heartbeat")
     pid_file.write_text(str(os.getpid()))
     # Stamp the liveness file immediately (before any slow startup work) so a stale file from a
     # previous run can't make the health check false-report the fresh process as unhealthy.

@@ -240,7 +240,7 @@ def main() -> None:
     ap.add_argument("--day", required=True)
     ap.add_argument("--freq", default=None, help="restrict to one frequency")
     ap.add_argument("--net-contains", default=None, help="restrict to nets whose header contains this")
-    ap.add_argument("--model", default="claude-sonnet-5")
+    ap.add_argument("--model", default="claude-opus-5-5")
     ap.add_argument("--effort", default="medium")
     ap.add_argument("--limit", type=int, default=0, help="stop after N conversations (trial runs)")
     ap.add_argument("--out", default=None)

@@ -24,7 +24,7 @@ import run as R      # noqa: E402
 import pull          # noqa: E402
 
 OUT = Path("/tmp/movecount")
-MODEL = "claude-opus-5"
+MODEL, EFFORT = "claude-opus-5-5", "medium"   # 26.11.2026: was Opus 5 with no effort (= global high)
 NO_TOOLS = ["Bash", "Edit", "Write", "Read", "Glob", "Grep", "WebFetch", "WebSearch", "Task"]
 
 SYSTEM = """Ти аналітик радіоперехоплень. Тобі дано перехоплення ОДНІЄЇ мережі за ОДНУ добу.
@@ -73,7 +73,7 @@ def judge(freq: float, day: str, recs: list[dict]) -> list[dict]:
     material = f"Частота {freq:.4f}, доба {day}, перехоплень: {len(recs)}\n\n" + pull.render(recs)
     cmd = ["claude", "-p", "--model", MODEL, "--system-prompt", SYSTEM,
            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-           "--disallowedTools", *NO_TOOLS]
+           "--disallowedTools", *NO_TOOLS, "--effort", EFFORT]
     p = subprocess.run(cmd, input=material, capture_output=True, text=True, timeout=2400,
                        cwd="/tmp")
     if p.returncode != 0:

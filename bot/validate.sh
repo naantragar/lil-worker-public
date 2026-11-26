@@ -102,7 +102,10 @@ print('OK')
     FAIL=true
   fi
 
-  rm -f "$SCRIPT_DIR/lil_worker.pid" "$SCRIPT_DIR/bot_runtime_state.json"
+  # The dry-run keeps its pid/state/heartbeat in its own temp dir (krevetka.py, --validate-startup).
+  # This line used to `rm -f` lil_worker.pid and bot_runtime_state.json HERE - the LIVE bot's files -
+  # so every --deep validation made the cron supervisor restart the running bot (25.11.2026).
+  rm -rf /tmp/krevetka-validate-*
 
 fi
 

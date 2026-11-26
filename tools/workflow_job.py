@@ -52,6 +52,15 @@ def _default_model() -> str:
         return "sonnet"
 
 
+def _default_effort() -> str:
+    """The effort that sits next to the model in the same file. Without it the nested claude ran at
+    the GLOBAL effortLevel (high) while the bot that launched it ran at medium (found 26.11.2026)."""
+    try:
+        return str(json.loads(DEFAULT_MODEL_CFG.read_text()).get("effort", "")).strip()
+    except Exception:
+        return ""
+
+
 def _inject_args(script_text: str, args_json: str) -> str:
     """Insert `globalThis.args = <literal>;` immediately after the mandatory `export const meta = {…}`
     block, so the workflow's global `args` is set DETERMINISTICALLY by the script itself.
@@ -137,8 +146,9 @@ def cmd_launch(a: argparse.Namespace) -> None:
         "--model", model,
         "--allowedTools", ALLOWED_TOOLS,
     ]
-    if a.effort:
-        inner += ["--effort", a.effort]
+    effort = a.effort or _default_effort()
+    if effort:
+        inner += ["--effort", effort]
     # Quote-safe assembly: job_ctl stores the cmd base64, but we still hand it a single shell string.
     # The env prefix is the whole point of the durability fix: a `claude -p` turn kills still-running
     # background tasks after a 600s ceiling ("Background tasks still running after 600s; terminating"),

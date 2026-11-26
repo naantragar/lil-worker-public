@@ -104,7 +104,7 @@ def main() -> None:
     ap.add_argument("--screen", help="MOVEMENT_SCREEN_*.json; omit to build one now")
     ap.add_argument("--days", type=int, default=3)
     ap.add_argument("--group", default="PATAGONIA_GP")
-    ap.add_argument("--model", default="claude-sonnet-5")
+    ap.add_argument("--model", default="claude-opus-5-5")
     ap.add_argument("--effort", default="medium")
     ap.add_argument("--limit", type=int, default=0, help="stop after N candidates (0 = all)")
     ap.add_argument("--out", default=None)

@@ -433,7 +433,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("verb", choices=["scan", "plan", "run", "report", "eyes"])
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--model", default="claude-sonnet-5")
+    ap.add_argument("--model", default="claude-opus-5-5")
     ap.add_argument("--effort", default="medium")
     a = ap.parse_args()
     if a.verb == "scan":

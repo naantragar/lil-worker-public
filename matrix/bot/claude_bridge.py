@@ -376,7 +376,11 @@ async def run(prompt: str, session_id: str | None, images: list[str] | None = No
                         except Exception as e:
                             _log("progress callback failed (ignored)", repr(e))
         elif etype == "result":
-            text = evt.get("result", "") or text
+            # A turn can end more than once (a background task wakes the model after its answer);
+            # keep every result, not just the last - the last is often only «see above». 25.11.2026.
+            r = evt.get("result", "") or ""
+            if r.strip() and not text.endswith(r):
+                text = f"{text}\n\n{r}" if text else r
             new_sid = evt.get("session_id", new_sid)
 
     async def _heartbeat() -> None:
